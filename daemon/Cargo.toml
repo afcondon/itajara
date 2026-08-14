@@ -1,0 +1,13 @@
+[package]
+name = "itajara"
+version = "0.1.0"
+edition = "2021"
+description = "Itajara \u2014 the looper engine for producing-with-your-feet (Epinephelus itajara, the goliath grouper, which booms): CoreAudio capture/playback, layered loops, and the latency metrology the layering depends on"
+
+[dependencies]
+cpal = "0.15"
+tungstenite = "0.24"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

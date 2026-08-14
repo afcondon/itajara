@@ -1,6 +1,6 @@
 -- | Talking to the looper daemon.
 -- |
--- | The daemon (`looper/` in this repo) owns the audio: buffers, the sample
+-- | The daemon (`itajara/` in this repo) owns the audio: buffers, the sample
 -- | clock, latency compensation. This app owns the UX and the MIDI. So the
 -- | traffic is one-way in each direction — commands out, state in — and the
 -- | app never needs to model the engine, only display what it reports.
@@ -25,7 +25,7 @@ import Data.Maybe (Maybe)
 import Data.Nullable (Nullable, toMaybe)
 import Effect (Effect)
 
--- | What the daemon says about itself. Mirrors `snapshot` in `looper/src/ws.rs`
+-- | What the daemon says about itself. Mirrors `snapshot` in `itajara/src/ws.rs`
 -- | field for field; if one changes the other must.
 type LooperState =
   { state :: String
