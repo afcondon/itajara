@@ -146,6 +146,25 @@ pub struct Shared {
     pub monitor: AtomicBool,
     pub out_peak: AtomicU32,
     pub in_peak: AtomicU32,
+    /// Latched by cpal's stream error callback. Unplugging the USB bus kills
+    /// both streams, and until this existed the daemon carried on serving a
+    /// confident socket from a dead engine: `r` set the request, no output
+    /// callback ever consumed it, and the state sat at `idle` for ever. The
+    /// only tell was two meters reading digital zero.
+    /// Ask the output callback to stamp a fresh `p0`. Set at startup and again
+    /// after every reopen — `p0` used to be taken only when `out_frames` was
+    /// zero, which meant that after a recovery it could never be retaken, `K`
+    /// could never be recomputed, and every subsequent recording silently wrote
+    /// nothing at all.
+    pub p0_needed: AtomicBool,
+    /// The output frame `p0` was stamped at. Zero at startup, which is why the
+    /// original arithmetic could get away without it; not zero after a reopen.
+    pub p0_frame: AtomicUsize,
+    pub device_lost: AtomicBool,
+    /// How many times the device has been reopened. Worth surfacing rather
+    /// than hiding — a rig that silently recovers six times in a session is
+    /// telling you something about the cable.
+    pub reopens: AtomicUsize,
 }
 
 /// `AtomicU8` under a name that makes the intent obvious at the use sites.
@@ -220,6 +239,16 @@ impl Shared {
     }
 }
 
+/// The stream error callback, latching device loss so the supervisor can act.
+///
+/// One per stream because cpal takes ownership of each.
+fn err_cb(sh: Arc<Shared>) -> impl FnMut(cpal::StreamError) + Send + 'static {
+    move |e| {
+        eprintln!("stream error: {}", e);
+        sh.device_lost.store(true, Ordering::Release);
+    }
+}
+
 pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     let candidate = crate::devices::find(&opts.device)?;
     let device = candidate.device;
@@ -280,11 +309,20 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         monitor: AtomicBool::new(opts.monitor),
         out_peak: AtomicU32::new(0),
         in_peak: AtomicU32::new(0),
+        p0_needed: AtomicBool::new(true),
+        p0_frame: AtomicUsize::new(0),
+        device_lost: AtomicBool::new(false),
+        reopens: AtomicUsize::new(0),
     });
 
-    let err = |e| eprintln!("stream error: {}", e);
+    // Both streams are rebuilt on recovery, so building them lives in a closure
+    // rather than inline. Everything it captures is either `Arc` or `Copy`.
+    let build_streams = |device: &cpal::Device|
+     -> Result<(cpal::Stream, cpal::Stream), Box<dyn Error>> {
 
     let out_stream = {
+        // Cloned before the shadowing below moves `sh` into the callback.
+        let err_sh = sh.clone();
         let sh = sh.clone();
         let ch = opts.out_ch;
         let dual = opts.dual;
@@ -298,11 +336,13 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                 sh.buffer_frames.store(frames as u32, Ordering::Relaxed);
 
                 let base = sh.out_frames.load(Ordering::Acquire);
-                if base == 0 {
-                    if let Ok(mut g) = sh.p0.lock() {
-                        if g.is_none() {
-                            *g = Some(info.timestamp().playback);
-                        }
+                if sh.p0_needed.load(Ordering::Relaxed) {
+                    // `try_lock` because this is the audio thread; if the lock
+                    // is contended the next buffer will do just as well.
+                    if let Ok(mut g) = sh.p0.try_lock() {
+                        *g = Some(info.timestamp().playback);
+                        sh.p0_frame.store(base, Ordering::Release);
+                        sh.p0_needed.store(false, Ordering::Release);
                     }
                 }
 
@@ -379,12 +419,14 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                 sh.out_peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
                 sh.out_frames.store(base + frames, Ordering::Release);
             },
-            err,
+            err_cb(err_sh),
             None,
         )?
     };
 
     let in_stream = {
+        // Cloned before the shadowing below moves `sh` into the callback.
+        let err_sh = sh.clone();
         let sh = sh.clone();
         let ch = opts.in_ch;
         let residual = opts.residual;
@@ -407,7 +449,13 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                     let buffer = sh.buffer_frames.load(Ordering::Relaxed) as f64;
                     let offset = residual - 2.0 * buffer;
                     let c0 = signed_secs(p0, &info.timestamp().capture) * sr_f;
-                    sh.k.store((c0 - base as f64 - offset).round() as i64, Ordering::Release);
+                    // `p0_frame` is zero at startup, so this is the same
+                    // arithmetic as before for the case that always worked.
+                    let p0_frame = sh.p0_frame.load(Ordering::Acquire) as f64;
+                    sh.k.store(
+                        (p0_frame + c0 - base as f64 - offset).round() as i64,
+                        Ordering::Release,
+                    );
                     sh.k_set.store(true, Ordering::Release);
                 }
 
@@ -468,11 +516,15 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                 }
                 sh.in_frames.store(base + frames, Ordering::Release);
             },
-            err,
+            err_cb(err_sh),
             None,
         )?
     };
 
+        Ok((out_stream, in_stream))
+    };
+
+    let (mut out_stream, mut in_stream) = build_streams(&device)?;
     out_stream.play()?;
     in_stream.play()?;
     std::thread::sleep(Duration::from_millis(300));
@@ -488,7 +540,24 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         return r;
     }
 
-    control_loop(&sh, sr);
+    // With a socket open, the console moves to its own thread so the main one
+    // can watch the device. cpal's streams are not `Send` on this platform, so
+    // whichever thread built them is the only one that may replace them — and
+    // supervision behind a blocking read of stdin would only begin once the
+    // console closed, which is precisely backwards.
+    if opts.ws_port.is_some() {
+        let sh_console = sh.clone();
+        std::thread::spawn(move || {
+            // `q` means stop the daemon, not stop this thread. EOF means the
+            // console was never there, and the socket carries on regardless.
+            if control_loop(&sh_console, sr) {
+                std::process::exit(0);
+            }
+            println!("(console closed; still serving the socket and watching the device)");
+        });
+    } else {
+        let _ = control_loop(&sh, sr);
+    }
 
     // stdin closing is not a reason to stop.
     //
@@ -498,15 +567,123 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     // attached to a terminal, which is exactly when it is meant to be working.
     // With a socket open there is still a client to serve, so park instead.
     if opts.ws_port.is_some() {
-        println!("(console closed; still serving the socket — Ctrl-C or kill to stop)");
-        loop {
-            std::thread::sleep(Duration::from_secs(3600));
-        }
+        supervise(&sh, &opts.device, &build_streams, &mut out_stream, &mut in_stream);
     }
 
     drop(in_stream);
     drop(out_stream);
     Ok(())
+}
+
+/// Watch the device, and put it back when it goes.
+///
+/// Two detectors, because they catch different faults. cpal *reports* an
+/// unplugged interface through the error callback — that is the loud case. But
+/// a stream can also simply stop being called with no error at all, and that is
+/// the one that cost an afternoon: the socket kept serving plausible snapshots
+/// while both meters read digital zero and every command vanished into a
+/// request nothing would ever consume. So the frame counter is watched too, and
+/// a transport that claims to be running while its frames stand still is
+/// treated as lost whether or not anyone said so.
+///
+/// Never returns. Ctrl-C or a kill stops the daemon.
+fn supervise<F>(
+    sh: &Arc<Shared>,
+    device_name: &str,
+    build: &F,
+    out_stream: &mut cpal::Stream,
+    in_stream: &mut cpal::Stream,
+) where
+    F: Fn(&cpal::Device) -> Result<(cpal::Stream, cpal::Stream), Box<dyn Error>>,
+{
+    const TICK_MS: u64 = 250;
+    /// Ticks of a motionless frame counter before we stop giving it the benefit
+    /// of the doubt. Comfortably longer than any buffer, short enough that the
+    /// app says so before you have finished wondering.
+    const STALL_TICKS: u32 = 8;
+
+    let mut last_frames = sh.out_frames.load(Ordering::Acquire);
+    let mut still = 0u32;
+
+    loop {
+        std::thread::sleep(Duration::from_millis(TICK_MS));
+
+        let frames = sh.out_frames.load(Ordering::Acquire);
+        if frames == last_frames {
+            still += 1;
+        } else {
+            still = 0;
+            last_frames = frames;
+        }
+
+        let reported = sh.device_lost.load(Ordering::Acquire);
+        let stalled = still >= STALL_TICKS;
+        if !reported && !stalled {
+            continue;
+        }
+
+        eprintln!(
+            "device {} — reopening {}",
+            if reported { "reported lost" } else { "stopped answering" },
+            device_name
+        );
+
+        // A recording that spans an outage has a hole in it, and a hole in a
+        // layer is worse than no layer: it will be discovered later, in the
+        // mix, with no way to tell what went wrong. So abandon whatever was
+        // being captured and keep only what was already committed.
+        match sh.state.get() {
+            FIRST | OVERDUB | MULTIPLY => {
+                let n = sh.n_layers.load(Ordering::Acquire);
+                sh.zero_layer(n);
+                sh.state.set(if sh.loop_len.load(Ordering::Acquire) > 0 {
+                    PLAYING
+                } else {
+                    IDLE
+                });
+                eprintln!("  the recording in progress was dropped — it would have had a gap");
+            }
+            _ => {}
+        }
+        sh.request.take();
+
+        // Both streams restart independently, so the input↔output pairing has
+        // to be established again from scratch. Everything downstream reads
+        // `k_set`, so clearing it is enough to make them wait for a fresh K
+        // rather than trust a stale one.
+        sh.k_set.store(false, Ordering::Release);
+        if let Ok(mut g) = sh.p0.lock() {
+            *g = None;
+        }
+        sh.p0_needed.store(true, Ordering::Release);
+
+        // Reopen. The device has to be looked up again — after a USB cycle the
+        // old handle refers to something that no longer exists.
+        loop {
+            std::thread::sleep(Duration::from_millis(750));
+            let found = match crate::devices::find(device_name) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            match build(&found.device) {
+                Ok((new_out, new_in)) => {
+                    let played = new_out.play().and_then(|_| new_in.play());
+                    if played.is_err() {
+                        continue;
+                    }
+                    *out_stream = new_out;
+                    *in_stream = new_in;
+                    sh.device_lost.store(false, Ordering::Release);
+                    sh.reopens.fetch_add(1, Ordering::Release);
+                    last_frames = sh.out_frames.load(Ordering::Acquire);
+                    still = 0;
+                    eprintln!("  {} is back.", found.name);
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+    }
 }
 
 fn commit(sh: &Shared, sr: u32) {
@@ -853,22 +1030,28 @@ fn multiply_end(sh: &Shared, sr: u32) {
     println!("  committed. {} layers playing.", layer + 1);
 }
 
-fn control_loop(sh: &Shared, sr: u32) {
+/// Returns true only if the user actually asked to quit.
+///
+/// EOF is not a quit. Run headless — from a launcher, or with output
+/// redirected — and `lines()` returns immediately, which must not be allowed to
+/// take the audio engine and the socket down with it.
+fn control_loop(sh: &Shared, sr: u32) -> bool {
     println!("Commands:  r = record/overdub toggle   x = multiply   t [secs] = take");
     println!("           u = undo   c = clear   k = click   m = input monitoring");
     println!("           l = levels   p = status + waveforms   q = quit\n");
 
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
+        let Ok(line) = line else { return false };
         if line.trim() == "q" {
-            break;
+            return true;
         }
         let ack = dispatch(sh, sr, &line);
         if !ack.is_empty() {
             println!("  {}", ack);
         }
     }
+    false
 }
 
 /// One command, from wherever it came.
@@ -917,6 +1100,14 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     println!("  layer {} removed, {} left.", n, n - 1);
                 }
             }
+            // Deliberate device-loss injection, so the recovery path can be
+            // proved rather than hoped for. It is the same argument as the
+            // alignment self-test: this is a part of a looper that can be
+            // verified, so it should be.
+            "!lose" => {
+                sh.device_lost.store(true, Ordering::Release);
+                println!("  simulating device loss.");
+            }
             "c" => {
                 sh.state.set(IDLE);
                 sh.n_layers.store(0, Ordering::Release);
@@ -926,13 +1117,25 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 }
                 println!("  cleared.");
             }
-            "k" => {
-                let on = !sh.click.load(Ordering::Relaxed);
+            // `k` and `m` flip, which is right at a console and wrong over a
+            // wire: a client that sets rather than flips drifts out of step the
+            // first time a command is dropped, and never recovers. So the
+            // explicit forms exist alongside, and the app uses those.
+            "k" | "k1" | "k0" => {
+                let on = match line.trim() {
+                    "k1" => true,
+                    "k0" => false,
+                    _ => !sh.click.load(Ordering::Relaxed),
+                };
                 sh.click.store(on, Ordering::Relaxed);
                 println!("  click {}.", if on { "on" } else { "off" });
             }
-            "m" => {
-                let on = !sh.monitor.load(Ordering::Relaxed);
+            "m" | "m1" | "m0" => {
+                let on = match line.trim() {
+                    "m1" => true,
+                    "m0" => false,
+                    _ => !sh.monitor.load(Ordering::Relaxed),
+                };
                 sh.monitor.store(on, Ordering::Relaxed);
                 println!(
                     "  input monitoring {}.{}",

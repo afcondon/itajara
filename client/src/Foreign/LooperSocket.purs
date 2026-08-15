@@ -44,6 +44,12 @@ type LooperState =
   , recording :: Boolean
   , calibrated :: Boolean
   , k :: Int
+  -- | Whether the audio callbacks are actually running. A connected socket says
+  -- | nothing about this: the push thread only reads shared atomics, so it will
+  -- | serve confident snapshots from an engine whose device was unplugged.
+  , audioAlive :: Boolean
+  , deviceLost :: Boolean
+  , reopens :: Int
   }
 
 type SocketStatus =

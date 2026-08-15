@@ -71,6 +71,18 @@ fn talk(
     let mut ws = tungstenite::accept(stream)?;
     println!("  app connected.");
 
+    // Liveness is measured, not assumed. This thread only reads shared atomics,
+    // so it will happily serve a plausible-looking snapshot from an engine whose
+    // audio callbacks stopped — which is exactly what happened when the USB bus
+    // was unplugged mid-session, and it cost an afternoon of looking for a MIDI
+    // fault. Watching the output frame counter makes the failure visible from
+    // the app instead.
+    let mut last_frames = sh.out_frames.load(Ordering::Acquire);
+    let mut still = 0u32;
+    // At 30 Hz, a second and a half of a motionless counter. Longer than any
+    // buffer, shorter than anyone's patience.
+    const STILL_LIMIT: u32 = PUSH_HZ as u32 * 3 / 2;
+
     loop {
         match ws.read() {
             Ok(tungstenite::Message::Text(cmd)) => {
@@ -102,7 +114,16 @@ fn talk(
             Err(e) => return Err(Box::new(e)),
         }
 
-        ws.send(tungstenite::Message::Text(snapshot(&sh, sr)))?;
+        let frames = sh.out_frames.load(Ordering::Acquire);
+        if frames == last_frames {
+            still = still.saturating_add(1);
+        } else {
+            still = 0;
+            last_frames = frames;
+        }
+        let alive = still < STILL_LIMIT && !sh.device_lost.load(Ordering::Acquire);
+
+        ws.send(tungstenite::Message::Text(snapshot(&sh, sr, alive)))?;
     }
 }
 
@@ -112,7 +133,7 @@ fn talk(
 /// and this way it is obvious at a glance what the app is being told. If it
 /// grows a variable shape, that is the moment to reach for serde and not
 /// before.
-fn snapshot(sh: &Shared, sr: u32) -> String {
+fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
     let loop_len = sh.loop_len.load(Ordering::Acquire);
     let origin = sh.origin.load(Ordering::Acquire);
     let cur = sh.out_frames.load(Ordering::Acquire) as i64;
@@ -133,7 +154,8 @@ fn snapshot(sh: &Shared, sr: u32) -> String {
             r#"{{"state":"{}","layers":{},"maxLayers":{},"loopFrames":{},"#,
             r#""loopSecs":{:.4},"pos":{},"phase":{:.5},"sampleRate":{},"#,
             r#""inDb":{:.1},"outDb":{:.1},"click":{},"monitor":{},"#,
-            r#""armed":{},"recording":{},"calibrated":{},"k":{}}}"#
+            r#""armed":{},"recording":{},"calibrated":{},"k":{},"#,
+            r#""audioAlive":{},"deviceLost":{},"reopens":{}}}"#
         ),
         sh.state_name(),
         sh.n_layers.load(Ordering::Acquire),
@@ -151,6 +173,9 @@ fn snapshot(sh: &Shared, sr: u32) -> String {
         sh.is_recording(),
         sh.k_set.load(Ordering::Acquire),
         sh.k.load(Ordering::Acquire),
+        alive,
+        sh.device_lost.load(Ordering::Acquire),
+        sh.reopens.load(Ordering::Acquire),
     )
 }
 
