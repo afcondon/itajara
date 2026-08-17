@@ -149,13 +149,27 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
     let in_peak = f32::from_bits(sh.in_peak.swap(0, Ordering::Relaxed));
     let out_peak = f32::from_bits(sh.out_peak.swap(0, Ordering::Relaxed));
 
+    // Each layer's own length and where it sounds. Without this the app can draw
+    // a loop and not what is in it: two takes of the same length look identical
+    // when one of them plays one bar in four, and that is precisely the thing
+    // the display exists to make visible.
+    let shapes: Vec<String> = (0..sh.n_layers.load(Ordering::Acquire))
+        .map(|l| {
+            let (len, period, phase) = sh.layer_shape(l);
+            format!(
+                r#"{{"len":{},"period":{},"phase":{}}}"#,
+                len, period, phase
+            )
+        })
+        .collect();
+
     format!(
         concat!(
             r#"{{"state":"{}","layers":{},"maxLayers":{},"loopFrames":{},"#,
             r#""loopSecs":{:.4},"pos":{},"phase":{:.5},"sampleRate":{},"#,
             r#""inDb":{:.1},"outDb":{:.1},"click":{},"monitor":{},"#,
             r#""armed":{},"recording":{},"calibrated":{},"k":{},"#,
-            r#""audioAlive":{},"deviceLost":{},"reopens":{}}}"#
+            r#""audioAlive":{},"deviceLost":{},"reopens":{},"shapes":[{}]}}"#
         ),
         sh.state_name(),
         sh.n_layers.load(Ordering::Acquire),
@@ -176,6 +190,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
         alive,
         sh.device_lost.load(Ordering::Acquire),
         sh.reopens.load(Ordering::Acquire),
+        shapes.join(","),
     )
 }
 

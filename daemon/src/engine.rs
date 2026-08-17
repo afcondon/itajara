@@ -120,6 +120,23 @@ pub struct Shared {
     ring_len: usize,
     pub loop_len: AtomicUsize,
     pub n_layers: AtomicUsize,
+    /// Each layer's own length, and where in the cycle it sounds.
+    ///
+    /// A layer is **not** stretched to fill the loop. It keeps the length it was
+    /// recorded at, sounds once every `period` of its own lengths, and sits at
+    /// slot `phase` within that period. Playback resolves all three.
+    ///
+    /// This is what makes two kinds of multiply one mechanism. `period = 1` is
+    /// an ordinary layer, repeating every time round — which is what the old
+    /// code achieved by copying the audio n times into the longer cycle. Set
+    /// `period = 4, phase = 3` and the same bar sounds once in four: `~ ~ ~ B`.
+    /// Since nothing was flattened, it can go back, or move, or alternate,
+    /// afterwards. Tiling could not: it destroyed the fact that there was a
+    /// one-bar thing there at all, which is the same reason a `MidiClip` in
+    /// Triggerfish stores every note and bakes in no tempo.
+    l_len: Vec<AtomicUsize>,
+    l_period: Vec<AtomicUsize>,
+    l_phase: Vec<AtomicUsize>,
     /// The output frame at which loop position zero sits.
     pub origin: AtomicI64,
     state: AtomicU8Wrapper,
@@ -232,6 +249,64 @@ impl Shared {
         Some(f32::from_bits(self.ring[i].load(Ordering::Relaxed)))
     }
 
+    /// Where in a layer's own buffer the loop position `pos` falls — or `None`
+    /// when the layer is silent there.
+    ///
+    /// Called once per layer per frame in the output callback, so the dense case
+    /// skips the division: a layer at `period = 1` sounds everywhere, and asking
+    /// which slot it is in has no answer worth computing.
+    fn layer_pos(&self, layer: usize, pos: usize) -> Option<usize> {
+        let len = self.l_len[layer].load(Ordering::Relaxed);
+        if len == 0 {
+            return None;
+        }
+        let period = self.l_period[layer].load(Ordering::Relaxed).max(1);
+        if period > 1 {
+            let slot = (pos / len) % period;
+            if slot != self.l_phase[layer].load(Ordering::Relaxed) % period {
+                return None;
+            }
+        }
+        Some(pos % len)
+    }
+
+    /// What the mix takes from a layer at a loop position: the sample, or zero
+    /// where the layer is silent.
+    ///
+    /// The output callback and the self-test both go through here on purpose.
+    /// The test used to read the arena directly, which made it an assertion about
+    /// *storage* — and it duly failed the moment repetition stopped being a copy
+    /// and became a calculation, while the audio was correct. A test that can
+    /// disagree with the audio path about what is audible is testing the wrong
+    /// thing.
+    fn sample_at(&self, layer: usize, pos: usize) -> f32 {
+        match self.layer_pos(layer, pos) {
+            Some(p) => self.read(layer, p),
+            None => 0.0,
+        }
+    }
+
+    /// A freshly committed layer: its own length, sounding every time round.
+    ///
+    /// Written *before* `n_layers` is incremented everywhere it is used. The
+    /// output callback plays `0..n_layers`, so publishing the layer first and
+    /// its length second leaves a window in which the mix reads a length of
+    /// zero and drops it — a buffer of silence at the exact moment a take
+    /// lands, which is the least forgivable place for one.
+    fn set_layer_shape(&self, layer: usize, len: usize) {
+        self.l_len[layer].store(len, Ordering::Release);
+        self.l_period[layer].store(1, Ordering::Release);
+        self.l_phase[layer].store(0, Ordering::Release);
+    }
+
+    pub fn layer_shape(&self, layer: usize) -> (usize, usize, usize) {
+        (
+            self.l_len[layer].load(Ordering::Relaxed),
+            self.l_period[layer].load(Ordering::Relaxed).max(1),
+            self.l_phase[layer].load(Ordering::Relaxed),
+        )
+    }
+
     fn zero_layer(&self, layer: usize) {
         for i in 0..self.max_frames {
             self.cell(layer, i).store(0, Ordering::Relaxed);
@@ -290,6 +365,9 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         ring_len,
         loop_len: AtomicUsize::new(0),
         n_layers: AtomicUsize::new(0),
+        l_len: (0..MAX_LAYERS).map(|_| AtomicUsize::new(0)).collect(),
+        l_period: (0..MAX_LAYERS).map(|_| AtomicUsize::new(1)).collect(),
+        l_phase: (0..MAX_LAYERS).map(|_| AtomicUsize::new(0)).collect(),
         origin: AtomicI64::new(0),
         state: AtomicU8Wrapper::new(IDLE),
         request: AtomicU8Wrapper::new(0),
@@ -398,7 +476,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                     if loop_len > 0 {
                         let pos = (out_frame - origin).rem_euclid(loop_len as i64) as usize;
                         for l in 0..n {
-                            v += sh.read(l, pos);
+                            v += sh.sample_at(l, pos);
                         }
                         if sh.click.load(Ordering::Relaxed) && pos < 16 {
                             v += 0.4;
@@ -745,8 +823,10 @@ fn commit(sh: &Shared, sr: u32) {
             240.0 / (len as f64 / sr as f64)
         );
     }
-    let layer = sh.n_layers.fetch_add(1, Ordering::AcqRel);
+    let layer = sh.n_layers.load(Ordering::Acquire);
     let len = sh.loop_len.load(Ordering::Acquire);
+    sh.set_layer_shape(layer, len);
+    sh.n_layers.fetch_add(1, Ordering::AcqRel);
     if len > 0 {
         draw_layer(sh, layer, len, sr);
     }
@@ -900,7 +980,9 @@ fn take(sh: &Shared, sr: u32, secs: f64) {
     } else {
         println!("  took the last complete cycle as a new {}.", what);
     }
-    let taken = sh.n_layers.fetch_add(1, Ordering::AcqRel);
+    let taken = sh.n_layers.load(Ordering::Acquire);
+    sh.set_layer_shape(taken, sh.loop_len.load(Ordering::Acquire));
+    sh.n_layers.fetch_add(1, Ordering::AcqRel);
     draw_layer(sh, taken, sh.loop_len.load(Ordering::Acquire), sr);
     println!(
         "  {} layer{} playing.",
@@ -1000,19 +1082,13 @@ fn multiply_end(sh: &Shared, sr: u32) {
     sh.state.set(PLAYING);
     std::thread::sleep(Duration::from_millis(60));
 
-    // Everything that was playing has to fill the new, longer cycle — that is
-    // what "with the original repeating underneath" means. The multiply began
-    // on a cycle boundary, so each existing layer simply repeats from its own
-    // position zero.
-    let layers = sh.n_layers.load(Ordering::Acquire);
-    for l in 0..layers {
-        for c in 1..n {
-            for pos in 0..loop_len {
-                let v = sh.read(l, pos);
-                sh.write(l, c * loop_len + pos, v);
-            }
-        }
-    }
+    // "With the original repeating underneath" now costs nothing. Every existing
+    // layer keeps its own length at `period = 1`, and the mix wraps it inside
+    // the longer cycle by itself. This used to copy the audio n times, which
+    // worked and threw away the structure: afterwards there was no one-bar thing
+    // to make sparse, alternate or move, because it had been smeared across four
+    // bars of buffer. The multiply began on a cycle boundary, so each layer's
+    // position zero still lands where it did.
 
     // The new loop's position zero is where the multiply began.
     sh.origin.store(from, Ordering::Release);
@@ -1025,9 +1101,144 @@ fn multiply_end(sh: &Shared, sr: u32) {
         n,
         loop_len as f64 / sr as f64
     );
-    let layer = sh.n_layers.fetch_add(1, Ordering::AcqRel);
+    let layer = sh.n_layers.load(Ordering::Acquire);
+    sh.set_layer_shape(layer, new_len);
+    sh.n_layers.fetch_add(1, Ordering::AcqRel);
     draw_layer(sh, layer, new_len, sr);
     println!("  committed. {} layers playing.", layer + 1);
+}
+
+/// The other multiply: keep the layer one bar long and give it room.
+///
+/// Ordinary multiply asks "how many bars of this?" and answers by repeating it.
+/// This asks "how *often*?" and answers by leaving the rest silent. `s 2` on a
+/// one-bar layer gives `B ~`; again gives `B ~ ~ ~`; again `B ~ ~ ~ ~ ~ ~ ~`.
+/// Everything else keeps repeating underneath, so the loop grows without the
+/// newest thing in it getting busier — which is the opposite of what a looper
+/// usually does to you.
+///
+/// It takes no time. Ordinary multiply costs you n cycles of playing, because it
+/// is recording; this is structural, so it lands on the next boundary and you
+/// have not committed to anything you cannot take back with `d`.
+///
+/// **Growth is in whole multiples of the current cycle**, which is not an
+/// arbitrary restriction: every layer's length divides the cycle, so a cycle
+/// that is a multiple of the old one still divides evenly by all of them. Grow
+/// by anything else and some other layer gets cut off mid-phrase at the wrap.
+fn sparse(sh: &Shared, sr: u32, n: usize) -> String {
+    let layers = sh.n_layers.load(Ordering::Acquire);
+    if layers == 0 {
+        return "nothing to spread — record a loop first.".into();
+    }
+    let n = n.max(2);
+    let l = layers - 1;
+    let (len, period, phase) = sh.layer_shape(l);
+    if len == 0 {
+        return "that layer has no length.".into();
+    }
+    let loop_len = sh.loop_len.load(Ordering::Acquire);
+    let new_len = n * loop_len;
+    if new_len > sh.max_frames {
+        return format!(
+            "{} cycles would be {:.1} s, past the ceiling of {:.1} s.",
+            n,
+            new_len as f64 / sr as f64,
+            sh.max_frames as f64 / sr as f64
+        );
+    }
+
+    // Measured in the layer's own lengths, not in cycles, and multiplicative
+    // rather than absolute: "spread by n" means *sound n times less often*. So
+    // pressing it twice gives one in four, and a layer that already repeats four
+    // times inside the cycle halves its density rather than jumping to once.
+    let new_period = (period * n).max(1);
+    sh.l_period[l].store(new_period, Ordering::Release);
+    sh.l_phase[l].store(phase, Ordering::Release);
+    sh.loop_len.store(new_len, Ordering::Release);
+
+    format!(
+        "layer {} sounds once every {} of its own lengths; loop is {:.3} s.",
+        l + 1,
+        new_period,
+        new_len as f64 / sr as f64
+    )
+}
+
+/// Move the newest layer one slot later in the cycle.
+///
+/// `B ~ ~ ~` → `~ B ~ ~` → `~ ~ B ~`. One button, and it is the cheapest way to
+/// make a loop stop announcing where its bar line is.
+///
+/// It takes effect immediately rather than at the next boundary, which can chop
+/// the layer mid-phrase if you press while it is sounding. The fix is the same
+/// pending-at-the-wrap mechanism scenes will need, so it is worth building once,
+/// for both, rather than here.
+fn rotate(sh: &Shared) -> String {
+    let layers = sh.n_layers.load(Ordering::Acquire);
+    if layers == 0 {
+        return "nothing to move.".into();
+    }
+    let l = layers - 1;
+    let (_, period, phase) = sh.layer_shape(l);
+    if period <= 1 {
+        return "that layer sounds every time round — spread it first.".into();
+    }
+    let next = (phase + 1) % period;
+    sh.l_phase[l].store(next, Ordering::Release);
+    format!("layer {} moved to slot {} of {}.", l + 1, next + 1, period)
+}
+
+/// Put the newest layer back to sounding every time round.
+///
+/// The loop keeps the length it grew to, because that length is now shared with
+/// everything else that was recorded against it. Shrinking it would be a
+/// different and much less reversible operation.
+fn dense(sh: &Shared) -> String {
+    let layers = sh.n_layers.load(Ordering::Acquire);
+    if layers == 0 {
+        return "nothing to fill.".into();
+    }
+    let l = layers - 1;
+    sh.l_period[l].store(1, Ordering::Release);
+    sh.l_phase[l].store(0, Ordering::Release);
+    format!("layer {} sounds every time round again.", l + 1)
+}
+
+/// Forget the loop's length, so the next recording lays down a new grid.
+///
+/// Undo removes a layer and deliberately keeps the length: erasing a first take
+/// while holding onto the tempo you found is worth having, and the click goes on
+/// running at it so the next attempt lands on the same grid. But without a way to
+/// let go of it, undoing everything left the engine "stuck" at a length with
+/// nothing in it — the transport still running, the record button still offering
+/// an overdub, and no route back to an open-ended first recording short of `c`.
+///
+/// So the three erasures are distinct, and worth keeping distinct: `u` drops a
+/// layer, this drops the grid, `c` drops both.
+///
+/// Refused while layers exist, because the length is what they are addressed by.
+/// Clearing it under them would leave a mix reading positions in a cycle that no
+/// longer has a size.
+fn free_length(sh: &Shared, sr: u32) -> String {
+    let n = sh.n_layers.load(Ordering::Acquire);
+    if n > 0 {
+        return format!(
+            "{} layer{} still playing — undo or clear them first; the length is what they sit in.",
+            n,
+            if n == 1 { "" } else { "s" }
+        );
+    }
+    let was = sh.loop_len.load(Ordering::Acquire);
+    if was == 0 {
+        return "no length set — the next recording will set one.".into();
+    }
+    sh.loop_len.store(0, Ordering::Release);
+    sh.reached.store(0, Ordering::Release);
+    sh.state.set(IDLE);
+    format!(
+        "length forgotten (was {:.3} s). The next recording sets a new one.",
+        was as f64 / sr as f64
+    )
 }
 
 /// Returns true only if the user actually asked to quit.
@@ -1037,7 +1248,9 @@ fn multiply_end(sh: &Shared, sr: u32) {
 /// take the audio engine and the socket down with it.
 fn control_loop(sh: &Shared, sr: u32) -> bool {
     println!("Commands:  r = record/overdub toggle   x = multiply   t [secs] = take");
-    println!("           u = undo   c = clear   k = click   m = input monitoring");
+    println!("           s [n] = spread one in n   o = move it one slot   d = dense again");
+    println!("           u = undo a layer   z = forget the length   c = both");
+    println!("           k = click   m = input monitoring");
     println!("           l = levels   p = status + waveforms   q = quit\n");
 
     let stdin = std::io::stdin();
@@ -1090,6 +1303,15 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 let secs = l[1..].trim().parse::<f64>().unwrap_or(8.0);
                 take(sh, sr, secs);
             }
+            // The second multiply, and its two companions. Structural, so they
+            // are instant and reversible — nothing here records anything.
+            l if l.starts_with('s') => {
+                let n = l[1..].trim().parse::<usize>().unwrap_or(2);
+                println!("  {}", sparse(sh, sr, n));
+            }
+            "o" => println!("  {}", rotate(sh)),
+            "d" => println!("  {}", dense(sh)),
+            "z" => println!("  {}", free_length(sh, sr)),
             "u" => {
                 let n = sh.n_layers.load(Ordering::Acquire);
                 if n == 0 {
@@ -1097,7 +1319,21 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 } else {
                     sh.n_layers.store(n - 1, Ordering::Release);
                     sh.zero_layer(n - 1);
-                    println!("  layer {} removed, {} left.", n, n - 1);
+                    if n == 1 {
+                        // Say what is being kept, or it reads as a fault. The
+                        // length surviving an undo is the point — the click goes
+                        // on at the tempo you found, so the next attempt lands on
+                        // the same grid — but a length with nothing in it looks
+                        // exactly like a looper that has stopped listening.
+                        let len = sh.loop_len.load(Ordering::Acquire);
+                        println!(
+                            "  layer 1 removed. Empty now, but still {:.3} s long, so the next \
+                             take lands on the same grid — `z` to forget the length.",
+                            len as f64 / sr as f64
+                        );
+                    } else {
+                        println!("  layer {} removed, {} left.", n, n - 1);
+                    }
                 }
             }
             // Deliberate device-loss injection, so the recovery path can be
@@ -1114,6 +1350,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 sh.loop_len.store(0, Ordering::Release);
                 for l in 0..MAX_LAYERS {
                     sh.zero_layer(l);
+                    sh.set_layer_shape(l, 0);
                 }
                 println!("  cleared.");
             }
@@ -1280,19 +1517,23 @@ fn selftest(sh: &Shared, sr: u32, secs: f64) -> Result<(), Box<dyn Error>> {
     }
     let n = new_len / len;
 
-    // Layer 0 carried the click at position zero. After a multiply it should
-    // carry it at every cycle boundary, because it was repeated to fill.
-    let mut missing = Vec::new();
-    for c in 0..n {
+    // Layer 0 carried the click at position zero. After a multiply it should be
+    // *audible* at every cycle boundary — which is a question about the mix, not
+    // about where the bytes are, so it is asked through `sample_at`.
+    let click_at = |c: usize| -> f32 {
         let mut best = 0f32;
         for d in 0..64usize {
-            best = best.max(sh.read(0, (c * len + d) % new_len).abs());
+            best = best.max(sh.sample_at(0, (c * len + d) % new_len).abs());
             if c * len + len > d {
                 let back = (c * len + new_len - d - 1) % new_len;
-                best = best.max(sh.read(0, back).abs());
+                best = best.max(sh.sample_at(0, back).abs());
             }
         }
-        if best < 0.01 {
+        best
+    };
+    let mut missing = Vec::new();
+    for c in 0..n {
+        if click_at(c) < 0.01 {
             missing.push(c);
         }
     }
@@ -1310,6 +1551,46 @@ fn selftest(sh: &Shared, sr: u32, secs: f64) -> Result<(), Box<dyn Error>> {
             missing
         )
         .into());
+    }
+
+    // The other multiply, checked on the same click. Spreading layer 0 one-in-n
+    // must silence it at every boundary but one, and moving it must move which
+    // one — and both must be exactly reversible, since the whole claim of doing
+    // this at playback rather than by copying is that nothing was destroyed.
+    if n >= 2 {
+        println!("\n  Spread: the same layer, sounding once instead of {} times.", n);
+        let before: Vec<f32> = (0..n).map(click_at).collect();
+        sh.l_period[0].store(n, Ordering::Release);
+        sh.l_phase[0].store(0, Ordering::Release);
+        let sounding: Vec<usize> = (0..n).filter(|&c| click_at(c) >= 0.01).collect();
+        if sounding != vec![0] {
+            return Err(format!(
+                "spread one-in-{} should sound at cycle 0 alone; it sounds at {:?}",
+                n, sounding
+            )
+            .into());
+        }
+        sh.l_phase[0].store(n - 1, Ordering::Release);
+        let moved: Vec<usize> = (0..n).filter(|&c| click_at(c) >= 0.01).collect();
+        if moved != vec![n - 1] {
+            return Err(format!(
+                "moved to the last slot it should sound at cycle {} alone; it sounds at {:?}",
+                n - 1,
+                moved
+            )
+            .into());
+        }
+        println!("    sounds at cycle 0 alone, then at cycle {} alone.", n - 1);
+
+        sh.l_period[0].store(1, Ordering::Release);
+        sh.l_phase[0].store(0, Ordering::Release);
+        let after: Vec<f32> = (0..n).map(click_at).collect();
+        if before != after {
+            return Err("dense again did not restore what spreading hid — the audio \
+                        was altered by an operation that is supposed to be a view of it"
+                .into());
+        }
+        println!("    and dense again is identical to before, sample for sample.");
     }
 
     let slip = e1 - e0;
