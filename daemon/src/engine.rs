@@ -1572,7 +1572,13 @@ fn save_take(sh: &Shared, sr: u32, name: &str) -> String {
         // Nothing is writing the arena here — saving is refused while
         // recording — so a plain read is a consistent read.
         let samples: Vec<f32> = (0..len).map(|p| sh.read(l, p)).collect();
-        let file = format!("layer-{}.wav", l);
+        // Zero-padded because these become a SuperDirt sample bank, and its
+        // loader sorts the folder lexicographically to assign `n` indices.
+        // Unpadded, a tenth layer would sort between the first and the second
+        // and every index past it would name the wrong audio — silently, since
+        // nothing downstream can tell a misordered bank from an intended one.
+        // `MAX_LAYERS` is 8 today, so this is insurance bought while it is free.
+        let file = format!("layer-{:02}.wav", l);
         if let Err(e) = std::fs::write(dir.join(&file), crate::wav::wav_bytes(&samples, sr)) {
             return format!("could not write {}: {}", file, e);
         }
