@@ -105,6 +105,14 @@ type LoopState =
   , phase :: Number
   , armed :: Boolean
   , recording :: Boolean
+  -- | Whether this loop waits for the grid — the first loop's cycle — before
+  -- | starting, and rounds its length to a whole number of those cycles.
+  -- | Off by default, so a loop is free unless asked otherwise.
+  , quant :: Boolean
+  -- | Frames until a scheduled transition fires, or -1 when nothing is
+  -- | pending. What lets the display say "starts in 1.4 s" rather than leaving
+  -- | a deliberate wait looking like a dead button.
+  , pendingAt :: Int
   , shapes :: Array LayerShape
   }
 

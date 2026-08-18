@@ -174,6 +174,23 @@ pub struct Loop {
     /// Set by the control thread, consumed by the output callback, which is the
     /// only place a transition can be stamped to an exact frame.
     request: AtomicU8Wrapper,
+    /// The output frame the pending request should take effect on, or
+    /// `i64::MIN` for "the next buffer", which is what every request used to be.
+    ///
+    /// This is what makes a loop start *on* a boundary rather than within a
+    /// buffer of one. Sleeping on the control thread until the boundary and
+    /// then setting the request would still land at the start of whichever
+    /// buffer came next — up to a full buffer late, and a buffer is 21 ms at
+    /// 1024 frames, which is an audible flam against a loop already playing.
+    /// The callback is the only thread that knows the frame, so the frame is
+    /// what it is told.
+    request_at: AtomicI64,
+    /// Whether this loop's transitions wait for the grid.
+    ///
+    /// Off by default, so a rig that never asks for it behaves exactly as it
+    /// did — which is also what keeps the self-test a regression test rather
+    /// than a description of new behaviour.
+    quant: AtomicBool,
     /// Highest position the first recording reached, so a loop can be closed at
     /// the right length even though the input trails the output.
     reached: AtomicUsize,
@@ -196,6 +213,8 @@ impl Loop {
             origin: AtomicI64::new(0),
             state: AtomicU8Wrapper::new(IDLE),
             request: AtomicU8Wrapper::new(0),
+            request_at: AtomicI64::new(i64::MIN),
+            quant: AtomicBool::new(false),
             reached: AtomicUsize::new(0),
             overflowed: AtomicBool::new(false),
             rec_from: AtomicI64::new(0),
@@ -222,6 +241,20 @@ impl Loop {
     /// claim on the one converter the rig has.
     pub fn wants_input(&self) -> bool {
         self.is_armed() || self.is_recording()
+    }
+    pub fn quantised(&self) -> bool {
+        self.quant.load(Ordering::Relaxed)
+    }
+    /// Frames until a scheduled transition fires, or `-1` when nothing is
+    /// pending or it has no deadline.
+    pub fn pending_in(&self, now: i64) -> i64 {
+        if self.request.get() == 0 {
+            return -1;
+        }
+        match self.request_at.load(Ordering::Acquire) {
+            i64::MIN => -1,
+            at => (at - now).max(0),
+        }
     }
     pub fn layer_shape(&self, layer: usize) -> (usize, usize, usize) {
         (
@@ -289,6 +322,9 @@ pub struct Shared {
     /// is a mode, and a mode that a footswitch could fall out of step with is
     /// the thing this design is trying not to have.
     pub selected: AtomicUsize,
+    /// Which loop's cycle is the grid, or `N_LOOPS` for none yet. Set by the
+    /// first loop to acquire a length; see `grid`.
+    pub anchor: AtomicUsize,
     pub out_frames: AtomicUsize,
     in_frames: AtomicUsize,
     pub k: AtomicI64,
@@ -411,6 +447,67 @@ impl Shared {
     /// Whether any loop is claiming the input, including one merely armed.
     pub fn input_claimed(&self) -> Option<usize> {
         (0..N_LOOPS).find(|&i| self.loops[i].wants_input())
+    }
+
+    /// The grid quantised loops align to: the anchor's origin and cycle length.
+    ///
+    /// The anchor is the first loop to acquire a length, which is how a looper
+    /// has always worked — the thing you played first is the thing everything
+    /// else fits around. It is *derived* on every call rather than cached,
+    /// because a cached anchor survives the loop being cleared and would hand
+    /// out a grid belonging to audio that no longer exists.
+    ///
+    /// Deliberately not Link. Tempo alone gives a bar's *length* but not where
+    /// the bar falls, and aligning to a boundary needs both — so until the
+    /// frame-to-wall-clock join lands, the grid the engine can honestly offer
+    /// is another loop's cycle. That is also the grid that matters most here:
+    /// six loops agreeing with each other is the point, and agreeing with
+    /// Ableton is a bonus.
+    pub fn grid(&self) -> Option<(i64, usize)> {
+        let a = self.anchor.load(Ordering::Acquire);
+        if a >= N_LOOPS {
+            return None;
+        }
+        let lp = self.lp(a);
+        let len = lp.loop_len.load(Ordering::Acquire);
+        if len == 0 {
+            return None;
+        }
+        Some((lp.origin.load(Ordering::Acquire), len))
+    }
+
+    /// The first output frame at or after `from` that lands on the grid.
+    pub fn next_boundary(&self, from: i64) -> Option<i64> {
+        let (origin, len) = self.grid()?;
+        let elapsed = from - origin;
+        let cycles = elapsed.div_euclid(len as i64) + if elapsed.rem_euclid(len as i64) == 0 { 0 } else { 1 };
+        Some(origin + cycles * len as i64)
+    }
+
+    /// Remember which loop laid down the grid, the first time one does.
+    fn claim_anchor(&self, li: usize) {
+        let _ = self.anchor.compare_exchange(
+            N_LOOPS,
+            li,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Give up the grid when the loop that set it loses its length.
+    ///
+    /// `grid` already refuses to serve a boundary from an empty anchor, so the
+    /// audio is safe without this — but the index would stay pointed at the
+    /// cleared loop and `claim_anchor` only succeeds from "none", so the next
+    /// loop recorded could never become the grid. The rig would quietly have no
+    /// grid for the rest of the session.
+    fn release_anchor(&self, li: usize) {
+        let _ = self.anchor.compare_exchange(
+            li,
+            N_LOOPS,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
     }
 
     /// Record what a command had to say, for the snapshot to carry.
@@ -555,6 +652,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         ring_len,
         loops: (0..N_LOOPS).map(|_| Loop::new()).collect(),
         selected: AtomicUsize::new(0),
+        anchor: AtomicUsize::new(N_LOOPS),
         out_frames: AtomicUsize::new(0),
         in_frames: AtomicUsize::new(0),
         k: AtomicI64::new(0),
@@ -622,7 +720,31 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                 // `take`s a buffer, and each is a swap on an uncontended atomic.
                 for li in 0..N_LOOPS {
                     let lp = sh.lp(li);
-                    match lp.request.take() {
+                    // Peek, not take: a request with a deadline in the future
+                    // has to survive this buffer and be reconsidered on the
+                    // next. Consuming first and re-arming would lose it if the
+                    // control thread never looked again.
+                    let pending = lp.request.get();
+                    if pending == 0 {
+                        continue;
+                    }
+                    let at = lp.request_at.load(Ordering::Acquire);
+                    // Due if it has no deadline, or its deadline falls inside
+                    // this buffer, or has already gone by — a deadline in the
+                    // past means the control thread was late, and being late is
+                    // not a reason to wait a whole cycle more.
+                    if at != i64::MIN && at >= (base + frames) as i64 {
+                        continue;
+                    }
+                    // The frame the transition belongs to. `origin` and
+                    // `rec_from` are stamped with this rather than with the
+                    // buffer start, which is what makes the alignment exact:
+                    // the flag flips at buffer granularity, but everything
+                    // downstream reads the frame.
+                    let stamp = if at == i64::MIN { base as i64 } else { at.max(base as i64) };
+                    lp.request.set(0);
+                    lp.request_at.store(i64::MIN, Ordering::Release);
+                    match pending {
                         ARMED => {
                             lp.reached.store(0, Ordering::Release);
                             let n = lp.n_layers.load(Ordering::Acquire);
@@ -634,8 +756,8 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                                     // hit record — playback reads origin too. The
                                     // self-test cannot catch that, because both
                                     // sides move together.
-                                    lp.origin.store(base as i64, Ordering::Release);
-                                    lp.rec_from.store(base as i64, Ordering::Release);
+                                    lp.origin.store(stamp, Ordering::Release);
+                                    lp.rec_from.store(stamp, Ordering::Release);
                                     lp.state.set(FIRST);
                                 } else {
                                     // An overdub is modular against the existing
@@ -983,6 +1105,46 @@ fn commit(sh: &Shared, li: usize, sr: u32) {
     if state != FIRST && state != OVERDUB {
         return;
     }
+
+    // A quantised first recording gets a length that is a whole number of grid
+    // cycles, decided here rather than taken from what happened to be captured.
+    // Rounding to nearest means a press slightly late loses the overhang and a
+    // press slightly early waits — which is right, because the intent was a
+    // whole number of cycles either way, and a human aiming at a boundary
+    // misses it in both directions.
+    //
+    // The wait happens BEFORE the state flips, so the loop keeps recording up
+    // to the boundary. Flipping first and waiting after would hand back a loop
+    // whose last fraction of a cycle is silence.
+    let quantised_len = if state == FIRST && lp.quant.load(Ordering::Relaxed) {
+        sh.grid().and_then(|(_, glen)| {
+            let from = lp.origin.load(Ordering::Acquire);
+            let cur = sh.out_frames.load(Ordering::Acquire) as i64;
+            let elapsed = (cur - from).max(0) as f64;
+            let n = ((elapsed / glen as f64).round() as usize).max(1);
+            let len = n * glen;
+            if len > sh.max_frames {
+                println!("  {} grid cycles would exceed --max-secs; closing free.", n);
+                return None;
+            }
+            let target = from + len as i64;
+            if target > cur {
+                println!(
+                    "  waiting {:.2} s for the grid boundary ({} cycle{}).",
+                    (target - cur) as f64 / sr as f64,
+                    n,
+                    if n == 1 { "" } else { "s" }
+                );
+                while (sh.out_frames.load(Ordering::Acquire) as i64) < target {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            Some(len)
+        })
+    } else {
+        None
+    };
+
     // Let the input drain: it trails the output by K, so the last frames of the
     // loop have not arrived yet. Without this the tail of every recording is
     // missing, which is exactly the kind of fault that sounds like "feel".
@@ -990,7 +1152,7 @@ fn commit(sh: &Shared, li: usize, sr: u32) {
     std::thread::sleep(Duration::from_millis(60));
 
     if state == FIRST {
-        let mut len = lp.reached.load(Ordering::Acquire);
+        let mut len = quantised_len.unwrap_or_else(|| lp.reached.load(Ordering::Acquire));
         if len == 0 {
             println!("  nothing recorded.");
             return;
@@ -998,7 +1160,16 @@ fn commit(sh: &Shared, li: usize, sr: u32) {
         // Pre-roll: a tap is always a little late, so back-date the loop's start
         // and fill the front from the ring. The attack that would have been
         // clipped off is already captured; it just has to be claimed.
-        let pre = sh.preroll.load(Ordering::Acquire);
+        // Never for a quantised loop: the pre-roll shifts `origin` backwards to
+        // reclaim the attack, and moving origin is exactly what must not happen
+        // to a loop that was started on a boundary. Alignment beats the last
+        // few milliseconds of the attack, and a loop that drifts off the grid
+        // by its pre-roll would be a bug nobody could see the cause of.
+        let pre = if quantised_len.is_some() {
+            0
+        } else {
+            sh.preroll.load(Ordering::Acquire)
+        };
         let layer = lp.n_layers.load(Ordering::Acquire);
         let origin = lp.origin.load(Ordering::Acquire);
         let new_origin = origin - pre as i64;
@@ -1030,6 +1201,11 @@ fn commit(sh: &Shared, li: usize, sr: u32) {
             );
         }
         lp.loop_len.store(len, Ordering::Release);
+        // The first loop to acquire a length becomes the grid the rest
+        // can align to — first rather than chosen, because that is how a
+        // looper has always worked: what you played first is what the
+        // rest fits around. A compare-exchange, so later calls are no-ops.
+        sh.claim_anchor(li);
         println!(
             "  loop set: {} frames ({:.3} s), {:.1} bpm if that is one bar of 4/4",
             len,
@@ -1183,6 +1359,11 @@ fn take(sh: &Shared, li: usize, sr: u32, secs: f64) {
 
     if loop_len == 0 {
         lp.loop_len.store(len, Ordering::Release);
+        // The first loop to acquire a length becomes the grid the rest
+        // can align to — first rather than chosen, because that is how a
+        // looper has always worked: what you played first is what the
+        // rest fits around. A compare-exchange, so later calls are no-ops.
+        sh.claim_anchor(li);
         lp.origin.store(from_out, Ordering::Release);
         lp.state.set(PLAYING);
         println!(
@@ -1456,6 +1637,7 @@ fn free_length(sh: &Shared, li: usize, sr: u32) -> String {
     lp.loop_len.store(0, Ordering::Release);
     lp.reached.store(0, Ordering::Release);
     lp.state.set(IDLE);
+    sh.release_anchor(li);
     format!(
         "length forgotten (was {:.3} s). The next recording sets a new one.",
         was as f64 / sr as f64
@@ -1472,6 +1654,7 @@ fn control_loop(sh: &Shared, sr: u32) -> bool {
     println!("           s [n] = spread one in n   o = move it one slot   d = dense again");
     println!("           u = undo a layer   z = forget the length   c = both");
     println!("           w [name] = save the take (one file per layer + manifest)");
+    println!("           g = follow the grid (the first loop's cycle) / free");
     println!(
         "           a leading digit picks the loop: 3r records loop 3, 3s2 spreads it,\n\
          \x20          a bare 3 selects it. {} loops, 0 to {}.",
@@ -1555,8 +1738,34 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                         // An overdub sums into its layer, so anything left there
                         // from an undone take would bleed into the new one.
                         sh.zero_layer(li, layer);
-                        lp.request.set(ARMED);
-                        println!("  recording...");
+                        // Only a FIRST recording needs a deadline. An overdub
+                        // records from `origin`, so it is already on whatever
+                        // grid its loop sits on and cannot be nudged off it.
+                        let boundary = if lp.quant.load(Ordering::Relaxed)
+                            && lp.loop_len.load(Ordering::Acquire) == 0
+                        {
+                            sh.next_boundary(sh.out_frames.load(Ordering::Acquire) as i64)
+                        } else {
+                            None
+                        };
+                        match boundary {
+                            Some(t) => {
+                                lp.request_at.store(t, Ordering::Release);
+                                lp.request.set(ARMED);
+                                let wait =
+                                    (t - sh.out_frames.load(Ordering::Acquire) as i64).max(0);
+                                return format!(
+                                    "loop {} starts on the grid in {:.2} s.",
+                                    li,
+                                    wait as f64 / sr as f64
+                                );
+                            }
+                            None => {
+                                lp.request_at.store(i64::MIN, Ordering::Release);
+                                lp.request.set(ARMED);
+                                println!("  recording...");
+                            }
+                        }
                     }
                 }
             },
@@ -1569,6 +1778,37 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             l if l.starts_with('s') => {
                 let n = l[1..].trim().parse::<usize>().unwrap_or(2);
                 println!("  {}", sparse(sh, li, sr, n));
+            }
+            // Grid sync for this loop. Explicit forms alongside the toggle for
+            // the same reason `k` and `m` have them: a client that flips rather
+            // than sets drifts out of step the first time a message is dropped
+            // and never recovers.
+            "g" | "g1" | "g0" => {
+                let on = match rest {
+                    "g1" => true,
+                    "g0" => false,
+                    _ => !lp.quant.load(Ordering::Relaxed),
+                };
+                lp.quant.store(on, Ordering::Relaxed);
+                return match (on, sh.grid()) {
+                    (false, _) => format!("loop {} is free.", li),
+                    (true, Some((_, glen))) => format!(
+                        "loop {} follows the grid ({:.3} s from loop {}).",
+                        li,
+                        glen as f64 / sr as f64,
+                        sh.anchor.load(Ordering::Acquire)
+                    ),
+                    // Worth saying plainly rather than reporting success: the
+                    // setting took, but with nothing to align to it does
+                    // nothing, and a loop that starts free when you asked for
+                    // the grid is the kind of surprise that gets blamed on the
+                    // engine much later.
+                    (true, None) => format!(
+                        "loop {} will follow the grid — but no loop has a length yet, \
+                         so there is no grid. The first recording makes one.",
+                        li
+                    ),
+                };
             }
             "o" => println!("  {}", rotate(sh, li)),
             "d" => println!("  {}", dense(sh, li)),
@@ -1619,6 +1859,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     sh.zero_layer(li, l);
                     lp.set_layer_shape(l, 0);
                 }
+                sh.release_anchor(li);
                 println!("  cleared.");
             }
             // `k` and `m` flip, which is right at a console and wrong over a
