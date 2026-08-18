@@ -11,6 +11,7 @@ mod engine;
 mod ws;
 mod levels;
 mod measure;
+mod wav;
 
 use std::process::ExitCode;
 
@@ -61,6 +62,7 @@ USAGE
       --ws              serve the app on ws://127.0.0.1:3028
       --ws-port <n>     ...on a different port
       --ring-secs <s>   how much of the past stays claimable      (default 60)
+      --takes-dir <p>   where `w` saves takes         (default ~/.itajara/takes)
       --preroll-ms <n>  how far before the tap the first loop actually
                         starts, pulled from the pre-roll           (default 0)
       --selftest <s>    record one cycle of the engine's own click through a
@@ -265,6 +267,7 @@ fn parse_loop(args: &[String]) -> Result<engine::Opts, String> {
                 opts.ws_port = Some(value.parse().map_err(|_| "--ws-port wants a port number")?)
             }
             "--ring-secs" => opts.ring_secs = value.parse().map_err(|_| "--ring-secs wants a number")?,
+            "--takes-dir" => opts.takes_dir = value.into(),
             "--preroll-ms" => opts.preroll_ms = value.parse().map_err(|_| "--preroll-ms wants a number")?,
             "--selftest" => {
                 opts.selftest = Some(value.parse().map_err(|_| "--selftest wants a length in seconds")?)

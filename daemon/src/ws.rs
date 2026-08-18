@@ -98,6 +98,11 @@ fn talk(
                     let ack = dispatch(&sh, sr, &cmd);
                     if !ack.is_empty() {
                         println!("  [app] {}", ack);
+                        // Which is where it used to stop. Printing to the
+                        // daemon's stdout told whoever was looking at a
+                        // terminal, and the app — the only thing that is
+                        // definitely watching — learned nothing at all.
+                        sh.note_ack(&ack);
                     }
                 });
             }
@@ -163,13 +168,19 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
         })
         .collect();
 
+    // The last thing a command said, carried in every snapshot rather than sent
+    // once. A client that reloads still sees it, and one that misses a frame has
+    // not missed the only copy.
+    let ack = sh.ack.lock().map(|g| g.clone()).unwrap_or_default();
+
     format!(
         concat!(
             r#"{{"state":"{}","layers":{},"maxLayers":{},"loopFrames":{},"#,
             r#""loopSecs":{:.4},"pos":{},"phase":{:.5},"sampleRate":{},"#,
             r#""inDb":{:.1},"outDb":{:.1},"click":{},"monitor":{},"#,
             r#""armed":{},"recording":{},"calibrated":{},"k":{},"#,
-            r#""audioAlive":{},"deviceLost":{},"reopens":{},"shapes":[{}]}}"#
+            r#""audioAlive":{},"deviceLost":{},"reopens":{},"shapes":[{}],"#,
+            r#""ack":"{}","ackSeq":{}}}"#
         ),
         sh.state_name(),
         sh.n_layers.load(Ordering::Acquire),
@@ -191,7 +202,31 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
         sh.device_lost.load(Ordering::Acquire),
         sh.reopens.load(Ordering::Acquire),
         shapes.join(","),
+        escape(&ack),
+        sh.ack_seq.load(Ordering::Acquire),
     )
+}
+
+/// Enough JSON string escaping for the one free-text field in the snapshot.
+///
+/// Acks carry filesystem paths and error text from the OS, neither of which
+/// this code chose, so they can contain quotes and backslashes — and an
+/// unescaped one would not corrupt the ack, it would make the whole snapshot
+/// unparseable and take the display down with it.
+fn escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn db(x: f32) -> f64 {

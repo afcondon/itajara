@@ -11,6 +11,7 @@
 -- | the app feeling slow. The FFI keeps the newest and drops the rest.
 module Foreign.LooperSocket
   ( LooperState
+  , LayerShape
   , SocketStatus
   , connect
   , send
@@ -50,6 +51,27 @@ type LooperState =
   , audioAlive :: Boolean
   , deviceLost :: Boolean
   , reopens :: Int
+  -- | Each layer's own length and where it sounds. The daemon has sent these
+  -- | since layers stopped being tiled into the cycle; this type went on
+  -- | claiming to mirror the snapshot without them, which is how a field the
+  -- | display most needs stayed invisible.
+  -- |
+  -- | `period` and `phase` are the whole reason a take is stored rather than
+  -- | flattened: two layers of the same length look identical until you can see
+  -- | that one of them sounds one cycle in four.
+  , shapes :: Array LayerShape
+  -- | What the last command had to say, and a counter that moves when it
+  -- | changes. Carried in every snapshot rather than sent once, so a reload
+  -- | still sees it — and so a client can tell a fresh ack from the same one
+  -- | still on screen.
+  , ack :: String
+  , ackSeq :: Int
+  }
+
+type LayerShape =
+  { len :: Int
+  , period :: Int
+  , phase :: Int
   }
 
 type SocketStatus =

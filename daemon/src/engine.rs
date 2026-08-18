@@ -34,6 +34,7 @@
 use cpal::traits::{DeviceTrait, StreamTrait};
 use std::error::Error;
 use std::io::BufRead;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -82,6 +83,9 @@ pub struct Opts {
     pub monitor: bool,
     /// TCP port for the app to connect on. None keeps the daemon console-only.
     pub ws_port: Option<u16>,
+    /// Where `w` writes takes. Under `$HOME` by convention, beside `~/.es9` and
+    /// `~/.fh2`.
+    pub takes_dir: PathBuf,
 }
 
 impl Default for Opts {
@@ -101,7 +105,17 @@ impl Default for Opts {
             dual: true,
             monitor: false,
             ws_port: None,
+            takes_dir: default_takes_dir(),
         }
+    }
+}
+
+/// `~/.itajara/takes`, or a relative path if there is no home — which happens
+/// under some launchers, and is better than refusing to save at all.
+pub fn default_takes_dir() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home).join(".itajara").join("takes"),
+        None => PathBuf::from("itajara-takes"),
     }
 }
 
@@ -182,6 +196,24 @@ pub struct Shared {
     /// than hiding — a rig that silently recovers six times in a session is
     /// telling you something about the cable.
     pub reopens: AtomicUsize,
+    /// Where saved takes go.
+    pub takes_dir: PathBuf,
+    /// The last thing a command had to say, and a counter that moves whenever
+    /// it changes.
+    ///
+    /// `dispatch` has always returned a sentence and the socket has always
+    /// thrown it away — printing it to the daemon's stdout, where no app can
+    /// see it. So a command either worked or did not and the display could not
+    /// tell which, which is the same silence this project keeps finding.
+    ///
+    /// It rides in the snapshot rather than as its own message because the app
+    /// keeps only the newest message it received: a separate ack would be
+    /// overwritten within a frame, or worse, handed to a decoder expecting
+    /// state. The sequence number is what lets a client tell a fresh ack from
+    /// the same one still being shown — and if two commands land inside one
+    /// tick the counter jumps by two, so the loss is visible instead of silent.
+    pub ack: Mutex<String>,
+    pub ack_seq: AtomicUsize,
 }
 
 /// `AtomicU8` under a name that makes the intent obvious at the use sites.
@@ -217,6 +249,14 @@ impl Shared {
     }
     pub fn is_recording(&self) -> bool {
         matches!(self.state.get(), FIRST | OVERDUB | MULTIPLY)
+    }
+
+    /// Record what a command had to say, for the snapshot to carry.
+    pub fn note_ack(&self, msg: &str) {
+        if let Ok(mut g) = self.ack.lock() {
+            *g = msg.to_string();
+        }
+        self.ack_seq.fetch_add(1, Ordering::Release);
     }
 
     fn cell(&self, layer: usize, pos: usize) -> &AtomicU32 {
@@ -391,6 +431,9 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         p0_frame: AtomicUsize::new(0),
         device_lost: AtomicBool::new(false),
         reopens: AtomicUsize::new(0),
+        takes_dir: opts.takes_dir.clone(),
+        ack: Mutex::new(String::new()),
+        ack_seq: AtomicUsize::new(0),
     });
 
     // Both streams are rebuilt on recovery, so building them lives in a closure
@@ -1250,6 +1293,7 @@ fn control_loop(sh: &Shared, sr: u32) -> bool {
     println!("Commands:  r = record/overdub toggle   x = multiply   t [secs] = take");
     println!("           s [n] = spread one in n   o = move it one slot   d = dense again");
     println!("           u = undo a layer   z = forget the length   c = both");
+    println!("           w [name] = save the take (one file per layer + manifest)");
     println!("           k = click   m = input monitoring");
     println!("           l = levels   p = status + waveforms   q = quit\n");
 
@@ -1312,6 +1356,12 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             "o" => println!("  {}", rotate(sh)),
             "d" => println!("  {}", dense(sh)),
             "z" => println!("  {}", free_length(sh, sr)),
+            // Returned rather than printed. This is the one command whose whole
+            // point is *where* it put something, and a path printed on the
+            // daemon's stdout is a path the app cannot show anyone — so the
+            // message goes back as the ack and both callers display it
+            // themselves. Printing here as well got it shown twice.
+            l if l.starts_with('w') => return save_take(sh, sr, &l[1..]),
             "u" => {
                 let n = sh.n_layers.load(Ordering::Acquire);
                 if n == 0 {
@@ -1428,6 +1478,112 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
         }
     }
     String::new()
+}
+
+/// Write the loop out as a take: one file per layer, plus a manifest.
+///
+/// **Not a bounce.** A take is the layers at the lengths they were recorded,
+/// with their `period` and `phase` recorded beside them — so a take reloads as
+/// the thing that was played, and `s`/`o`/`d` still mean something afterwards.
+/// The resolved mix is a *view* of this and can be rendered whenever it is
+/// wanted; the reverse is not true, because flattening destroys the fact that
+/// there were layers at all. Same argument as the engine's refusal to tile a
+/// layer into a longer cycle, and as `MidiClip` storing every note.
+///
+/// The manifest carries no timestamp on purpose. Two takes of identical audio
+/// should produce identical bytes, because the destination for these is
+/// amphora, which keys an artefact by the hash of its content — a clock reading
+/// baked into the payload would make every save a different artefact and throw
+/// that away. When it was written is the filesystem's business.
+fn save_take(sh: &Shared, sr: u32, name: &str) -> String {
+    if sh.is_recording() || sh.is_armed() {
+        return "finish the recording first — a layer still being written is half a thing.".into();
+    }
+    let n = sh.n_layers.load(Ordering::Acquire);
+    let loop_len = sh.loop_len.load(Ordering::Acquire);
+    if n == 0 || loop_len == 0 {
+        return "nothing to save yet.".into();
+    }
+
+    let name = safe_name(name);
+    let dir = sh.takes_dir.join(&name);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return format!("could not make {}: {}", dir.display(), e);
+    }
+
+    let mut entries: Vec<String> = Vec::new();
+    let mut written = 0usize;
+    for l in 0..n {
+        let (len, period, phase) = sh.layer_shape(l);
+        if len == 0 {
+            continue;
+        }
+        if len > crate::wav::MAX_FRAMES {
+            return format!("layer {} is longer than a WAV can address.", l);
+        }
+        // Nothing is writing the arena here — saving is refused while
+        // recording — so a plain read is a consistent read.
+        let samples: Vec<f32> = (0..len).map(|p| sh.read(l, p)).collect();
+        let file = format!("layer-{}.wav", l);
+        if let Err(e) = std::fs::write(dir.join(&file), crate::wav::wav_bytes(&samples, sr)) {
+            return format!("could not write {}: {}", file, e);
+        }
+        entries.push(format!(
+            r#"{{"file":"{}","len":{},"period":{},"phase":{}}}"#,
+            file, len, period, phase
+        ));
+        written += 1;
+    }
+
+    // Hand-rolled for the same reason `snapshot` is: the shape is fixed and
+    // small, and every value in it is a number or a name this function chose,
+    // so there is nothing here that could need escaping.
+    let manifest = format!(
+        concat!(
+            "{{\n  \"version\": 1,\n  \"sampleRate\": {},\n",
+            "  \"loopFrames\": {},\n  \"loopSecs\": {:.6},\n  \"layers\": [\n    {}\n  ]\n}}\n"
+        ),
+        sr,
+        loop_len,
+        loop_len as f64 / sr as f64,
+        entries.join(",\n    ")
+    );
+    if let Err(e) = std::fs::write(dir.join("take.json"), manifest) {
+        return format!("wrote the audio but not the manifest: {}", e);
+    }
+
+    format!(
+        "saved {} layer{} ({:.3} s) to {}",
+        written,
+        if written == 1 { "" } else { "s" },
+        loop_len as f64 / sr as f64,
+        dir.display()
+    )
+}
+
+/// A take name that cannot leave the takes directory.
+///
+/// Everything outside a small safe set becomes a dash rather than being
+/// rejected, so a name typed with a slash in it still saves somewhere sensible
+/// instead of failing at the one moment the user is trying not to lose a take.
+fn safe_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let cleaned = cleaned.trim_matches('-').to_string();
+    if cleaned.is_empty() {
+        format!(
+            "take-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        )
+    } else {
+        cleaned
+    }
 }
 
 /// Record one cycle of the engine's own click through a loopback cable and ask
