@@ -139,9 +139,54 @@ fn talk(
 /// grows a variable shape, that is the moment to reach for serde and not
 /// before.
 fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
-    let loop_len = sh.loop_len.load(Ordering::Acquire);
-    let origin = sh.origin.load(Ordering::Acquire);
     let cur = sh.out_frames.load(Ordering::Acquire) as i64;
+
+    // One object per loop, and separately the SELECTED loop's numbers repeated
+    // at the top level.
+    //
+    // The duplication is deliberate and temporary. The app's `LooperState` is a
+    // flat record describing one loop, written when there was one; promoting it
+    // to an array is a change to every reader of it. Keeping the old fields
+    // pointed at the selected loop means the existing Looper page keeps working
+    // untouched while the six-loop display is built against `loops` — rather
+    // than the display and the engine both being new at once, which is how you
+    // end up debugging two things and knowing neither.
+    let each: Vec<String> = (0..crate::engine::N_LOOPS)
+        .map(|li| {
+            let lp = sh.lp(li);
+            let len = lp.loop_len.load(Ordering::Acquire);
+            let origin = lp.origin.load(Ordering::Acquire);
+            let pos = if len > 0 { (cur - origin).rem_euclid(len as i64) as usize } else { 0 };
+            let shapes: Vec<String> = (0..lp.n_layers.load(Ordering::Acquire))
+                .map(|l| {
+                    let (slen, period, phase) = lp.layer_shape(l);
+                    format!(r#"{{"len":{},"period":{},"phase":{}}}"#, slen, period, phase)
+                })
+                .collect();
+            format!(
+                concat!(
+                    r#"{{"index":{},"state":"{}","layers":{},"loopFrames":{},"#,
+                    r#""loopSecs":{:.4},"pos":{},"phase":{:.5},"armed":{},"#,
+                    r#""recording":{},"shapes":[{}]}}"#
+                ),
+                li,
+                lp.state_name(),
+                lp.n_layers.load(Ordering::Acquire),
+                len,
+                len as f64 / sr as f64,
+                pos,
+                if len > 0 { pos as f64 / len as f64 } else { 0.0 },
+                lp.is_armed(),
+                lp.is_recording(),
+                shapes.join(","),
+            )
+        })
+        .collect();
+
+    let sel = sh.sel();
+    let cl = sh.lp(sel);
+    let loop_len = cl.loop_len.load(Ordering::Acquire);
+    let origin = cl.origin.load(Ordering::Acquire);
     let pos = if loop_len > 0 {
         (cur - origin).rem_euclid(loop_len as i64) as usize
     } else {
@@ -158,9 +203,9 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
     // a loop and not what is in it: two takes of the same length look identical
     // when one of them plays one bar in four, and that is precisely the thing
     // the display exists to make visible.
-    let shapes: Vec<String> = (0..sh.n_layers.load(Ordering::Acquire))
+    let shapes: Vec<String> = (0..cl.n_layers.load(Ordering::Acquire))
         .map(|l| {
-            let (len, period, phase) = sh.layer_shape(l);
+            let (len, period, phase) = cl.layer_shape(l);
             format!(
                 r#"{{"len":{},"period":{},"phase":{}}}"#,
                 len, period, phase
@@ -184,10 +229,11 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
             r#""armed":{},"recording":{},"calibrated":{},"k":{},"#,
             r#""audioAlive":{},"deviceLost":{},"reopens":{},"shapes":[{}],"#,
             r#""ack":"{}","ackSeq":{},"linkTempo":{:.4},"linkQuantum":{:.4},"#,
-            r#""linkBarFrames":{},"linkAnchors":{},"linkRejected":{}}}"#
+            r#""linkBarFrames":{},"linkAnchors":{},"linkRejected":{},"#,
+            r#""selected":{},"nLoops":{},"loops":[{}]}}"#
         ),
-        sh.state_name(),
-        sh.n_layers.load(Ordering::Acquire),
+        cl.state_name(),
+        cl.n_layers.load(Ordering::Acquire),
         crate::engine::MAX_LAYERS,
         loop_len,
         loop_len as f64 / sr as f64,
@@ -198,8 +244,8 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
         db(out_peak),
         sh.click.load(Ordering::Relaxed),
         sh.monitor.load(Ordering::Relaxed),
-        sh.is_armed(),
-        sh.is_recording(),
+        cl.is_armed(),
+        cl.is_recording(),
         sh.k_set.load(Ordering::Acquire),
         sh.k.load(Ordering::Acquire),
         alive,
@@ -217,6 +263,9 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
         crate::engine::bar_frames(tempo, quantum, sr).unwrap_or(0),
         sh.link_anchors.load(Ordering::Acquire),
         sh.link_rejected.load(Ordering::Relaxed),
+        sel,
+        crate::engine::N_LOOPS,
+        each.join(","),
     )
 }
 

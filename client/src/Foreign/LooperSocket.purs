@@ -11,6 +11,7 @@
 -- | the app feeling slow. The FFI keeps the newest and drops the rest.
 module Foreign.LooperSocket
   ( LooperState
+  , LoopState
   , LayerShape
   , SocketStatus
   , connect
@@ -80,6 +81,31 @@ type LooperState =
   , linkBarFrames :: Int
   , linkAnchors :: Int
   , linkRejected :: Int
+  -- | All six loops, and which one the flat fields above describe.
+  -- |
+  -- | The duplication is deliberate and meant to be temporary. Everything above
+  -- | describes ONE loop, because there was one when this type was written;
+  -- | those fields now report whichever loop is selected, so this page keeps
+  -- | working untouched while the six-loop display is built against `loops`.
+  -- | Two new things at once is how you end up debugging both and understanding
+  -- | neither. When the new display lands, the flat fields go.
+  , selected :: Int
+  , nLoops :: Int
+  , loops :: Array LoopState
+  }
+
+-- | One loop as the daemon sees it.
+type LoopState =
+  { index :: Int
+  , state :: String
+  , layers :: Int
+  , loopFrames :: Int
+  , loopSecs :: Number
+  , pos :: Int
+  , phase :: Number
+  , armed :: Boolean
+  , recording :: Boolean
+  , shapes :: Array LayerShape
   }
 
 type LayerShape =
