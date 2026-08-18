@@ -66,6 +66,20 @@ type LooperState =
   -- | still on screen.
   , ack :: String
   , ackSeq :: Int
+  -- | What the rig's clock says, from link-spike's `/link/anchor`. Zero
+  -- | throughout when no anchor has arrived — `linkAnchors` is what
+  -- | distinguishes "no clock" from "a clock reading zero", and
+  -- | `linkRejected` counts anchors that arrived in a shape we would not
+  -- | believe, so a changed message cannot be adopted in silence.
+  -- |
+  -- | `linkBarFrames` is the one number quantisation needs and the looper
+  -- | cannot derive: it measures cycles, and nothing in it has an opinion
+  -- | about metre.
+  , linkTempo :: Number
+  , linkQuantum :: Number
+  , linkBarFrames :: Int
+  , linkAnchors :: Int
+  , linkRejected :: Int
   }
 
 type LayerShape =

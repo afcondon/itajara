@@ -7,6 +7,12 @@ description = "Itajara \u2014 the looper engine for producing-with-your-feet (Ep
 [dependencies]
 cpal = "0.15"
 tungstenite = "0.24"
+# For /link/anchor only. Hand-decoding was the obvious move given the WAV header
+# next door, but OSC has padding rules and — unlike a WAV — there is no
+# independent decoder to check a hand-rolled parse against. link-spike encodes
+# these bytes with this crate and es9-daemon decodes them with it, so matching
+# it means a parse bug cannot be a divergence from the thing generating them.
+rosc = "0.10"
 
 [profile.release]
 opt-level = 3

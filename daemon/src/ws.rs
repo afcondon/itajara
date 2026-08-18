@@ -173,6 +173,9 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
     // not missed the only copy.
     let ack = sh.ack.lock().map(|g| g.clone()).unwrap_or_default();
 
+    let tempo = f64::from_bits(sh.link_tempo.load(Ordering::Relaxed));
+    let quantum = f64::from_bits(sh.link_quantum.load(Ordering::Relaxed));
+
     format!(
         concat!(
             r#"{{"state":"{}","layers":{},"maxLayers":{},"loopFrames":{},"#,
@@ -180,7 +183,8 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
             r#""inDb":{:.1},"outDb":{:.1},"click":{},"monitor":{},"#,
             r#""armed":{},"recording":{},"calibrated":{},"k":{},"#,
             r#""audioAlive":{},"deviceLost":{},"reopens":{},"shapes":[{}],"#,
-            r#""ack":"{}","ackSeq":{}}}"#
+            r#""ack":"{}","ackSeq":{},"linkTempo":{:.4},"linkQuantum":{:.4},"#,
+            r#""linkBarFrames":{},"linkAnchors":{},"linkRejected":{}}}"#
         ),
         sh.state_name(),
         sh.n_layers.load(Ordering::Acquire),
@@ -204,6 +208,15 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
         shapes.join(","),
         escape(&ack),
         sh.ack_seq.load(Ordering::Acquire),
+        tempo,
+        quantum,
+        // Zero rather than null when there is no clock: the app's snapshot type
+        // is a flat record of plain values, and one nullable field would make
+        // every reader of it handle an absence that `linkAnchors == 0` already
+        // states more precisely.
+        crate::engine::bar_frames(tempo, quantum, sr).unwrap_or(0),
+        sh.link_anchors.load(Ordering::Acquire),
+        sh.link_rejected.load(Ordering::Relaxed),
     )
 }
 

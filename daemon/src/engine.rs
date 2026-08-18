@@ -35,7 +35,7 @@ use cpal::traits::{DeviceTrait, StreamTrait};
 use std::error::Error;
 use std::io::BufRead;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -86,6 +86,9 @@ pub struct Opts {
     /// Where `w` writes takes. Under `$HOME` by convention, beside `~/.es9` and
     /// `~/.fh2`.
     pub takes_dir: PathBuf,
+    /// UDP port to hear `/link/anchor` on. `None` runs the looper without a
+    /// bar, which is the right default for using it alone.
+    pub link_port: Option<u16>,
 }
 
 impl Default for Opts {
@@ -106,6 +109,7 @@ impl Default for Opts {
             monitor: false,
             ws_port: None,
             takes_dir: default_takes_dir(),
+            link_port: None,
         }
     }
 }
@@ -214,6 +218,39 @@ pub struct Shared {
     /// tick the counter jumps by two, so the loss is visible instead of silent.
     pub ack: Mutex<String>,
     pub ack_seq: AtomicUsize,
+    /// The newest `/link/anchor`, as sent: microseconds, beat, tempo, quantum.
+    /// Doubles are held as bits because there is no `AtomicF64`.
+    ///
+    /// This is the only thing in the engine that knows what a bar is. Everything
+    /// else measures cycles, which is why a looper alone cannot answer "one bar"
+    /// and why quantisation waits on this rather than on a tap tempo.
+    pub link_micros: AtomicI64,
+    pub link_beat: AtomicU64,
+    pub link_tempo: AtomicU64,
+    pub link_quantum: AtomicU64,
+    /// The output frame the newest anchor arrived on — the half of the
+    /// wall-clock-to-frame join that can only be taken at the moment it lands.
+    pub link_frame: AtomicUsize,
+    /// How many anchors have been accepted, and how many were refused for
+    /// having the wrong shape or an impossible value. A silent listener and an
+    /// absent clock look identical from the app unless both are counted.
+    pub link_anchors: AtomicUsize,
+    pub link_rejected: AtomicUsize,
+}
+
+/// How many frames a bar lasts, or `None` when there is no usable tempo.
+///
+/// The whole of what tempo buys us on its own: a bar's *length*, which is
+/// enough to round a recording to a whole number of bars. Where we are within
+/// the bar is a different question and needs the frame counter tied to wall
+/// clock — see `link.rs`.
+pub fn bar_frames(tempo_bpm: f64, quantum: f64, sr: u32) -> Option<usize> {
+    if !(tempo_bpm > 0.0) || !(quantum > 0.0) {
+        return None;
+    }
+    let secs = 60.0 / tempo_bpm * quantum;
+    let frames = (secs * sr as f64).round();
+    if frames >= 1.0 { Some(frames as usize) } else { None }
 }
 
 /// `AtomicU8` under a name that makes the intent obvious at the use sites.
@@ -434,6 +471,13 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         takes_dir: opts.takes_dir.clone(),
         ack: Mutex::new(String::new()),
         ack_seq: AtomicUsize::new(0),
+        link_micros: AtomicI64::new(0),
+        link_beat: AtomicU64::new(0),
+        link_tempo: AtomicU64::new(0),
+        link_quantum: AtomicU64::new(0),
+        link_frame: AtomicUsize::new(0),
+        link_anchors: AtomicUsize::new(0),
+        link_rejected: AtomicUsize::new(0),
     });
 
     // Both streams are rebuilt on recovery, so building them lives in a closure
@@ -649,6 +693,10 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     out_stream.play()?;
     in_stream.play()?;
     std::thread::sleep(Duration::from_millis(300));
+
+    if let Some(port) = opts.link_port {
+        crate::link::spawn_listener(sh.clone(), sr, port);
+    }
 
     if let Some(port) = opts.ws_port {
         crate::ws::serve(sh.clone(), sr, port);

@@ -10,6 +10,7 @@ mod devices;
 mod engine;
 mod ws;
 mod levels;
+mod link;
 mod measure;
 mod wav;
 
@@ -63,6 +64,8 @@ USAGE
       --ws-port <n>     ...on a different port
       --ring-secs <s>   how much of the past stays claimable      (default 60)
       --takes-dir <p>   where `w` saves takes         (default ~/.itajara/takes)
+      --link            take the bar from link-spike's /link/anchor, on 57125
+      --link-port <n>   ...on a different port
       --preroll-ms <n>  how far before the tap the first loop actually
                         starts, pulled from the pre-roll           (default 0)
       --selftest <s>    record one cycle of the engine's own click through a
@@ -241,6 +244,11 @@ fn parse_loop(args: &[String]) -> Result<engine::Opts, String> {
             i += 1;
             continue;
         }
+        if flag == "--link" {
+            opts.link_port = Some(link::DEFAULT_ANCHOR_PORT);
+            i += 1;
+            continue;
+        }
         if flag == "--monitor" {
             opts.monitor = true;
             i += 1;
@@ -268,6 +276,9 @@ fn parse_loop(args: &[String]) -> Result<engine::Opts, String> {
             }
             "--ring-secs" => opts.ring_secs = value.parse().map_err(|_| "--ring-secs wants a number")?,
             "--takes-dir" => opts.takes_dir = value.into(),
+            "--link-port" => {
+                opts.link_port = Some(value.parse().map_err(|_| "--link-port wants a port number")?)
+            }
             "--preroll-ms" => opts.preroll_ms = value.parse().map_err(|_| "--preroll-ms wants a number")?,
             "--selftest" => {
                 opts.selftest = Some(value.parse().map_err(|_| "--selftest wants a length in seconds")?)

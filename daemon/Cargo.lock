@@ -357,6 +357,7 @@ name = "itajara"
 version = "0.1.0"
 dependencies = [
  "cpal",
+ "rosc",
  "tungstenite",
 ]
 
@@ -705,6 +706,16 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "rosc"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2e63d9e6b0d090be1485cf159b1e04c3973d2d3e1614963544ea2ff47a4a981"
+dependencies = [
+ "byteorder",
+ "nom",
+]
 
 [[package]]
 name = "rustc-hash"
