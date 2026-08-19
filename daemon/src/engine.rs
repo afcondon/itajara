@@ -2721,3 +2721,126 @@ fn onset_of(sh: &Shared, li: usize, layer: usize, len: usize) -> Option<(i64, f3
     let e = if onset > len / 2 { onset as i64 - len as i64 } else { onset as i64 };
     Some((e, peak))
 }
+
+/// The playhead arithmetic, which is the one part of speed that can be checked
+/// without a cable.
+///
+/// `align` proves where recorded audio *lands*; these prove where the playhead
+/// *is*, which is a different claim and the one this change actually makes. The
+/// property that matters most is the last one: a speed change must not move the
+/// audio, and that is a statement about two calls to `play_pos` either side of
+/// an `adopt` rather than about anything anyone can hear.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LEN: usize = 1000;
+
+    /// A loop with its position zero at output frame zero.
+    fn at_origin() -> Loop {
+        let lp = Loop::new();
+        lp.origin.store(0, Ordering::Relaxed);
+        lp
+    }
+
+    #[test]
+    fn rate_one_is_the_subtraction_it_always_was() {
+        let lp = at_origin();
+        // Exactly integral, which is what lets the mix skip interpolation and
+        // read one sample per layer in the ordinary case.
+        for f in [0i64, 1, 999, 1000, 1001, 48_000_000] {
+            let p = lp.play_pos(f, LEN);
+            assert_eq!(p, p.floor(), "frame {} landed between samples", f);
+            assert_eq!(p as i64, f.rem_euclid(LEN as i64));
+        }
+        assert!(lp.plain());
+    }
+
+    #[test]
+    fn half_speed_travels_half_as_far() {
+        let lp = at_origin();
+        lp.adopt(0, LEN, 0.5, false);
+        assert_eq!(lp.play_pos(0, LEN), 0.0);
+        assert_eq!(lp.play_pos(400, LEN), 200.0);
+        // And wraps after two thousand output frames rather than one.
+        assert_eq!(lp.play_pos(1999, LEN), 999.5);
+        assert_eq!(lp.play_pos(2000, LEN), 0.0);
+        // Recording into it is refused, because the grid is moving.
+        assert!(!lp.plain());
+    }
+
+    #[test]
+    fn a_negative_rate_walks_backwards_and_reappears_at_the_far_end() {
+        let lp = at_origin();
+        lp.adopt(0, LEN, -1.0, false);
+        assert_eq!(lp.play_pos(0, LEN), 0.0);
+        assert_eq!(lp.play_pos(1, LEN), 999.0);
+        assert_eq!(lp.play_pos(400, LEN), 600.0);
+    }
+
+    #[test]
+    fn a_pendulum_reflects_rather_than_wrapping() {
+        let lp = at_origin();
+        lp.adopt(0, LEN, 1.0, true);
+        assert_eq!(lp.play_pos(250, LEN), 250.0);
+        // Turns at the end of the audio, not at an arbitrary point...
+        assert_eq!(lp.play_pos(1200, LEN), 800.0);
+        // ...and so takes two lengths to come back to where it started.
+        assert_eq!(lp.play_pos(2000, LEN), 0.0);
+        // Never off the end, which a naive `2 * len - q` would be at the turn.
+        for f in 0..4000i64 {
+            let p = lp.play_pos(f, LEN);
+            assert!(p >= 0.0 && p < LEN as f64, "frame {} gave {}", f, p);
+        }
+    }
+
+    /// The property the whole `warp` field exists for.
+    #[test]
+    fn changing_speed_does_not_move_the_playhead() {
+        for &(from, to) in &[
+            (1.0, 0.5),
+            (1.0, 2.0),
+            (1.0, -1.0),
+            (0.5, -2.0),
+            (-1.5, 0.25),
+            (2.0, 1.0),
+        ] {
+            for &at in &[1i64, 777, 123_456, 9_999_999] {
+                let lp = at_origin();
+                lp.adopt(0, LEN, from, false);
+                let before = lp.play_pos(at, LEN);
+                lp.adopt(at, LEN, to, false);
+                let after = lp.play_pos(at, LEN);
+                // Half a sample, and only when returning to rate one, where the
+                // offset is folded into `origin` as a whole number of frames.
+                assert!(
+                    (before - after).abs() <= 0.5,
+                    "x{} -> x{} at {} moved the playhead from {} to {}",
+                    from, to, at, before, after
+                );
+            }
+        }
+    }
+
+    /// Coming back to rate one has to restore the exact arithmetic, or a loop
+    /// that had once been at a speed could never be recorded into again.
+    #[test]
+    fn returning_to_rate_one_makes_a_loop_recordable_again() {
+        let lp = at_origin();
+        lp.adopt(0, LEN, 0.5, false);
+        lp.adopt(4321, LEN, 1.0, false);
+        assert!(lp.plain(), "still carrying an offset after returning to x1");
+        let p = lp.play_pos(9999, LEN);
+        assert_eq!(p, p.floor());
+    }
+
+    #[test]
+    fn clearing_forgets_every_resolution() {
+        let lp = at_origin();
+        lp.adopt(0, LEN, -0.25, true);
+        lp.plainly();
+        assert!(lp.plain());
+        assert_eq!(lp.speed(), 1.0);
+        assert!(!lp.pendulum.load(Ordering::Relaxed));
+    }
+}
