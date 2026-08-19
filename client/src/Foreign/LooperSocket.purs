@@ -109,6 +109,10 @@ type LoopState =
   -- | starting, and rounds its length to a whole number of those cycles.
   -- | Off by default, so a loop is free unless asked otherwise.
   , quant :: Boolean
+  -- | Silenced but still turning. A flag rather than a state, because stopping
+  -- | is orthogonal to recording — and phase-locked, so bringing a loop back
+  -- | puts it where it would have been rather than where it started.
+  , muted :: Boolean
   -- | Frames until a scheduled transition fires, or -1 when nothing is
   -- | pending. What lets the display say "starts in 1.4 s" rather than leaving
   -- | a deliberate wait looking like a dead button.

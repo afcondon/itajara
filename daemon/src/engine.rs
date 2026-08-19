@@ -170,6 +170,24 @@ pub struct Loop {
     /// policy applied when a loop closes — not a shared origin, which would
     /// decide it here and for ever.
     pub origin: AtomicI64,
+    /// Silenced, but still turning.
+    ///
+    /// **Phase-locked, deliberately.** The playhead keeps advancing while a loop
+    /// is stopped, so bringing it back is not "start again" but "become audible
+    /// again, where you would have been". With six loops that is the only
+    /// behaviour worth having: a loop that restarted from its own zero would
+    /// come back out of phase with everything it was recorded against.
+    ///
+    /// It is also why this is a flag rather than a state. Stopping is
+    /// orthogonal to the record machine — a loop can be stopped while playing
+    /// or while overdubbing — and folding it into `state` would make the
+    /// machine describe two things at once. `Data.Loopy`, removed from the app
+    /// long before this existed, had already reached the same conclusion and
+    /// called it `PhaseMuted`.
+    ///
+    /// The alternative — moving `origin` — is the one thing that must never
+    /// happen to a loop that closed on a grid boundary.
+    pub muted: AtomicBool,
     state: AtomicU8Wrapper,
     /// Set by the control thread, consumed by the output callback, which is the
     /// only place a transition can be stamped to an exact frame.
@@ -211,6 +229,7 @@ impl Loop {
             l_period: (0..MAX_LAYERS).map(|_| AtomicUsize::new(1)).collect(),
             l_phase: (0..MAX_LAYERS).map(|_| AtomicUsize::new(0)).collect(),
             origin: AtomicI64::new(0),
+            muted: AtomicBool::new(false),
             state: AtomicU8Wrapper::new(IDLE),
             request: AtomicU8Wrapper::new(0),
             request_at: AtomicI64::new(i64::MIN),
@@ -586,6 +605,11 @@ impl Shared {
         let lp = self.lp(li);
         let len = lp.loop_len.load(Ordering::Acquire);
         if len == 0 {
+            return 0.0;
+        }
+        // Silenced but not stopped: `pos` below is still computed from `origin`
+        // on every frame, so nothing drifts while a loop is quiet.
+        if lp.muted.load(Ordering::Relaxed) {
             return 0.0;
         }
         let pos = (out_frame - lp.origin.load(Ordering::Acquire)).rem_euclid(len as i64) as usize;
@@ -1851,8 +1875,31 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 sh.device_lost.store(true, Ordering::Release);
                 println!("  simulating device loss.");
             }
+            // Silence a loop, or bring it back, without touching its origin.
+            //
+            // Explicit `h1`/`h0` alongside the flipping `h`, the same as the
+            // click and the monitor: a dropped command must not leave the app
+            // and the engine disagreeing about something the player cannot see
+            // — and a stopped loop is invisible by definition.
+            "h" | "h1" | "h0" => {
+                let want = match rest {
+                    "h1" => false,
+                    "h0" => true,
+                    _ => !lp.muted.load(Ordering::Relaxed),
+                };
+                lp.muted.store(want, Ordering::Relaxed);
+                return format!(
+                    "loop {} {}.",
+                    li,
+                    if want { "stopped, still turning" } else { "playing" }
+                );
+            }
             "c" => {
                 lp.state.set(IDLE);
+                // A cleared loop is an empty loop, and an empty loop that is
+                // still silenced would refuse to record audibly for a reason
+                // nothing on screen could explain.
+                lp.muted.store(false, Ordering::Relaxed);
                 lp.n_layers.store(0, Ordering::Release);
                 lp.loop_len.store(0, Ordering::Release);
                 for l in 0..MAX_LAYERS {
