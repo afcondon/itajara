@@ -188,13 +188,53 @@ pub struct Loop {
     /// The alternative — moving `origin` — is the one thing that must never
     /// happen to a loop that closed on a grid boundary.
     pub muted: AtomicBool,
-    /// Played backwards.
+    /// Loop frames travelled per output frame. Negative plays backwards.
     ///
-    /// A *resolution*, like `period` and `phase` — the samples are untouched and
-    /// `pos` is simply read from the other end. Length-preserving, so a reversed
-    /// loop stays on whatever grid it closed on, and reversible at no cost
-    /// because nothing was rewritten.
-    pub reverse: AtomicBool,
+    /// A *resolution*, like `period` and `phase`: the samples are untouched and
+    /// the playhead is simply asked to move at a different rate, so speed costs
+    /// nothing to change and nothing to change back.
+    ///
+    /// **Direction is the sign, not a separate flag.** It was a flag for a day,
+    /// and a flag is a second source of truth about which way the playhead is
+    /// going — SuperDirt has always spelt backwards as a negative `speed`, and
+    /// splitting them here would invent a distinction the rest of the rig does
+    /// not make. Folding it in also removed a click: mirroring `pos` to
+    /// `len - 1 - pos` jumps the playhead across the loop at the instant you
+    /// press it, where a sign change simply turns round where it stands.
+    ///
+    /// `f64` in an `AtomicU64` because the position it drives is an absolute
+    /// frame count, and `f32` runs out of mantissa at 16.7 M — about six
+    /// minutes at 48 k, which is well inside what a long take can reach.
+    pub speed: AtomicU64,
+    /// Forward, then back: the playhead reflects at each end instead of
+    /// wrapping, so a cycle takes twice as long and the loop is heard both ways
+    /// round.
+    ///
+    /// Free, given speed. A pendulum is a triangle where a plain loop is a
+    /// sawtooth, and the fold is two lines in the same place the wrap already
+    /// happens — which is why it is here rather than on the list of things
+    /// waiting for engine work.
+    pub pendulum: AtomicBool,
+    /// Where the playhead sits at `origin`, in loop frames.
+    ///
+    /// Zero until something changes speed. Playback is `warp + (frame -
+    /// origin) * speed`, so at `warp = 0, speed = 1` it is exactly the
+    /// subtraction it has always been, down to the bit — which is what keeps
+    /// the alignment self-test a regression test rather than a new claim.
+    ///
+    /// It exists because a speed change must not move the audio. Rescaling the
+    /// whole history would jump the playhead by however far it had already
+    /// come; instead the callback records where the loop *is* and rescales only
+    /// what happens next.
+    warp: AtomicU64,
+    /// A pending speed and pendulum, consumed by the output callback.
+    ///
+    /// The same argument as `request_at`: only the callback knows the frame, and
+    /// re-anchoring `warp` against a frame the control thread guessed would be
+    /// out by up to a buffer — 21 ms of jump at 1024 frames, which is a click.
+    cfg_speed: AtomicU64,
+    cfg_pend: AtomicBool,
+    cfg_armed: AtomicBool,
     /// Stereo placement, 0 hard left to 127 hard right, 64 centre.
     ///
     /// Equal-power, and the gains are computed once per buffer rather than once
@@ -243,7 +283,12 @@ impl Loop {
             l_phase: (0..MAX_LAYERS).map(|_| AtomicUsize::new(0)).collect(),
             origin: AtomicI64::new(0),
             muted: AtomicBool::new(false),
-            reverse: AtomicBool::new(false),
+            speed: AtomicU64::new(1.0f64.to_bits()),
+            pendulum: AtomicBool::new(false),
+            warp: AtomicU64::new(0.0f64.to_bits()),
+            cfg_speed: AtomicU64::new(1.0f64.to_bits()),
+            cfg_pend: AtomicBool::new(false),
+            cfg_armed: AtomicBool::new(false),
             pan: AtomicUsize::new(64),
             state: AtomicU8Wrapper::new(IDLE),
             request: AtomicU8Wrapper::new(0),
@@ -253,6 +298,113 @@ impl Loop {
             overflowed: AtomicBool::new(false),
             rec_from: AtomicI64::new(0),
         }
+    }
+
+    pub fn speed(&self) -> f64 {
+        f64::from_bits(self.speed.load(Ordering::Relaxed))
+    }
+
+    /// Whether the playhead is doing the plain thing: forward, at rate one, from
+    /// `origin`.
+    ///
+    /// Everything that *writes* asks this first. Recording at a speed is a
+    /// different instrument — the input arrives at rate one and would have to be
+    /// resampled into a buffer whose grid is moving — and the honest answer for
+    /// now is to refuse and say so, rather than record something nobody asked
+    /// for. Playback is where speed belongs, and playback is where it is.
+    pub fn plain(&self) -> bool {
+        self.speed() == 1.0
+            && !self.pendulum.load(Ordering::Relaxed)
+            && f64::from_bits(self.warp.load(Ordering::Relaxed)) == 0.0
+    }
+
+    /// Where the playhead is, in loop frames, at an output frame.
+    ///
+    /// Fractional, which is the whole of what speed costs: at any rate but one
+    /// the playhead lands between samples, and the mix has to interpolate.
+    ///
+    /// The pendulum fold happens here rather than in the caller because it is a
+    /// property of *where the playhead is*, not of what is read there — and
+    /// keeping it here means the display and the audio cannot disagree about
+    /// which way round a loop currently is.
+    pub fn play_pos(&self, out_frame: i64, len: usize) -> f64 {
+        if len == 0 {
+            return 0.0;
+        }
+        let warp = f64::from_bits(self.warp.load(Ordering::Relaxed));
+        let origin = self.origin.load(Ordering::Acquire);
+        let raw = warp + (out_frame - origin) as f64 * self.speed();
+        let lenf = len as f64;
+        if self.pendulum.load(Ordering::Relaxed) {
+            // A triangle where a plain loop is a sawtooth. `2 * len` is one
+            // there-and-back, and the second half is read as the reflection of
+            // the first — so the turn happens at the ends of the audio rather
+            // than at an arbitrary point, which is what makes it sound like a
+            // tape reversing rather than a jump.
+            let q = raw.rem_euclid(2.0 * lenf);
+            if q < lenf {
+                q
+            } else {
+                (2.0 * lenf - q).min(lenf - 1.0).max(0.0)
+            }
+        } else {
+            raw.rem_euclid(lenf)
+        }
+    }
+
+    /// Adopt a new speed and pendulum without moving the audio.
+    ///
+    /// Called only from the output callback, at a frame it knows exactly. The
+    /// playhead is read under the old settings and `warp` is chosen so the new
+    /// ones put it in the same place — after which everything downstream is
+    /// arithmetic and nothing is stored about how it got there.
+    fn adopt(&self, out_frame: i64, len: usize, speed: f64, pend: bool) {
+        let here = self.play_pos(out_frame, len);
+        self.speed.store(speed.to_bits(), Ordering::Relaxed);
+        self.pendulum.store(pend, Ordering::Relaxed);
+        if len == 0 {
+            // Nothing to hold in place. An empty loop has no position to
+            // preserve and its `origin` has not been stamped yet, so anchoring
+            // against it would store a number about a frame that means nothing.
+            self.warp.store(0.0f64.to_bits(), Ordering::Relaxed);
+            return;
+        }
+        let origin = self.origin.load(Ordering::Acquire);
+        let warp = here - (out_frame - origin) as f64 * speed;
+        if speed == 1.0 && !pend {
+            // Coming back to rate one, the offset is a whole-frame shift of
+            // where position zero sits — so put it there and have done, rather
+            // than carry it as a fraction for ever. That restores the exact
+            // integer arithmetic (and with it the no-interpolation path), and
+            // it makes `origin` tell the truth again: a loop that spent a while
+            // at half speed really has drifted off the grid it closed on, and
+            // this is where it says so.
+            //
+            // Rounding loses at most half a sample of position, once, at a
+            // moment the player asked for a change anyway.
+            self.origin
+                .store(origin - warp.round() as i64, Ordering::Release);
+            self.warp.store(0.0f64.to_bits(), Ordering::Relaxed);
+        } else {
+            self.warp.store(warp.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// Back to forward, rate one, no offset — what a cleared loop plays at.
+    fn plainly(&self) {
+        self.speed.store(1.0f64.to_bits(), Ordering::Relaxed);
+        self.pendulum.store(false, Ordering::Relaxed);
+        self.warp.store(0.0f64.to_bits(), Ordering::Relaxed);
+        self.cfg_speed.store(1.0f64.to_bits(), Ordering::Relaxed);
+        self.cfg_pend.store(false, Ordering::Relaxed);
+        self.cfg_armed.store(false, Ordering::Relaxed);
+    }
+
+    /// Ask for a speed and pendulum. Applied by the callback, at its own frame.
+    fn want(&self, speed: f64, pend: bool) {
+        self.cfg_speed.store(speed.to_bits(), Ordering::Relaxed);
+        self.cfg_pend.store(pend, Ordering::Relaxed);
+        self.cfg_armed.store(true, Ordering::Release);
     }
 
     /// Left and right gain for this loop's pan setting, equal-power.
@@ -638,16 +790,35 @@ impl Shared {
         if lp.muted.load(Ordering::Relaxed) {
             return 0.0;
         }
-        let mut pos =
-            (out_frame - lp.origin.load(Ordering::Acquire)).rem_euclid(len as i64) as usize;
-        // Read from the other end. Applied to the loop's position rather than
-        // to each layer's, so layers keep their places relative to one another
-        // and the whole cycle turns over — which is what reversing a loop
-        // means, and not the same as reversing every layer separately.
-        if lp.reverse.load(Ordering::Relaxed) {
-            pos = len - 1 - pos;
-        }
         let n = lp.n_layers.load(Ordering::Acquire);
+        if n == 0 {
+            return 0.0;
+        }
+        // Speed is applied to the *loop's* position rather than to each layer's,
+        // so the layers keep their places relative to one another and the whole
+        // cycle turns over together — which is what playing a loop at a speed
+        // means, and not the same as playing every layer at one.
+        let pf = lp.play_pos(out_frame, len);
+        let p0 = (pf as usize).min(len - 1);
+        let frac = pf - p0 as f64;
+        // At rate one going forwards the fraction is exactly zero — the
+        // arithmetic is `warp + (frame - origin) * 1.0` on integers — so the
+        // ordinary case reads one sample per layer, as it always did, and the
+        // second read is bought only by the loops that asked for it.
+        if frac == 0.0 {
+            return self.mix_at(li, n, p0);
+        }
+        let p1 = (p0 + 1) % len;
+        let f = frac as f32;
+        self.mix_at(li, n, p0) * (1.0 - f) + self.mix_at(li, n, p1) * f
+    }
+
+    /// Every layer of one loop, summed at one integer loop position.
+    ///
+    /// Split out because interpolation needs the same question asked at two
+    /// neighbouring positions, and summing the layers first is the same number
+    /// as interpolating each layer and summing after — for half the reads.
+    fn mix_at(&self, li: usize, n: usize, pos: usize) -> f32 {
         let mut v = 0.0f32;
         for l in 0..n {
             v += self.sample_at(li, l, pos);
@@ -778,6 +949,16 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                 // `take`s a buffer, and each is a swap on an uncontended atomic.
                 for li in 0..N_LOOPS {
                     let lp = sh.lp(li);
+                    // Speed first, and at the buffer start, because adopting it
+                    // reads the playhead and everything below may move `origin`.
+                    if lp.cfg_armed.swap(false, Ordering::Acquire) {
+                        lp.adopt(
+                            base as i64,
+                            lp.loop_len.load(Ordering::Acquire),
+                            f64::from_bits(lp.cfg_speed.load(Ordering::Relaxed)),
+                            lp.cfg_pend.load(Ordering::Relaxed),
+                        );
+                    }
                     // Peek, not take: a request with a deadline in the future
                     // has to survive this buffer and be reconsidered on the
                     // next. Consuming first and re-arming would lose it if the
@@ -1795,6 +1976,9 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     if let Some(other) = busy_elsewhere(sh, li) {
                         return other;
                     }
+                    if let Some(no) = not_plain(lp, li) {
+                        return no;
+                    }
                     multiply_start(sh, li, sr)
                 }
             },
@@ -1804,6 +1988,9 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 _ => {
                     if let Some(other) = busy_elsewhere(sh, li) {
                         return other;
+                    }
+                    if let Some(no) = not_plain(lp, li) {
+                        return no;
                     }
                     let layer = lp.n_layers.load(Ordering::Acquire);
                     if layer >= MAX_LAYERS {
@@ -1847,11 +2034,49 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 let secs = l[1..].trim().parse::<f64>().unwrap_or(8.0);
                 take(sh, li, sr, secs);
             }
+            // **Above `s`, which prefix-matches.** `s` is sparse-multiply and
+            // takes anything beginning with an s, so `sp0.5` read as "sparse,
+            // could not parse the count, use 2" and quietly did a multiply. It
+            // cost half an hour and would have cost a take: the command was
+            // acked by nothing and did something else entirely. Ordering fixes
+            // it here; `s` itself was tightened to refuse a count it cannot
+            // read, rather than inventing one.
+            _ if rest.starts_with("sp") => {
+                let arg = &rest[2..];
+                match arg.parse::<f64>() {
+                    // An eighth to four times. Below that a loop is a drone and
+                    // linear interpolation is audibly a filter; above it, the
+                    // aliasing this does nothing about becomes the loudest thing
+                    // in the sound.
+                    Ok(v) if v.abs() >= 0.125 && v.abs() <= 4.0 => {
+                        if lp.is_recording() {
+                            return format!("loop {} is recording; speed would move the grid under it.", li);
+                        }
+                        lp.want(v, lp.pendulum.load(Ordering::Relaxed));
+                        return format!(
+                            "loop {} plays at x{} {}.",
+                            li,
+                            v.abs(),
+                            if v < 0.0 { "backwards" } else { "forwards" }
+                        );
+                    }
+                    Ok(v) => {
+                        return format!("speed wants 0.125 to 4, either sign, not {}.", v)
+                    }
+                    _ => return format!("speed wants a number, not `{}`.", arg),
+                }
+            }
             // The second multiply, and its two companions. Structural, so they
             // are instant and reversible — nothing here records anything.
             l if l.starts_with('s') => {
-                let n = l[1..].trim().parse::<usize>().unwrap_or(2);
-                println!("  {}", sparse(sh, li, sr, n));
+                // Bare `s` means two, which is the common case. Anything else
+                // has to be a number: `unwrap_or(2)` here turned every typo
+                // beginning with an s into a multiply nobody asked for.
+                let arg = l[1..].trim();
+                match if arg.is_empty() { Ok(2) } else { arg.parse::<usize>() } {
+                    Ok(n) => println!("  {}", sparse(sh, li, sr, n)),
+                    Err(_) => return format!("`{}` is not a command; `s` wants a count.", l),
+                }
             }
             // Grid sync for this loop. Explicit forms alongside the toggle for
             // the same reason `k` and `m` have them: a client that flips rather
@@ -1936,16 +2161,42 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // `0pan32` say themselves in a log where `0v1` and `0n32` would
             // need the source open.
             "rev" | "rev1" | "rev0" => {
-                let want = match rest {
+                let now = lp.speed();
+                let back = match rest {
                     "rev1" => true,
                     "rev0" => false,
-                    _ => !lp.reverse.load(Ordering::Relaxed),
+                    _ => now > 0.0,
                 };
-                lp.reverse.store(want, Ordering::Relaxed);
+                // Direction changes the sign and keeps the rate, so reversing a
+                // half-speed loop leaves it at half speed — the two are one
+                // parameter and this is the arithmetic that says so.
+                let want = now.abs() * if back { -1.0 } else { 1.0 };
+                lp.want(want, lp.pendulum.load(Ordering::Relaxed));
                 return format!(
-                    "loop {} plays {}.",
+                    "loop {} plays {} at x{}.",
                     li,
-                    if want { "backwards" } else { "forwards" }
+                    if back { "backwards" } else { "forwards" },
+                    want.abs()
+                );
+            }
+            // Forward, then back. Doubles the cycle, which is the point: a
+            // pendulum that fitted into one cycle would be a different effect
+            // wearing the name.
+            "pend" | "pend1" | "pend0" => {
+                let want = match rest {
+                    "pend1" => true,
+                    "pend0" => false,
+                    _ => !lp.pendulum.load(Ordering::Relaxed),
+                };
+                lp.want(lp.speed(), want);
+                return format!(
+                    "loop {} {}.",
+                    li,
+                    if want {
+                        "swings forward then back"
+                    } else {
+                        "runs one way"
+                    }
                 );
             }
             _ if rest.starts_with("pan") => {
@@ -1993,8 +2244,9 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 // nothing on screen could explain.
                 lp.muted.store(false, Ordering::Relaxed);
                 // The resolutions go with the audio. A cleared loop that came
-                // back reversed and hard left would be a haunting.
-                lp.reverse.store(false, Ordering::Relaxed);
+                // back at half speed backwards and hard left would be a
+                // haunting.
+                lp.plainly();
                 lp.pan.store(64, Ordering::Relaxed);
                 lp.n_layers.store(0, Ordering::Release);
                 lp.loop_len.store(0, Ordering::Release);
@@ -2185,6 +2437,31 @@ fn busy_elsewhere(sh: &Shared, li: usize) -> Option<String> {
         )),
         _ => None,
     }
+}
+
+/// Why a loop at a speed cannot be recorded into.
+///
+/// Named rather than worked around. The input arrives at rate one and the loop's
+/// grid is moving under it, so there is no honest place to put the samples —
+/// and the answer that would look like it worked (resample the input, or quietly
+/// snap back to rate one) is the answer this project keeps refusing.
+fn not_plain(lp: &Loop, li: usize) -> Option<String> {
+    if lp.plain() {
+        return None;
+    }
+    Some(format!(
+        "loop {} is playing at x{}{}; `{}sp1` to record into it.",
+        li,
+        lp.speed().abs(),
+        if lp.pendulum.load(Ordering::Relaxed) {
+            ", swinging"
+        } else if lp.speed() < 0.0 {
+            ", backwards"
+        } else {
+            ""
+        },
+        li
+    ))
 }
 
 /// A take name that cannot leave the takes directory.

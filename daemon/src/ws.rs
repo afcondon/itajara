@@ -155,8 +155,10 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
         .map(|li| {
             let lp = sh.lp(li);
             let len = lp.loop_len.load(Ordering::Acquire);
-            let origin = lp.origin.load(Ordering::Acquire);
-            let pos = if len > 0 { (cur - origin).rem_euclid(len as i64) as usize } else { 0 };
+            // Through the engine's own playhead rather than subtracting `origin`
+            // here, so the display cannot disagree with the audio about where a
+            // loop is — which it would the moment speed or a pendulum was on.
+            let pos = lp.play_pos(cur, len) as usize;
             let shapes: Vec<String> = (0..lp.n_layers.load(Ordering::Acquire))
                 .map(|l| {
                     let (slen, period, phase) = lp.layer_shape(l);
@@ -168,7 +170,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                     r#"{{"index":{},"state":"{}","layers":{},"loopFrames":{},"#,
                     r#""loopSecs":{:.4},"pos":{},"phase":{:.5},"armed":{},"#,
                     r#""recording":{},"quant":{},"muted":{},"reverse":{},"pan":{},"#,
-                    r#""pendingAt":{},"shapes":[{}]}}"#
+                    r#""speed":{:.4},"pendulum":{},"pendingAt":{},"shapes":[{}]}}"#
                 ),
                 li,
                 lp.state_name(),
@@ -181,8 +183,13 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                 lp.is_recording(),
                 lp.quantised(),
                 lp.muted.load(Ordering::Relaxed),
-                lp.reverse.load(Ordering::Relaxed),
+                // Direction is the sign of speed in the engine; it is reported
+                // separately as well because the display asks "which way round
+                // is this" far more often than it asks "how fast".
+                lp.speed() < 0.0,
                 lp.pan.load(Ordering::Relaxed),
+                lp.speed().abs(),
+                lp.pendulum.load(Ordering::Relaxed),
                 // Frames until a scheduled transition fires, or -1 for nothing
                 // pending. A display that can show "starts in 1.4 s" is the
                 // difference between a deliberate wait and a dead button.
@@ -195,12 +202,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
     let sel = sh.sel();
     let cl = sh.lp(sel);
     let loop_len = cl.loop_len.load(Ordering::Acquire);
-    let origin = cl.origin.load(Ordering::Acquire);
-    let pos = if loop_len > 0 {
-        (cur - origin).rem_euclid(loop_len as i64) as usize
-    } else {
-        0
-    };
+    let pos = cl.play_pos(cur, loop_len) as usize;
 
     // Peaks are swapped out, so each reader gets the peak since the last read
     // rather than a decaying maximum. With one client that is exactly right;
