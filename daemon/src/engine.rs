@@ -62,6 +62,12 @@ pub struct Opts {
     pub in_ch: usize,
     pub out_ch: usize,
     pub residual: f64,
+    /// Whether `--residual` was actually given, as against left at its default.
+    ///
+    /// The default is not "no compensation", it is a number — so without this
+    /// the engine cannot tell an operator who measured 252 from one who never
+    /// looked, and cannot say which it is doing.
+    pub residual_given: bool,
     pub max_secs: f64,
     pub sample_rate: u32,
     pub buffer: Option<u32>,
@@ -98,6 +104,7 @@ impl Default for Opts {
             in_ch: 0,
             out_ch: 0,
             residual: 252.0,
+            residual_given: false,
             max_secs: 30.0,
             sample_rate: 48_000,
             buffer: None,
@@ -837,9 +844,116 @@ fn err_cb(sh: Arc<Shared>) -> impl FnMut(cpal::StreamError) + Send + 'static {
     }
 }
 
+/// The residual in force, and where it came from.
+///
+/// The second half is not decoration. The residual is a *measurement*, it moves
+/// when another client opens the device, and the failure mode is that nobody
+/// notices — so the engine says which of the three sources it used every time it
+/// starts, and admits when it is guessing.
+struct Residual {
+    samples: f64,
+    source: String,
+    /// What had the device open when the number was measured, if it is stored.
+    /// Kept so the operator can compare it with what is running now; the
+    /// comparison is `deepstar latency check`'s job, not the audio daemon's.
+    clients: Option<String>,
+}
+
+/// Where DeepStar leaves the calibration it curates.
+///
+/// The canonical artefact is in Amphora, content-addressed, alongside the VCO
+/// tables — this is its projection onto the filesystem, so the audio daemon
+/// needs no HTTP client and starts with no dependency on a store being up. Same
+/// division as everywhere else in the rig: the store holds the truth, and what
+/// the realiser reads is compiled output.
+///
+/// Deliberately not JSON. It is a handful of scalars that a person reads exactly
+/// once — at the moment they suspect it — and `residual_samples = 275` is more
+/// use then than a brace.
+fn calibration_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".itajara").join("calibration.conf"))
+}
+
+fn resolve_residual(opts: &Opts, device: &str) -> Residual {
+    // Given explicitly: the operator has measured for the configuration in
+    // force and knows better than anything stored.
+    if opts.residual_given {
+        return Residual {
+            samples: opts.residual,
+            source: "--residual".into(),
+            clients: None,
+        };
+    }
+    if let Some(path) = calibration_path() {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let mut fields = std::collections::HashMap::new();
+            for line in text.lines() {
+                let line = line.trim();
+                if line.starts_with('#') || line.is_empty() {
+                    continue;
+                }
+                if let Some((k, v)) = line.split_once('=') {
+                    fields.insert(k.trim().to_string(), v.trim().to_string());
+                }
+            }
+            // Keyed by device, because the residual is a property of the
+            // interface and this rig has more than one. A calibration for
+            // something else is not a calibration for this.
+            let stored_device = fields.get("device").cloned().unwrap_or_default();
+            let matches = stored_device.is_empty()
+                || device.to_lowercase().contains(&stored_device.to_lowercase());
+            if let (true, Some(v)) = (matches, fields.get("residual_samples")) {
+                if let Ok(n) = v.parse::<f64>() {
+                    return Residual {
+                        samples: n,
+                        source: format!(
+                            "{} (measured {})",
+                            path.display(),
+                            fields
+                                .get("measured_at")
+                                .cloned()
+                                .unwrap_or_else(|| "at an unrecorded time".into())
+                        ),
+                        clients: fields.get("clients").cloned(),
+                    };
+                }
+            }
+            if !matches {
+                eprintln!(
+                    "  calibration at {} is for {:?}, not {:?} — ignoring it.",
+                    path.display(),
+                    stored_device,
+                    device
+                );
+            }
+        }
+    }
+    Residual {
+        samples: opts.residual,
+        source: "the compiled default, which is an assumption".into(),
+        clients: None,
+    }
+}
+
 pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     let candidate = crate::devices::find(&opts.device)?;
     let device = candidate.device;
+
+    // Said out loud at every start, because the whole failure mode here is a
+    // number that quietly stopped being true. On 2026-08-19 the default was 23
+    // samples short and nothing in the sound said so.
+    let residual = resolve_residual(&opts, &candidate.name);
+    println!(
+        "Residual {:.0} samples, from {}.",
+        residual.samples, residual.source
+    );
+    if let Some(clients) = &residual.clients {
+        println!(
+            "  measured with these also on the device: {}. \
+             `deepstar latency check` compares that with what is running now.",
+            clients
+        );
+    }
 
     let mut in_cfg = choose_input(&device, opts.in_ch, opts.sample_rate, Width::Widest)
         .ok_or_else(|| format!("{} has no f32 input config", candidate.name))?;
@@ -1086,7 +1200,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         let err_sh = sh.clone();
         let sh = sh.clone();
         let ch = opts.in_ch;
-        let residual = opts.residual;
+        let residual = residual.samples;
         device.build_input_stream(
             &in_cfg,
             move |data: &[f32], info: &cpal::InputCallbackInfo| {

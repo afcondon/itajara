@@ -67,6 +67,12 @@ pub struct Opts {
     /// stored per buffer size. If it stays put, it is a property of the
     /// interface and one constant will do.
     pub buffer: Option<u32>,
+    /// Emit one machine-readable object on stdout and nothing else.
+    ///
+    /// So a conductor can run the calibration rather than a person reading a
+    /// paragraph — which is the difference between a number that gets measured
+    /// when the configuration changes and one that gets measured once.
+    pub json: bool,
 }
 
 impl Default for Opts {
@@ -78,6 +84,7 @@ impl Default for Opts {
             amplitude: 0.5,
             sample_rate: 48_000,
             buffer: None,
+            json: false,
         }
     }
 }
@@ -540,19 +547,26 @@ const SWEEP_BUFFERS: [u32; 5] = [64, 128, 256, 512, 1024];
 /// engine must apply to raw timestamp arithmetic — and since the engine chooses
 /// its own buffer size, it can apply it exactly.
 pub fn sweep(opts: Opts) -> Result<(), Box<dyn Error>> {
+    // In `--json` the prose is not merely quieter, it is absent: a conductor
+    // parsing stdout must not have to know which lines are commentary.
+    let say = |s: String| {
+        if !opts.json {
+            println!("{}", s)
+        }
+    };
     let candidate = crate::devices::find(&opts.device)?;
-    println!("Device: {}\n", candidate.name);
-    println!(
+    say(format!("Device: {}\n", candidate.name));
+    say(format!(
         "Measuring at several buffer sizes. A single reading cannot tell a real\n\
          converter delay from a bookkeeping error in the timestamps; varying the\n\
          buffer separates them, because only one of them moves.\n"
-    );
+    ));
 
     // (buffer frames, measured samples, channel, spread ms)
     let mut points: Vec<(f64, f64, usize, f64)> = Vec::new();
     let mut sr = opts.sample_rate;
 
-    println!("  buffer     ch    measured     spread");
+    say(format!("  buffer     ch    measured     spread"));
     for &b in SWEEP_BUFFERS.iter() {
         let mut o = opts.clone();
         o.buffer = Some(b);
@@ -560,7 +574,7 @@ pub fn sweep(opts: Opts) -> Result<(), Box<dyn Error>> {
         let p = match probe(&o, false) {
             Ok(p) => p,
             Err(e) => {
-                println!("  {:>6}     —    failed: {}", b, e);
+                say(format!("  {:>6}     —    failed: {}", b, e));
                 continue;
             }
         };
@@ -574,7 +588,7 @@ pub fn sweep(opts: Opts) -> Result<(), Box<dyn Error>> {
             .max_by(|(_, a), (_, c)| a.peak.partial_cmp(&c.peak).unwrap());
 
         let Some((ch, res)) = best else {
-            println!("  {:>6}     —    silence on every input", b);
+            say(format!("  {:>6}     —    silence on every input", b));
             continue;
         };
 
@@ -584,14 +598,14 @@ pub fn sweep(opts: Opts) -> Result<(), Box<dyn Error>> {
         let spread = lats[lats.len() - 1] - lats[0];
         let samples = m_ms / 1000.0 * p.sr as f64;
 
-        println!(
+        say(format!(
             "  {:>6}  {:>4}  {:>+8.0} sm   {:>6.3} ms{}",
             p.buffer,
             ch,
             samples,
             spread,
             if spread > 0.5 { "   <- unstable" } else { "" }
-        );
+        ));
         points.push((p.buffer as f64, samples, ch, spread));
     }
 
@@ -622,39 +636,55 @@ pub fn sweep(opts: Opts) -> Result<(), Box<dyn Error>> {
     let residual = median(&sorted);
     let residual_spread = sorted[sorted.len() - 1] - sorted[0];
 
-    println!("\n  implied constant at each size, once the slope is removed:");
+    say(format!("\n  implied constant at each size, once the slope is removed:"));
     for (i, &(b, _, _, _)) in points.iter().enumerate() {
-        println!("    buffer {:>5}   {:>+8.1} samples", b as u32, residuals[i]);
+        say(format!("    buffer {:>5}   {:>+8.1} samples", b as u32, residuals[i]));
     }
 
-    println!(
+    say(format!(
         "\n  Model:  measured = {:.0} {} {:.2} x buffer",
         residual,
         if slope < 0.0 { "-" } else { "+" },
         slope.abs()
-    );
+    ));
 
+    // The two ways this measurement can fail to mean anything. In `--json` they
+    // are reported as `usable: false` with the reason, rather than as a missing
+    // object — a conductor has to be able to tell "the interface is not
+    // describable by one constant" from "the tool did not run".
     if slope_spread.abs() > 0.05 {
-        println!(
+        let why = format!(
+            "the slope varies by {:.2} across buffer sizes, so the relationship is \
+             not linear and no single constant describes this interface",
+            slope_spread
+        );
+        say(format!(
             "\n  ! !  The slope is not consistent across sizes ({:.2} of variation).\n       \
              The relationship is not linear, so no single constant describes this\n       \
              interface and the calibration has to be stored per buffer size.",
             slope_spread
-        );
+        ));
+        emit_sweep_json(&opts, &candidate.name, sr, residual, slope, &points, &residuals, Some(&why));
         return Ok(());
     }
 
     if residual_spread.abs() > 8.0 {
-        println!(
+        let why = format!(
+            "the residual varies by {:.0} samples across buffer sizes, so it is not \
+             buffer-independent and has to be stored per buffer size",
+            residual_spread
+        );
+        say(format!(
             "\n  ! !  The residual varies by {:.0} samples across buffer sizes, so it\n       \
              is not buffer-independent after all. Treat it as per-buffer-size.",
             residual_spread
-        );
+        ));
+        emit_sweep_json(&opts, &candidate.name, sr, residual, slope, &points, &residuals, Some(&why));
         return Ok(());
     }
 
     let buffers = -slope;
-    println!(
+    say(format!(
         "\n  The slope is {:.2} buffers per buffer. {}",
         buffers,
         if (buffers - 2.0).abs() < 0.05 {
@@ -665,9 +695,9 @@ pub fn sweep(opts: Opts) -> Result<(), Box<dyn Error>> {
             "That is not the two buffers a symmetric\n  over-account would give, so read it with \
              some suspicion."
         }
-    );
+    ));
 
-    println!(
+    say(format!(
         "\n  Buffer-independent residual: {:.0} samples, {:.2} ms at {} Hz.\n  \
          That is the interface's own converter round trip — it does not move when\n  \
          the buffer does, which is what makes it physics rather than accounting,\n  \
@@ -675,13 +705,73 @@ pub fn sweep(opts: Opts) -> Result<(), Box<dyn Error>> {
         residual,
         residual / sr as f64 * 1000.0,
         sr
-    );
+    ));
 
-    println!(
+    say(format!(
         "\n  For the engine:  true_offset_samples = measured_samples + {:.0} x buffer_frames",
         buffers
-    );
+    ));
+    emit_sweep_json(&opts, &candidate.name, sr, residual, slope, &points, &residuals, None);
     Ok(())
+}
+
+/// The sweep as one object, for whoever is going to store it.
+///
+/// Hand-rolled rather than serde, because this crate has no JSON dependency and
+/// one field of one shape does not justify acquiring one. The evidence goes in
+/// alongside the answer — every buffer size and what it implied — so a stored
+/// calibration can be argued with later rather than merely believed.
+#[allow(clippy::too_many_arguments)]
+fn emit_sweep_json(
+    opts: &Opts,
+    device: &str,
+    sr: u32,
+    residual: f64,
+    slope: f64,
+    points: &[(f64, f64, usize, f64)],
+    residuals: &[f64],
+    unusable: Option<&str>,
+) {
+    if !opts.json {
+        return;
+    }
+    let per: Vec<String> = points
+        .iter()
+        .zip(residuals.iter())
+        .map(|(&(b, m, ch, _), &r)| {
+            format!(
+                r#"{{"buffer":{},"measured":{:.1},"implied":{:.1},"channel":{}}}"#,
+                b as u32, m, r, ch
+            )
+        })
+        .collect();
+    println!(
+        concat!(
+            r#"{{"kind":"audio-latency.v1","device":"{}","sample_rate":{},"#,
+            r#""out_ch":{},"residual_samples":{:.0},"residual_ms":{:.4},"#,
+            r#""slope_buffers":{:.2},"usable":{},"reason":"{}","points":[{}]}}"#
+        ),
+        escape(device),
+        sr,
+        opts.out_ch,
+        residual,
+        residual / sr as f64 * 1000.0,
+        -slope,
+        unusable.is_none(),
+        escape(unusable.unwrap_or("")),
+        per.join(",")
+    );
+}
+
+fn escape(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| match c {
+            '"' => vec!['\\', '"'],
+            '\\' => vec!['\\', '\\'],
+            '\n' => vec!['\\', 'n'],
+            c => vec![c],
+        })
+        .collect()
 }
 
 fn dbfs(x: f32) -> f64 {

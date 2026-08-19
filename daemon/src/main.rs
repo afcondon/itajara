@@ -53,7 +53,11 @@ USAGE
       It starts at the beginning of the cycle you are in, not when you
       pressed, so pressing late costs nothing.
 
-      --residual <n>    from `sweep`, for this configuration  (default 252)
+      --residual <n>    from `sweep`, for this configuration. Without it the
+                        engine reads ~/.itajara/calibration.conf, which
+                        `deepstar latency --write` curates from Amphora; with
+                        neither it falls back to 252 and says so, because
+                        the default is an assertion and not an abstention
       --max-secs <s>    longest loop, and so the arena size   (default 30)
       --click           metronome at loop position zero
       --monitor         pass live input to the output. Off by default: the
@@ -107,6 +111,11 @@ USAGE
       is the correction to apply to raw timestamp arithmetic.
 
       Same options as `measure`, minus --buffer, which it varies itself.
+
+      --json            emit one object on stdout and no prose, so a
+                        conductor can store the result. `deepstar latency`
+                        is that conductor; see its docs for where the
+                        number ends up and who reads it.
 
   itajara measure --device <name> [options]
       Measure output→input round-trip latency by clicking and listening on
@@ -267,7 +276,10 @@ fn parse_loop(args: &[String]) -> Result<engine::Opts, String> {
             "--device" => opts.device = value,
             "--in-ch" => opts.in_ch = value.parse().map_err(|_| "--in-ch wants an integer")?,
             "--out-ch" => opts.out_ch = value.parse().map_err(|_| "--out-ch wants an integer")?,
-            "--residual" => opts.residual = value.parse().map_err(|_| "--residual wants a number")?,
+            "--residual" => {
+                opts.residual = value.parse().map_err(|_| "--residual wants a number")?;
+                opts.residual_given = true;
+            }
             "--max-secs" => opts.max_secs = value.parse().map_err(|_| "--max-secs wants a number")?,
             "--rate" => opts.sample_rate = value.parse().map_err(|_| "--rate wants an integer")?,
             "--buffer" => opts.buffer = Some(value.parse().map_err(|_| "--buffer wants an integer")?),
@@ -364,6 +376,11 @@ fn parse_measure(args: &[String]) -> Result<measure::Opts, String> {
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
+        if flag == "--json" {
+            opts.json = true;
+            i += 1;
+            continue;
+        }
         let value = || {
             args.get(i + 1)
                 .cloned()
