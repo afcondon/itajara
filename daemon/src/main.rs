@@ -84,7 +84,9 @@ USAGE
       This is the only part of a looper that can be verified rather than
       judged by ear. Run it whenever the audio configuration changes.
 
-      --residual <n>    the interface's transit, from `sweep`  (default 252)
+      --residual <n>    the interface's transit, from `sweep`. Resolved the
+                        same three ways `loop` resolves it, so with no flag
+                        this verifies the number the engine will use
       --loop-secs <s>   loop length to test against            (default 2.0)
       --cycles <n>      how many times round                   (default 4)
       --out-ch / --in-ch / --amp / --buffer / --rate  as elsewhere
@@ -322,7 +324,8 @@ fn parse_align(args: &[String]) -> Result<align::Opts, String> {
             "--out-ch" => opts.out_ch = value.parse().map_err(|_| "--out-ch wants an integer")?,
             "--in-ch" => opts.in_ch = value.parse().map_err(|_| "--in-ch wants an integer")?,
             "--residual" => {
-                opts.residual = value.parse().map_err(|_| "--residual wants a number")?
+                opts.residual = value.parse().map_err(|_| "--residual wants a number")?;
+                opts.residual_given = true;
             }
             "--loop-secs" => {
                 opts.loop_secs = value.parse().map_err(|_| "--loop-secs wants a number")?

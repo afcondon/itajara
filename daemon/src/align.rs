@@ -67,6 +67,13 @@ pub struct Opts {
     /// session state rather than a constant — see DESIGN-LOOPER §10 — so it is a
     /// flag rather than something baked in.
     pub residual: f64,
+    /// Whether the flag was actually given.
+    ///
+    /// Without it this test would compensate by a residual the engine is not
+    /// using — and could report zero while the engine ran on a different
+    /// number. A self-test that does not describe the thing it tests is the
+    /// most expensive kind of green.
+    pub residual_given: bool,
     pub loop_secs: f64,
     pub cycles: usize,
     pub amplitude: f32,
@@ -81,6 +88,7 @@ impl Default for Opts {
             out_ch: 0,
             in_ch: 0,
             residual: 252.0,
+            residual_given: false,
             loop_secs: 2.0,
             cycles: 4,
             amplitude: 0.5,
@@ -90,9 +98,20 @@ impl Default for Opts {
     }
 }
 
-pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
+pub fn run(mut opts: Opts) -> Result<(), Box<dyn Error>> {
     let candidate = crate::devices::find(&opts.device)?;
     let device = candidate.device;
+
+    // The same three sources, in the same order, as `loop`. This test exists to
+    // say whether the ENGINE's arithmetic is right, and it can only say that if
+    // it compensates by the number the engine will actually use.
+    let resolved =
+        crate::engine::resolve_residual(opts.residual, opts.residual_given, &candidate.name);
+    opts.residual = resolved.samples;
+    println!(
+        "Residual {:.0} samples, from {}.",
+        resolved.samples, resolved.source
+    );
 
     let mut in_cfg = choose_input(&device, opts.in_ch, opts.sample_rate, Width::Widest)
         .ok_or_else(|| format!("{} has no f32 input config", candidate.name))?;

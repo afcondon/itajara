@@ -850,13 +850,13 @@ fn err_cb(sh: Arc<Shared>) -> impl FnMut(cpal::StreamError) + Send + 'static {
 /// when another client opens the device, and the failure mode is that nobody
 /// notices — so the engine says which of the three sources it used every time it
 /// starts, and admits when it is guessing.
-struct Residual {
-    samples: f64,
-    source: String,
+pub(crate) struct Residual {
+    pub samples: f64,
+    pub source: String,
     /// What had the device open when the number was measured, if it is stored.
     /// Kept so the operator can compare it with what is running now; the
     /// comparison is `deepstar latency check`'s job, not the audio daemon's.
-    clients: Option<String>,
+    pub clients: Option<String>,
 }
 
 /// Where DeepStar leaves the calibration it curates.
@@ -870,16 +870,16 @@ struct Residual {
 /// Deliberately not JSON. It is a handful of scalars that a person reads exactly
 /// once — at the moment they suspect it — and `residual_samples = 275` is more
 /// use then than a brace.
-fn calibration_path() -> Option<PathBuf> {
+pub(crate) fn calibration_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".itajara").join("calibration.conf"))
 }
 
-fn resolve_residual(opts: &Opts, device: &str) -> Residual {
+pub(crate) fn resolve_residual(default: f64, given: bool, device: &str) -> Residual {
     // Given explicitly: the operator has measured for the configuration in
     // force and knows better than anything stored.
-    if opts.residual_given {
+    if given {
         return Residual {
-            samples: opts.residual,
+            samples: default,
             source: "--residual".into(),
             clients: None,
         };
@@ -929,7 +929,7 @@ fn resolve_residual(opts: &Opts, device: &str) -> Residual {
         }
     }
     Residual {
-        samples: opts.residual,
+        samples: default,
         source: "the compiled default, which is an assumption".into(),
         clients: None,
     }
@@ -942,7 +942,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     // Said out loud at every start, because the whole failure mode here is a
     // number that quietly stopped being true. On 2026-08-19 the default was 23
     // samples short and nothing in the sound said so.
-    let residual = resolve_residual(&opts, &candidate.name);
+    let residual = resolve_residual(opts.residual, opts.residual_given, &candidate.name);
     println!(
         "Residual {:.0} samples, from {}.",
         residual.samples, residual.source
