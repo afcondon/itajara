@@ -113,6 +113,11 @@ type LoopState =
   -- | is orthogonal to recording — and phase-locked, so bringing a loop back
   -- | puts it where it would have been rather than where it started.
   , muted :: Boolean
+  -- | Played backwards, and where it sits in the stereo field (0-127, 64
+  -- | centre). Both are *resolutions* applied at playback rather than edits, so
+  -- | they cost nothing to change and nothing to undo.
+  , reverse :: Boolean
+  , pan :: Int
   -- | Frames until a scheduled transition fires, or -1 when nothing is
   -- | pending. What lets the display say "starts in 1.4 s" rather than leaving
   -- | a deliberate wait looking like a dead button.

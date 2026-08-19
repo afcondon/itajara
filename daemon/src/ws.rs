@@ -167,7 +167,8 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                 concat!(
                     r#"{{"index":{},"state":"{}","layers":{},"loopFrames":{},"#,
                     r#""loopSecs":{:.4},"pos":{},"phase":{:.5},"armed":{},"#,
-                    r#""recording":{},"quant":{},"muted":{},"pendingAt":{},"shapes":[{}]}}"#
+                    r#""recording":{},"quant":{},"muted":{},"reverse":{},"pan":{},"#,
+                    r#""pendingAt":{},"shapes":[{}]}}"#
                 ),
                 li,
                 lp.state_name(),
@@ -180,6 +181,8 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                 lp.is_recording(),
                 lp.quantised(),
                 lp.muted.load(Ordering::Relaxed),
+                lp.reverse.load(Ordering::Relaxed),
+                lp.pan.load(Ordering::Relaxed),
                 // Frames until a scheduled transition fires, or -1 for nothing
                 // pending. A display that can show "starts in 1.4 s" is the
                 // difference between a deliberate wait and a dead button.

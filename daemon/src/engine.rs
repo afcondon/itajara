@@ -188,6 +188,19 @@ pub struct Loop {
     /// The alternative — moving `origin` — is the one thing that must never
     /// happen to a loop that closed on a grid boundary.
     pub muted: AtomicBool,
+    /// Played backwards.
+    ///
+    /// A *resolution*, like `period` and `phase` — the samples are untouched and
+    /// `pos` is simply read from the other end. Length-preserving, so a reversed
+    /// loop stays on whatever grid it closed on, and reversible at no cost
+    /// because nothing was rewritten.
+    pub reverse: AtomicBool,
+    /// Stereo placement, 0 hard left to 127 hard right, 64 centre.
+    ///
+    /// Equal-power, and the gains are computed once per buffer rather than once
+    /// per frame — six loops times two `cos` calls is nothing at buffer rate and
+    /// wasteful at sample rate.
+    pub pan: AtomicUsize,
     state: AtomicU8Wrapper,
     /// Set by the control thread, consumed by the output callback, which is the
     /// only place a transition can be stamped to an exact frame.
@@ -230,6 +243,8 @@ impl Loop {
             l_phase: (0..MAX_LAYERS).map(|_| AtomicUsize::new(0)).collect(),
             origin: AtomicI64::new(0),
             muted: AtomicBool::new(false),
+            reverse: AtomicBool::new(false),
+            pan: AtomicUsize::new(64),
             state: AtomicU8Wrapper::new(IDLE),
             request: AtomicU8Wrapper::new(0),
             request_at: AtomicI64::new(i64::MIN),
@@ -238,6 +253,17 @@ impl Loop {
             overflowed: AtomicBool::new(false),
             rec_from: AtomicI64::new(0),
         }
+    }
+
+    /// Left and right gain for this loop's pan setting, equal-power.
+    ///
+    /// At centre both are `1/sqrt(2)`, so a centred loop is the same loudness
+    /// as a hard-panned one — which linear panning would not give, and which
+    /// matters when six loops are being placed against each other.
+    pub fn pan_gains(&self) -> (f32, f32) {
+        let p = self.pan.load(Ordering::Relaxed).min(127) as f32 / 127.0;
+        let theta = p * std::f32::consts::FRAC_PI_2;
+        (theta.cos(), theta.sin())
     }
 
     pub fn state_name(&self) -> &'static str {
@@ -612,7 +638,15 @@ impl Shared {
         if lp.muted.load(Ordering::Relaxed) {
             return 0.0;
         }
-        let pos = (out_frame - lp.origin.load(Ordering::Acquire)).rem_euclid(len as i64) as usize;
+        let mut pos =
+            (out_frame - lp.origin.load(Ordering::Acquire)).rem_euclid(len as i64) as usize;
+        // Read from the other end. Applied to the loop's position rather than
+        // to each layer's, so layers keep their places relative to one another
+        // and the whole cycle turns over — which is what reversing a loop
+        // means, and not the same as reversing every layer separately.
+        if lp.reverse.load(Ordering::Relaxed) {
+            pos = len - 1 - pos;
+        }
         let n = lp.n_layers.load(Ordering::Acquire);
         let mut v = 0.0f32;
         for l in 0..n {
@@ -817,13 +851,27 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                 let mon_from = sh.in_frames.load(Ordering::Acquire) as i64 - frames as i64;
 
                 let mut peak = 0.0f32;
+                // Once per buffer, not once per frame: six loops times two
+                // trig calls is free here and wasteful inside the frame loop.
+                let mut gains = [(0.0f32, 0.0f32); N_LOOPS];
+                for li in 0..N_LOOPS {
+                    gains[li] = sh.lp(li).pan_gains();
+                }
+
                 for f in 0..frames {
                     let out_frame = (base + f) as i64;
-                    let mut v = 0.0f32;
+                    let mut vl = 0.0f32;
+                    let mut vr = 0.0f32;
 
                     for li in 0..N_LOOPS {
-                        v += sh.loop_at(li, out_frame);
+                        let s = sh.loop_at(li, out_frame);
+                        vl += s * gains[li].0;
+                        vr += s * gains[li].1;
                     }
+                    // The click and the input monitor sit in the middle. They
+                    // are references, not material, and a reference that moves
+                    // is not one.
+                    let mut v = 0.0f32;
                     if click_len > 0 && sh.click.load(Ordering::Relaxed) {
                         let pos = (out_frame - click_origin).rem_euclid(click_len as i64) as usize;
                         if pos < 16 {
@@ -836,10 +884,12 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                         }
                     }
 
-                    peak = peak.max(v.abs());
-                    data[f * out_channels + ch] = v;
+                    vl += v;
+                    vr += v;
+                    peak = peak.max(vl.abs()).max(vr.abs());
+                    data[f * out_channels + ch] = vl;
                     if dual && ch + 1 < out_channels {
-                        data[f * out_channels + ch + 1] = v;
+                        data[f * out_channels + ch + 1] = vr;
                     }
                 }
                 sh.out_peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
@@ -1881,6 +1931,48 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // click and the monitor: a dropped command must not leave the app
             // and the engine disagreeing about something the player cannot see
             // — and a stopped loop is invisible by definition.
+            // Multi-letter from here on. Single letters were running out and a
+            // config surface should read like what it does — `0rev1` and
+            // `0pan32` say themselves in a log where `0v1` and `0n32` would
+            // need the source open.
+            "rev" | "rev1" | "rev0" => {
+                let want = match rest {
+                    "rev1" => true,
+                    "rev0" => false,
+                    _ => !lp.reverse.load(Ordering::Relaxed),
+                };
+                lp.reverse.store(want, Ordering::Relaxed);
+                return format!(
+                    "loop {} plays {}.",
+                    li,
+                    if want { "backwards" } else { "forwards" }
+                );
+            }
+            _ if rest.starts_with("pan") => {
+                match rest[3..].parse::<usize>() {
+                    Ok(v) if v <= 127 => {
+                        lp.pan.store(v, Ordering::Relaxed);
+                        let (l, r) = lp.pan_gains();
+                        return format!(
+                            "loop {} panned {} (L {:.2}, R {:.2}).",
+                            li,
+                            match v {
+                                0..=10 => "hard left",
+                                11..=52 => "left",
+                                53..=74 => "centre",
+                                75..=116 => "right",
+                                _ => "hard right",
+                            },
+                            l,
+                            r
+                        );
+                    }
+                    // Says what was wrong rather than ignoring it. A config
+                    // command that silently does nothing is the failure this
+                    // whole surface is built against.
+                    _ => return format!("pan wants 0-127, not `{}`.", &rest[3..]),
+                }
+            }
             "h" | "h1" | "h0" => {
                 let want = match rest {
                     "h1" => false,
@@ -1900,6 +1992,10 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 // still silenced would refuse to record audibly for a reason
                 // nothing on screen could explain.
                 lp.muted.store(false, Ordering::Relaxed);
+                // The resolutions go with the audio. A cleared loop that came
+                // back reversed and hard left would be a haunting.
+                lp.reverse.store(false, Ordering::Relaxed);
+                lp.pan.store(64, Ordering::Relaxed);
                 lp.n_layers.store(0, Ordering::Release);
                 lp.loop_len.store(0, Ordering::Release);
                 for l in 0..MAX_LAYERS {
