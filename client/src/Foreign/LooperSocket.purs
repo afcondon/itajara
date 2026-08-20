@@ -139,6 +139,15 @@ type LoopState =
   -- | along while it is silent. The engine is the only thing that knows which,
   -- | so the engine says.
   , firing :: Boolean
+  -- | How often a pass sounds, as a probability; `1.0` is always. A gate on the
+  -- | mix and nothing else — the playhead keeps turning and `origin` never
+  -- | moves, exactly like `muted`.
+  , chance :: Number
+  -- | Whether chance is holding *this* pass back. Read from the mixer's own
+  -- | decision rather than worked out here: the roll happens once per pass in
+  -- | the audio callback, and a display that rolled its own would disagree with
+  -- | what is coming out of the speakers.
+  , skipping :: Boolean
   -- | Frames until a scheduled transition fires, or -1 when nothing is
   -- | pending. What lets the display say "starts in 1.4 s" rather than leaving
   -- | a deliberate wait looking like a dead button.

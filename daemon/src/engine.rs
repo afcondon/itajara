@@ -157,6 +157,45 @@ fn thresh_words(sh: &Shared) -> String {
     format!("{:.0} dBFS", 20.0 * (mag.max(1e-9) as f64).log10())
 }
 
+/// A number in `[0, 1)`, cheap enough for the audio thread.
+///
+/// xorshift64* — three shifts, a multiply, and one relaxed load and store. No
+/// allocation, no lock, no syscall, and nothing that can block, which is the
+/// whole of what "a random source in the audio callback" was waiting for.
+///
+/// Twenty-four bits taken off the top, because that is all an `f32` can hold and
+/// because taking the low bits is the classic way to get a generator that looks
+/// random and is not.
+///
+/// A free function over the atomic rather than a method, so it can be tested
+/// without standing up an engine.
+fn roll(rng: &AtomicU64) -> f32 {
+    let mut x = rng.load(Ordering::Relaxed);
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    rng.store(x, Ordering::Relaxed);
+    let bits = (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as u32;
+    bits as f32 / (1u32 << 24) as f32
+}
+
+/// A probability as the board says it, for the acks.
+///
+/// The named rungs are the ones the app's ladder offers, so a press and its ack
+/// use the same words; anything else set by hand gets a percentage rather than
+/// being rounded to the nearest rung it is not on.
+fn odds_words(p: f32) -> String {
+    match p {
+        _ if p >= 1.0 => "every pass".into(),
+        _ if p <= 0.0 => "never".into(),
+        _ if (p - 0.75).abs() < 1e-4 => "3 passes in 4".into(),
+        _ if (p - 0.5).abs() < 1e-4 => "1 pass in 2".into(),
+        _ if (p - 0.25).abs() < 1e-4 => "1 pass in 4".into(),
+        _ if (p - 0.125).abs() < 1e-4 => "1 pass in 8".into(),
+        _ => format!("{:.0}% of passes", p * 100.0),
+    }
+}
+
 /// dBFS to a magnitude, floored at silence rather than at minus infinity.
 ///
 /// A threshold of exactly zero would fire on the first denormal the converter
@@ -400,6 +439,21 @@ pub struct Loop {
     /// and spent as pre-roll, which is the machinery a late footswitch already
     /// built.
     arm_from: AtomicI64,
+    /// How often a pass sounds, as a probability. `1.0` is always.
+    ///
+    /// A gate on the mix and nothing else — the playhead keeps turning, `origin`
+    /// never moves, and the pass count keeps counting. Exactly the shape of
+    /// `muted`, and phase-locked for the same reason: a loop that plays one
+    /// cycle in four has to come back on the cycle it would have been on, or it
+    /// is not one cycle in four of anything.
+    pub chance: AtomicU32,
+    /// Which pass the last roll was for, and what it came up.
+    ///
+    /// The roll happens in the mixer, which runs per frame — so it has to be
+    /// remembered, or a one-in-four loop would flicker at sample rate instead of
+    /// dropping cycles. One roll per pass, held for the whole pass.
+    chance_pass: AtomicI64,
+    chance_sounds: AtomicBool,
 }
 
 impl Loop {
@@ -434,6 +488,9 @@ impl Loop {
             shot_end: AtomicI64::new(i64::MIN),
             level_arm: AtomicBool::new(false),
             arm_from: AtomicI64::new(i64::MIN),
+            chance: AtomicU32::new(1.0f32.to_bits()),
+            chance_pass: AtomicI64::new(i64::MIN),
+            chance_sounds: AtomicBool::new(true),
         }
     }
 
@@ -464,13 +521,39 @@ impl Loop {
     /// property of *where the playhead is*, not of what is read there — and
     /// keeping it here means the display and the audio cannot disagree about
     /// which way round a loop currently is.
+    /// Where the playhead is *before* it is folded back into the loop: how far
+    /// it has travelled since `origin`, in loop frames, without wrapping.
+    ///
+    /// Both the position and the pass count come out of this one expression, so
+    /// "where in the cycle" and "which cycle" cannot come to disagree — which
+    /// they would the first time speed or a pendulum was involved and only one
+    /// of them was taught about it.
+    fn raw_pos(&self, out_frame: i64) -> f64 {
+        let warp = f64::from_bits(self.warp.load(Ordering::Relaxed));
+        let origin = self.origin.load(Ordering::Acquire);
+        warp + (out_frame - origin) as f64 * self.speed()
+    }
+
+    /// How many complete trips through the loop have gone by, counting from
+    /// `origin`. Negative before it, which is honest rather than clamped.
+    ///
+    /// One *pass* is what chance rolls for, and a pendulum's pass is there and
+    /// back — the same span `pass_frames` measures, so a swinging loop that
+    /// plays one cycle in four drops a whole there-and-back rather than half of
+    /// one.
+    pub fn pass_index(&self, out_frame: i64, len: usize) -> i64 {
+        if len == 0 {
+            return 0;
+        }
+        let span = if self.pendulum.load(Ordering::Relaxed) { 2 * len } else { len } as f64;
+        (self.raw_pos(out_frame) / span).floor() as i64
+    }
+
     pub fn play_pos(&self, out_frame: i64, len: usize) -> f64 {
         if len == 0 {
             return 0.0;
         }
-        let warp = f64::from_bits(self.warp.load(Ordering::Relaxed));
-        let origin = self.origin.load(Ordering::Acquire);
-        let raw = warp + (out_frame - origin) as f64 * self.speed();
+        let raw = self.raw_pos(out_frame);
         let lenf = len as f64;
         if self.pendulum.load(Ordering::Relaxed) {
             // A triangle where a plain loop is a sawtooth. `2 * len` is one
@@ -604,6 +687,33 @@ impl Loop {
     pub fn firing(&self, out_frame: i64) -> bool {
         self.one_shot.load(Ordering::Relaxed) && out_frame < self.shot_end.load(Ordering::Acquire)
     }
+    pub fn chance_of(&self) -> f32 {
+        f32::from_bits(self.chance.load(Ordering::Relaxed))
+    }
+    /// Whether chance has any say over this loop at the moment.
+    ///
+    /// One function because two things ask: the mixer, which rolls, and the
+    /// snapshot, which reports. Written twice they would drift, and the way they
+    /// would drift is the quiet one — the display saying a loop is sitting a
+    /// pass out while it is audibly overdubbing.
+    ///
+    /// Never while recording. Overdubbing onto something you cannot hear is a
+    /// way to record a mistake twice, which is the same argument that un-stops a
+    /// loop before an overdub.
+    fn chance_applies(&self) -> bool {
+        self.chance_of() < 1.0 && !self.is_recording()
+    }
+    /// Whether chance is holding this pass back.
+    ///
+    /// **Reads the decision, never makes it.** The snapshot thread calls this
+    /// thirty times a second; rolling here would consume randomness the mixer
+    /// was going to use and, worse, would decide passes on whether anybody
+    /// happened to be looking. The mixer owns the roll, this only reports it.
+    pub fn skipping(&self, out_frame: i64, len: usize) -> bool {
+        self.chance_applies()
+            && self.chance_pass.load(Ordering::Relaxed) == self.pass_index(out_frame, len)
+            && !self.chance_sounds.load(Ordering::Relaxed)
+    }
     /// Frames until a scheduled transition fires, or `-1` when nothing is
     /// pending or it has no deadline.
     pub fn pending_in(&self, now: i64) -> i64 {
@@ -717,6 +827,21 @@ pub struct Shared {
     pub arm_thresh: AtomicU32,
     /// `ARM_REACH_MS` in frames, resolved once at startup.
     arm_reach: AtomicUsize,
+    /// The rig's random source, for chance.
+    ///
+    /// This is the thing chance was waiting for, and it turned out to be four
+    /// lines. The gap was written as "chance needs a random source in the audio
+    /// callback" on the assumption that randomness on the audio thread is a
+    /// problem — it is, if you reach for the one that allocates, locks, or asks
+    /// the operating system. A xorshift over a single atomic does none of those
+    /// and costs a couple of nanoseconds, which is less than the `cos` already
+    /// being called for the pan.
+    ///
+    /// One stream for all six loops rather than one each. They interleave, which
+    /// is if anything better — six loops pulling from one sequence cannot fall
+    /// into step with each other the way six identically-seeded generators
+    /// would.
+    rng: AtomicU64,
     pub monitor: AtomicBool,
     pub out_peak: AtomicU32,
     pub in_peak: AtomicU32,
@@ -999,6 +1124,24 @@ impl Shared {
         if n == 0 {
             return 0.0;
         }
+        // Chance: one roll per pass, held for the whole pass.
+        //
+        // The roll has to happen here, because this is the only place that knows
+        // the frame and so the only place that can turn a loop on and off *at* a
+        // cycle boundary rather than within a buffer of one. Remembering which
+        // pass it was for is what keeps a one-in-four loop from flickering at
+        // sample rate.
+        if lp.chance_applies() {
+            let p = lp.chance_of();
+            let pass = lp.pass_index(out_frame, len);
+            if lp.chance_pass.load(Ordering::Relaxed) != pass {
+                lp.chance_pass.store(pass, Ordering::Relaxed);
+                lp.chance_sounds.store(roll(&self.rng) < p, Ordering::Relaxed);
+            }
+            if !lp.chance_sounds.load(Ordering::Relaxed) {
+                return 0.0;
+            }
+        }
         // Speed is applied to the *loop's* position rather than to each layer's,
         // so the layers keep their places relative to one another and the whole
         // cycle turns over together — which is what playing a loop at a speed
@@ -1206,6 +1349,17 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         ),
         arm_thresh: AtomicU32::new(db_to_mag(opts.arm_db).to_bits()),
         arm_reach: AtomicUsize::new((ARM_REACH_MS / 1000.0 * sr_f).round() as usize),
+        // Seeded from the clock, on the control thread, once. A fixed seed
+        // would make every session drop exactly the same cycles, which is the
+        // opposite of what anybody switches chance on for. The `| 1` is because
+        // xorshift has one fixed point and it is zero.
+        rng: AtomicU64::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E3779B97F4A7C15)
+                | 1,
+        ),
         monitor: AtomicBool::new(opts.monitor),
         out_peak: AtomicU32::new(0),
         in_peak: AtomicU32::new(0),
@@ -2911,6 +3065,32 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     format!("loop {} records on the press again.", li)
                 };
             }
+            // How often a pass sounds. A probability rather than a ratio,
+            // because the ladder the board offers (always, 3 in 4, 1 in 2, 1 in
+            // 4, 1 in 8) is a choice the *app* makes about which values are
+            // worth a press, and the engine should not have opinions about that
+            // — the same reason speed takes a number and not a gear.
+            _ if rest.starts_with("ch") => {
+                let arg = rest[2..].trim();
+                if arg.is_empty() {
+                    return format!("loop {} sounds {}.", li, odds_words(lp.chance_of()));
+                }
+                match arg.parse::<f32>() {
+                    Ok(p) if (0.0..=1.0).contains(&p) => {
+                        lp.chance.store(p.to_bits(), Ordering::Relaxed);
+                        // Forget the pass the last roll covered, or a loop set to
+                        // always would stay silent until the cycle turned over —
+                        // the switch would look like it had not worked, for up to
+                        // a whole cycle, which is exactly long enough to press it
+                        // again and undo what you just did.
+                        lp.chance_pass.store(i64::MIN, Ordering::Relaxed);
+                        lp.chance_sounds.store(true, Ordering::Relaxed);
+                        return format!("loop {} sounds {}.", li, odds_words(p));
+                    }
+                    Ok(p) => return format!("chance wants 0 to 1, not {}.", p),
+                    _ => return format!("chance wants a probability, not `{}`.", arg),
+                }
+            }
             // The level a sound has to reach. Rig-wide, like the click — it
             // describes the room and the instrument, not any one loop.
             _ if rest.starts_with("arm") => {
@@ -2987,6 +3167,9 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 lp.shot_end.store(i64::MIN, Ordering::Release);
                 lp.level_arm.store(false, Ordering::Relaxed);
                 lp.arm_from.store(i64::MIN, Ordering::Release);
+                lp.chance.store(1.0f32.to_bits(), Ordering::Relaxed);
+                lp.chance_pass.store(i64::MIN, Ordering::Relaxed);
+                lp.chance_sounds.store(true, Ordering::Relaxed);
                 lp.n_layers.store(0, Ordering::Release);
                 lp.redo_to.store(0, Ordering::Release);
                 lp.loop_len.store(0, Ordering::Release);
@@ -3610,6 +3793,74 @@ mod tests {
             4 * LEN as i64,
             "there and back at half speed"
         );
+    }
+
+    /// Which pass we are on, which is what chance rolls for. Worth stating as a
+    /// property because it has to keep step with `play_pos` through speed,
+    /// direction and the pendulum — the two come out of one expression exactly
+    /// so this cannot drift, and this is what says so.
+    #[test]
+    fn a_pass_is_one_trip_through_the_loop_however_long_that_takes() {
+        let lp = at_origin();
+        assert_eq!(lp.pass_index(0, LEN), 0);
+        assert_eq!(lp.pass_index(LEN as i64 - 1, LEN), 0);
+        assert_eq!(lp.pass_index(LEN as i64, LEN), 1);
+        // Before `origin` is behind the loop's own beginning, and says so
+        // rather than clamping to zero and claiming a pass that never ran.
+        assert_eq!(lp.pass_index(-1, LEN), -1);
+
+        // Half speed: a pass takes twice as many output frames.
+        lp.adopt(0, LEN, 0.5, false);
+        assert_eq!(lp.pass_index(2 * LEN as i64 - 1, LEN), 0);
+        assert_eq!(lp.pass_index(2 * LEN as i64, LEN), 1);
+
+        // A pendulum's pass is there and back, so a swinging loop set to one
+        // cycle in four drops a whole round trip rather than half of one.
+        let sw = at_origin();
+        sw.adopt(0, LEN, 1.0, true);
+        assert_eq!(sw.pass_index(2 * LEN as i64 - 1, LEN), 0);
+        assert_eq!(sw.pass_index(2 * LEN as i64, LEN), 1);
+    }
+
+    /// The random source, which is what chance was waiting for. Cheap enough
+    /// for the audio thread is the interesting property and cannot be asserted;
+    /// what can is that it stays in range and does not sit still.
+    #[test]
+    fn the_roll_is_in_range_and_actually_moves() {
+        let rng = AtomicU64::new(0x1234_5678_9ABC_DEF1);
+        let mut lo = f32::MAX;
+        let mut hi = f32::MIN;
+        let mut sum = 0.0f64;
+        const N: usize = 20_000;
+        for _ in 0..N {
+            let r = roll(&rng);
+            assert!((0.0..1.0).contains(&r), "roll out of range: {}", r);
+            lo = lo.min(r);
+            hi = hi.max(r);
+            sum += r as f64;
+        }
+        assert!(lo < 0.01 && hi > 0.99, "roll never reached the ends: {}..{}", lo, hi);
+        let mean = sum / N as f64;
+        assert!((mean - 0.5).abs() < 0.02, "mean {} is not near a half", mean);
+    }
+
+    /// And that the gate the mixer actually applies — `roll() < p` — comes out
+    /// at the rate the label promises. A generator with a good mean can still
+    /// have a lumpy tail, and every rung on the ladder except the first lives in
+    /// the tail.
+    #[test]
+    fn a_pass_sounds_as_often_as_the_rung_says() {
+        let rng = AtomicU64::new(0xDEAD_BEEF_CAFE_F00D);
+        const N: usize = 40_000;
+        for p in [1.0f32, 0.75, 0.5, 0.25, 0.125] {
+            let hits = (0..N).filter(|_| roll(&rng) < p).count() as f64 / N as f64;
+            assert!(
+                (hits - p as f64).abs() < 0.01,
+                "at {} the gate opened {:.4} of the time",
+                p,
+                hits
+            );
+        }
     }
 
     /// A one-shot is silent until it is fired, and silent again after one pass.

@@ -178,7 +178,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                     r#""loopSecs":{:.4},"pos":{},"phase":{:.5},"armed":{},"#,
                     r#""recording":{},"quant":{},"muted":{},"reverse":{},"pan":{},"#,
                     r#""speed":{:.4},"pendulum":{},"oneShot":{},"levelArm":{},"#,
-                    r#""firing":{},"#,
+                    r#""firing":{},"chance":{:.4},"skipping":{},"#,
                     r#""pendingAt":{},"shapes":[{}]}}"#
                 ),
                 li,
@@ -210,6 +210,12 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                 // it is silent, which is a display describing something nobody
                 // can hear.
                 lp.firing(cur),
+                // How often this loop plays, and whether it is sitting this
+                // pass out. `skipping` reads the mixer's decision and never
+                // makes one — a snapshot that rolled would decide passes on
+                // whether anybody was looking.
+                lp.chance_of(),
+                lp.skipping(cur, len),
                 // Frames until a scheduled transition fires, or -1 for nothing
                 // pending. A display that can show "starts in 1.4 s" is the
                 // difference between a deliberate wait and a dead button.
