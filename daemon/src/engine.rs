@@ -160,12 +160,32 @@ fn thresh_words(sh: &Shared) -> String {
 /// A number in `[0, 1)`, cheap enough for the audio thread.
 ///
 /// xorshift64* — three shifts, a multiply, and one relaxed load and store. No
-/// allocation, no lock, no syscall, and nothing that can block, which is the
-/// whole of what "a random source in the audio callback" was waiting for.
+/// allocation, no lock, no syscall, nothing that can block.
+///
+/// **Not because Rust lacks a better one.** `rand`'s `SmallRng` (xoshiro256++)
+/// and `StdRng` (ChaCha12) are also pure computation over state you own, and
+/// either is fine in a callback once seeded off-thread. `rand` is even already
+/// in this tree, pulled in by tungstenite for WebSocket masking keys, so it
+/// would have cost a feature flag rather than a dependency.
+///
+/// The thing that is genuinely unusable here is `thread_rng()` — the one
+/// everybody reaches for. It is a `ReseedingRng` that pulls fresh entropy from
+/// the operating system every 64 KiB of output, which is a `getrandom` syscall
+/// at a moment nobody chose, on top of lazy thread-local initialisation. That
+/// is what "chance needs a random source in the audio callback" was really
+/// about, and stating it as though randomness itself were the problem is what
+/// left the feature parked for months.
+///
+/// So this stays because it is here, tested and measured, and not because it
+/// had to be written. If it ever wants to be better it should become
+/// `SmallRng`, which is a strictly better-studied generator and no more
+/// expensive.
 ///
 /// Twenty-four bits taken off the top, because that is all an `f32` can hold and
 /// because taking the low bits is the classic way to get a generator that looks
-/// random and is not.
+/// random and is not. The multiply is the whole point of the `*`: plain
+/// xorshift is a linear map over GF(2) and shows it, and the multiply is what
+/// scrambles that.
 ///
 /// A free function over the atomic rather than a method, so it can be tested
 /// without standing up an engine.
