@@ -273,6 +273,18 @@ pub struct Loop {
     /// the right length even though the input trails the output.
     reached: AtomicUsize,
     overflowed: AtomicBool,
+    /// How late the press that started this recording was, in frames.
+    ///
+    /// The app knows when the MIDI arrived and the daemon does not, so lateness
+    /// travels on the command (`0r@312`) and is kept here until the recording
+    /// closes — which is the only moment it can be spent, because the pre-roll
+    /// shift happens at commit.
+    ///
+    /// Zero means "no measurement", and the compiled `--preroll-ms` is used
+    /// instead. That is deliberately not the same as a measured zero: a rig
+    /// that cannot time its own presses should still be able to say "always
+    /// reach back 40 ms" by hand.
+    started_late: AtomicI64,
     /// Output frame at which the layer being recorded has its position zero.
     /// Equal to `origin` for a first recording; for a multiply it is the cycle
     /// boundary the multiply started on, which is also where the *new* loop's
@@ -304,6 +316,7 @@ impl Loop {
             reached: AtomicUsize::new(0),
             overflowed: AtomicBool::new(false),
             rec_from: AtomicI64::new(0),
+            started_late: AtomicI64::new(0),
         }
     }
 
@@ -1468,12 +1481,31 @@ fn supervise<F>(
     }
 }
 
-fn commit(sh: &Shared, li: usize, sr: u32) {
+/// Close a recording, as of the moment the foot went down rather than the
+/// moment the command arrived.
+///
+/// `late` is how many frames ago the closing press happened. It is not a
+/// nicety: a switch that may be double-tapped cannot resolve until the
+/// double-tap window expires, so every close arrives a fixed few hundred
+/// milliseconds after the press, and a free loop was coming out that much
+/// longer than it was played. Nothing in the sound says so — overdubs are
+/// modular against whatever length the loop ended up with, so everything still
+/// stacks perfectly against a cycle nobody chose.
+///
+/// The fix is not to hurry the gesture but to un-do the delay: the audio for
+/// those milliseconds is already in the arena, and the loop simply ends
+/// earlier than the last frame recorded. Which is also why adding a double-tap
+/// to a switch stopped costing anything recorded.
+fn commit(sh: &Shared, li: usize, sr: u32, late: i64) {
     let lp = sh.lp(li);
     let state = lp.state.get();
     if state != FIRST && state != OVERDUB {
         return;
     }
+
+    // The frame the foot went down on. Taken before anything below sleeps —
+    // the quantised path waits for a boundary, which would move it.
+    let closed_at = sh.out_frames.load(Ordering::Acquire) as i64 - late.max(0);
 
     // A quantised first recording gets a length that is a whole number of grid
     // cycles, decided here rather than taken from what happened to be captured.
@@ -1488,7 +1520,7 @@ fn commit(sh: &Shared, li: usize, sr: u32) {
     let quantised_len = if state == FIRST && lp.quant.load(Ordering::Relaxed) {
         sh.grid().and_then(|(_, glen)| {
             let from = lp.origin.load(Ordering::Acquire);
-            let cur = sh.out_frames.load(Ordering::Acquire) as i64;
+            let cur = closed_at;
             let elapsed = (cur - from).max(0) as f64;
             let n = ((elapsed / glen as f64).round() as usize).max(1);
             let len = n * glen;
@@ -1521,10 +1553,31 @@ fn commit(sh: &Shared, li: usize, sr: u32) {
     std::thread::sleep(Duration::from_millis(60));
 
     if state == FIRST {
-        let mut len = quantised_len.unwrap_or_else(|| lp.reached.load(Ordering::Acquire));
+        let reached = lp.reached.load(Ordering::Acquire);
+        let mut len = quantised_len.unwrap_or_else(|| {
+            if late <= 0 {
+                return reached;
+            }
+            // What was played, rather than what was captured. The frames after
+            // the press stay in the arena and are simply never read: playback
+            // is `pos % len`, so anything past the end does not exist.
+            let origin = lp.origin.load(Ordering::Acquire);
+            let want = (closed_at - origin).max(0) as usize;
+            // Only ever shorter. If the input has not caught up to the press —
+            // it trails the output by K — then `reached` is the honest answer
+            // and claiming further would claim silence.
+            want.min(reached)
+        });
         if len == 0 {
             println!("  nothing recorded.");
             return;
+        }
+        if late > 0 && quantised_len.is_none() && len < reached {
+            println!(
+                "  closed as of the press, {:.0} ms before the command: {} frames dropped.",
+                late as f64 / sr as f64 * 1000.0,
+                reached - len
+            );
         }
         // Pre-roll: a tap is always a little late, so back-date the loop's start
         // and fill the front from the ring. The attack that would have been
@@ -1534,10 +1587,19 @@ fn commit(sh: &Shared, li: usize, sr: u32) {
         // to a loop that was started on a boundary. Alignment beats the last
         // few milliseconds of the attack, and a loop that drifts off the grid
         // by its pre-roll would be a bug nobody could see the cause of.
+        // Measured beats configured: `started_late` is how late the press that
+        // began this recording actually was, where `--preroll-ms` is a guess
+        // applied to every take alike. Falls back to the guess when nothing
+        // measured it, so a rig that cannot time its presses still works.
         let pre = if quantised_len.is_some() {
             0
         } else {
-            sh.preroll.load(Ordering::Acquire)
+            let measured = lp.started_late.load(Ordering::Acquire);
+            if measured > 0 {
+                measured as usize
+            } else {
+                sh.preroll.load(Ordering::Acquire)
+            }
         };
         let layer = lp.n_layers.load(Ordering::Acquire);
         let origin = lp.origin.load(Ordering::Acquire);
@@ -2065,6 +2127,31 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
     //
     // A bare digit selects, which is a convenience for the console and for the
     // single-loop view, and nothing depends on it.
+    // `@<ms>` on the end says how long ago the press actually happened.
+    //
+    // **The app knows and the daemon cannot.** A switch that may be
+    // double-tapped cannot resolve until the window expires, so every command
+    // from a footswitch arrives a fixed few hundred milliseconds after the
+    // foot moved — and a looper that believes the arrival time records a loop
+    // that much longer than it was played. Nothing in the sound says so, which
+    // is the worst kind of wrong.
+    //
+    // Carried on the command rather than inferred, because only the sender was
+    // there. Stripped for every command and spent only by the ones for which a
+    // frame matters, so a client can stamp everything it sends without having
+    // to know which those are.
+    let (line, late_ms) = match line.rsplit_once('@') {
+        Some((cmd, ms)) => match ms.trim().parse::<f64>() {
+            Ok(v) if v >= 0.0 && v < 5000.0 => (cmd, v),
+            // Out of range or unparseable: refuse rather than silently treating
+            // it as on time, because a client that thinks it is compensating
+            // and is not would be worse off than one that never tried.
+            _ => return format!("`@{}` is not a lateness in milliseconds.", ms.trim()),
+        },
+        None => (line, 0.0),
+    };
+    let late = (late_ms / 1000.0 * sr as f64).round() as i64;
+
     let trimmed = line.trim();
     let (li, rest) = match trimmed.chars().next() {
         Some(c) if c.is_ascii_digit() => {
@@ -2098,7 +2185,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             },
             "r" => match lp.state.get() {
                 MULTIPLY => multiply_end(sh, li, sr),
-                FIRST | OVERDUB => commit(sh, li, sr),
+                FIRST | OVERDUB => commit(sh, li, sr, late),
                 _ => {
                     if let Some(other) = busy_elsewhere(sh, li) {
                         return other;
@@ -2113,6 +2200,9 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                         // An overdub sums into its layer, so anything left there
                         // from an undone take would bleed into the new one.
                         sh.zero_layer(li, layer);
+                        // Kept until the recording closes, because the pre-roll
+                        // shift that spends it happens at commit.
+                        lp.started_late.store(late, Ordering::Release);
                         // Only a FIRST recording needs a deadline. An overdub
                         // records from `origin`, so it is already on whatever
                         // grid its loop sits on and cannot be nudged off it.
@@ -2619,7 +2709,7 @@ fn selftest(sh: &Shared, sr: u32, secs: f64) -> Result<(), Box<dyn Error>> {
     lp.loop_len.store(len, Ordering::Release);
     lp.request.set(ARMED);
     std::thread::sleep(Duration::from_secs_f64(secs * 2.0 + 0.3));
-    commit(sh, li, sr);
+    commit(sh, li, sr, 0);
     std::thread::sleep(Duration::from_millis(200));
 
     let (e0, p0) = onset_of(sh, li, 0, len)
@@ -2641,7 +2731,7 @@ fn selftest(sh: &Shared, sr: u32, secs: f64) -> Result<(), Box<dyn Error>> {
     sh.click.store(false, Ordering::Relaxed);
     lp.request.set(ARMED);
     std::thread::sleep(Duration::from_secs_f64(secs * 2.0 + 0.3));
-    commit(sh, li, sr);
+    commit(sh, li, sr, 0);
     std::thread::sleep(Duration::from_millis(200));
 
     let (e1, p1) = onset_of(sh, li, 1, len)
