@@ -38,6 +38,14 @@ USAGE
         t [secs]  take from the past
         u  undo last layer             c  clear everything
         k  click on/off                p  status        q  quit
+        one  one pass per trigger      f  fire it
+        lev  wait for a sound          arm [db]  the level it waits for
+
+      `one` and `lev` are per-loop modes and take `0`/`1` to set rather than
+      flip: `2one1` makes loop 2 a one-shot, silent until `2f` fires it from
+      the top. `2lev1` makes `2r` arm rather than record — the loop starts
+      when something crosses the level, and reaches back past the crossing
+      so the attack that crossed it is in the take.
 
       `t` is the one a pedal cannot do: you played something good and did
       not hit record, so hit it afterwards. With no loop yet it takes the
@@ -72,6 +80,8 @@ USAGE
       --link-port <n>   ...on a different port
       --preroll-ms <n>  how far before the tap the first loop actually
                         starts, pulled from the pre-roll           (default 0)
+      --arm-db <n>      dBFS a sound must reach to start a level-armed
+                        loop; `arm<n>` changes it live         (default -36)
       --selftest <s>    record one cycle of the engine's own click through a
                         loopback cable and check where it landed
 
@@ -294,6 +304,7 @@ fn parse_loop(args: &[String]) -> Result<engine::Opts, String> {
                 opts.link_port = Some(value.parse().map_err(|_| "--link-port wants a port number")?)
             }
             "--preroll-ms" => opts.preroll_ms = value.parse().map_err(|_| "--preroll-ms wants a number")?,
+            "--arm-db" => opts.arm_db = value.parse().map_err(|_| "--arm-db wants a number of dBFS")?,
             "--selftest" => {
                 opts.selftest = Some(value.parse().map_err(|_| "--selftest wants a length in seconds")?)
             }

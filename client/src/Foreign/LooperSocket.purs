@@ -124,6 +124,21 @@ type LoopState =
   , speed :: Number
   -- | Forward, then back. Doubles the cycle rather than fitting into it.
   , pendulum :: Boolean
+  -- | One pass per trigger, rather than turning for ever. Reported because it
+  -- | changes what a **tap** means — a tap on a one-shot fires it where a tap
+  -- | on any other loop stops it — and the app has to know which before the
+  -- | foot lands, not after.
+  , oneShot :: Boolean
+  -- | Wait for a sound rather than starting on the press. Also changes what a
+  -- | press does, and `armed` above is what it looks like while it waits.
+  , levelArm :: Boolean
+  -- | Whether a one-shot is inside a pass right now.
+  -- |
+  -- | Needed because `pos` keeps moving between passes — the playhead cannot
+  -- | hold still — so a position readout on its own shows a one-shot sweeping
+  -- | along while it is silent. The engine is the only thing that knows which,
+  -- | so the engine says.
+  , firing :: Boolean
   -- | Frames until a scheduled transition fires, or -1 when nothing is
   -- | pending. What lets the display say "starts in 1.4 s" rather than leaving
   -- | a deliberate wait looking like a dead button.

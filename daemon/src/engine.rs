@@ -46,6 +46,13 @@ pub const MAX_LAYERS: usize = 8;
 /// Transport states, as a `u8` because the audio thread reads it every buffer.
 const IDLE: u8 = 0;
 /// Waiting for the output callback to stamp the exact frame recording begins.
+///
+/// Also, and for a long time only nominally, the state a **level-armed** loop
+/// sits in while it listens. `ARMED` was written as a request value and never
+/// once set as a state — `is_armed()` could not return true, and the `armed`
+/// field has been going out in every snapshot reading `false` since the socket
+/// existed. Level-arm is what it was always describing: the loop has claimed
+/// the input and is not yet writing to it.
 const ARMED: u8 = 1;
 /// Recording the first loop: linear, and its length becomes the cycle.
 const FIRST: u8 = 2;
@@ -56,6 +63,21 @@ const PLAYING: u8 = 4;
 /// Recording across several cycles, to make the loop an integer multiple longer
 /// with what is already there repeating underneath. The EDP's `Multiply`.
 const MULTIPLY: u8 = 5;
+/// A request only, never a state: play one pass from the top and stop.
+const FIRE: u8 = 6;
+
+/// How far before the threshold crossing a level-armed recording begins.
+///
+/// **The crossing is not the start of the sound, it is the middle of the
+/// attack.** A threshold low enough to catch the very front of a pluck is a
+/// threshold that fires on the room; a threshold high enough not to fire on the
+/// room is one that arrives some milliseconds into the note. Reaching backwards
+/// dissolves the trade: the ring already holds those milliseconds, and level-arm
+/// can pick a threshold that will not misfire and then take the attack anyway.
+///
+/// Fifty is comfortably past the front of anything with a pick or a stick on it,
+/// and comfortably short of catching the previous bar.
+const ARM_REACH_MS: f64 = 50.0;
 
 pub struct Opts {
     pub device: String,
@@ -95,6 +117,9 @@ pub struct Opts {
     /// UDP port to hear `/link/anchor` on. `None` runs the looper without a
     /// bar, which is the right default for using it alone.
     pub link_port: Option<u16>,
+    /// dBFS a sound has to reach to start a level-armed recording. Changeable
+    /// while running with `arm<db>`; this is only where it starts.
+    pub arm_db: f64,
 }
 
 impl Default for Opts {
@@ -117,8 +142,29 @@ impl Default for Opts {
             ws_port: None,
             takes_dir: default_takes_dir(),
             link_port: None,
+            arm_db: -36.0,
         }
     }
+}
+
+/// The arm threshold as the player would say it, for every ack that mentions it.
+///
+/// One function rather than the conversion written out at each call site: three
+/// acks quote this number, and three copies of a `log10` is three chances for
+/// the daemon to describe a threshold it is not using.
+fn thresh_words(sh: &Shared) -> String {
+    let mag = f32::from_bits(sh.arm_thresh.load(Ordering::Relaxed));
+    format!("{:.0} dBFS", 20.0 * (mag.max(1e-9) as f64).log10())
+}
+
+/// dBFS to a magnitude, floored at silence rather than at minus infinity.
+///
+/// A threshold of exactly zero would fire on the first denormal the converter
+/// produced, so "off" is not expressible here and is not meant to be — a
+/// level-arm with no threshold is a level-arm that starts immediately, which is
+/// what plain record already does.
+fn db_to_mag(db: f64) -> f32 {
+    (10f64.powf(db / 20.0)).clamp(1e-6, 1.0) as f32
 }
 
 /// `~/.itajara/takes`, or a relative path if there is no home — which happens
@@ -324,6 +370,36 @@ pub struct Loop {
     /// boundary the multiply started on, which is also where the *new* loop's
     /// position zero will end up.
     rec_from: AtomicI64,
+    /// Play one pass and stop, rather than turning for ever.
+    ///
+    /// A mode rather than a state, like `muted` and for the same reason: it is
+    /// orthogonal to the record machine. A one-shot can be recorded into, undone
+    /// and overdubbed exactly as any other loop; the only thing it changes is
+    /// what happens between fires, which is silence.
+    pub one_shot: AtomicBool,
+    /// The output frame the current pass ends at, or `i64::MIN` for "not
+    /// sounding".
+    ///
+    /// `i64::MIN` rather than a separate flag so that switching the mode on puts
+    /// a loop straight into the silence it will spend most of its life in — one
+    /// comparison in the mixer, no second thing to keep in step.
+    shot_end: AtomicI64,
+    /// Wait for a sound rather than starting on the press.
+    ///
+    /// The other half of *"we can't go back in time, but we're monitoring
+    /// continuously"*: with the ring running, arming costs nothing and the
+    /// recording can begin before the command that caused it.
+    pub level_arm: AtomicBool,
+    /// The output frame a pending recording should be back-dated to, or
+    /// `i64::MIN` for none.
+    ///
+    /// Written by the input callback at the threshold crossing, read by the
+    /// output callback when it stamps the recording. The two cannot be the same
+    /// frame — the crossing is found on the input thread and the transition is
+    /// stamped on the output one — so the difference is handed to `started_late`
+    /// and spent as pre-roll, which is the machinery a late footswitch already
+    /// built.
+    arm_from: AtomicI64,
 }
 
 impl Loop {
@@ -354,6 +430,10 @@ impl Loop {
             overflowed: AtomicBool::new(false),
             rec_from: AtomicI64::new(0),
             started_late: AtomicI64::new(0),
+            one_shot: AtomicBool::new(false),
+            shot_end: AtomicI64::new(i64::MIN),
+            level_arm: AtomicBool::new(false),
+            arm_from: AtomicI64::new(i64::MIN),
         }
     }
 
@@ -447,6 +527,21 @@ impl Loop {
         }
     }
 
+    /// How many output frames one trip through this loop takes, at whatever
+    /// speed and direction it is currently set to.
+    ///
+    /// Only a one-shot needs it — everything else wraps and never asks how long
+    /// a pass was — but it is the arithmetic most likely to be quietly wrong, so
+    /// it is a function with tests rather than three lines inside a callback.
+    fn pass_frames(&self, len: usize) -> i64 {
+        // A pendulum goes there and back before it has been round once.
+        let span = if self.pendulum.load(Ordering::Relaxed) { 2 * len } else { len };
+        // Direction does not change how long a pass takes, only which end it
+        // starts at — so the rate is the magnitude.
+        let rate = self.speed().abs().max(1e-6);
+        (span as f64 / rate).round() as i64
+    }
+
     /// Back to forward, rate one, no offset — what a cleared loop plays at.
     fn plainly(&self) {
         self.speed.store(1.0f64.to_bits(), Ordering::Relaxed);
@@ -498,6 +593,16 @@ impl Loop {
     }
     pub fn quantised(&self) -> bool {
         self.quant.load(Ordering::Relaxed)
+    }
+    /// Whether a one-shot is inside a pass at this frame.
+    ///
+    /// Reported as well as mixed with, because the playhead does not stop
+    /// between passes — it cannot, the arithmetic has no way to hold still —
+    /// and a display reading `pos` alone shows a one-shot sweeping merrily
+    /// along while it is silent. That is the same shape of lie the legend told
+    /// about a bank nobody was standing on.
+    pub fn firing(&self, out_frame: i64) -> bool {
+        self.one_shot.load(Ordering::Relaxed) && out_frame < self.shot_end.load(Ordering::Acquire)
     }
     /// Frames until a scheduled transition fires, or `-1` when nothing is
     /// pending or it has no deadline.
@@ -602,6 +707,16 @@ pub struct Shared {
     buffer_frames: AtomicU32,
     pub click: AtomicBool,
     preroll: AtomicUsize,
+    /// The level a sound has to reach to start a level-armed recording, as an
+    /// `f32` magnitude in the bits of a `u32`.
+    ///
+    /// Rig-wide rather than per loop, and settable while the daemon runs, because
+    /// it is a fact about the room and the instrument rather than about any one
+    /// loop — and because a threshold you cannot tune where you are standing is a
+    /// threshold that will be wrong.
+    pub arm_thresh: AtomicU32,
+    /// `ARM_REACH_MS` in frames, resolved once at startup.
+    arm_reach: AtomicUsize,
     pub monitor: AtomicBool,
     pub out_peak: AtomicU32,
     pub in_peak: AtomicU32,
@@ -716,6 +831,17 @@ impl Shared {
     /// Whether any loop is claiming the input, including one merely armed.
     pub fn input_claimed(&self) -> Option<usize> {
         (0..N_LOOPS).find(|&i| self.loops[i].wants_input())
+    }
+    /// The loop waiting for a sound, if one is. Asked by the input callback on
+    /// every buffer, and derived for the same reason `recording_loop` is.
+    ///
+    /// A loop whose crossing has already been found still reads `ARMED` — the
+    /// state does not change until the output callback stamps the transition,
+    /// which may be a buffer or two later. Excluding it here is what stops the
+    /// next buffer finding a second crossing and back-dating the recording to
+    /// *that* one instead.
+    pub fn armed_loop(&self) -> Option<usize> {
+        (0..N_LOOPS).find(|&i| self.loops[i].is_armed() && self.loops[i].request.get() == 0)
     }
 
     /// The grid quantised loops align to: the anchor's origin and cycle length.
@@ -860,6 +986,13 @@ impl Shared {
         // Silenced but not stopped: `pos` below is still computed from `origin`
         // on every frame, so nothing drifts while a loop is quiet.
         if lp.muted.load(Ordering::Relaxed) {
+            return 0.0;
+        }
+        // A one-shot sounds only inside a pass. Before the first fire `shot_end`
+        // is `i64::MIN`, so turning the mode on silences the loop at once — which
+        // is right, and is why the ack says so: a one-shot that kept playing
+        // until its next fire would be a loop in two minds.
+        if lp.one_shot.load(Ordering::Relaxed) && !lp.firing(out_frame) {
             return 0.0;
         }
         let n = lp.n_layers.load(Ordering::Acquire);
@@ -1071,6 +1204,8 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         preroll: AtomicUsize::new(
             (opts.preroll_ms / 1000.0 * sr_f).round().max(0.0) as usize,
         ),
+        arm_thresh: AtomicU32::new(db_to_mag(opts.arm_db).to_bits()),
+        arm_reach: AtomicUsize::new((ARM_REACH_MS / 1000.0 * sr_f).round() as usize),
         monitor: AtomicBool::new(opts.monitor),
         out_peak: AtomicU32::new(0),
         in_peak: AtomicU32::new(0),
@@ -1166,6 +1301,20 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                         ARMED => {
                             lp.reached.store(0, Ordering::Release);
                             lp.rec_reached.store(0, Ordering::Release);
+                            // A level-armed recording knows the frame the sound
+                            // crossed the threshold, and that frame is earlier
+                            // than the one this request can be stamped at — the
+                            // crossing is found on the input thread. Hand the
+                            // difference to `started_late`, which is the same
+                            // road a late footswitch already travels: `commit`
+                            // shifts `origin` back by it and fills the front
+                            // from the ring.
+                            match lp.arm_from.swap(i64::MIN, Ordering::AcqRel) {
+                                i64::MIN => {}
+                                want => lp
+                                    .started_late
+                                    .store((stamp - want).max(0), Ordering::Release),
+                            }
                             let n = lp.n_layers.load(Ordering::Acquire);
                             if n < MAX_LAYERS {
                                 if lp.loop_len.load(Ordering::Acquire) == 0 {
@@ -1189,6 +1338,40 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                             }
                         }
                         PLAYING => lp.state.set(PLAYING),
+                        // **The one place `origin` moves.**
+                        //
+                        // Everywhere else in this engine a loop's zero is fixed
+                        // at the moment it was recorded and stays there. That is
+                        // what phase-locking means and it is why stopping a loop
+                        // and starting it again puts it back where it would have
+                        // been rather than where it began — the alternative,
+                        // moving `origin`, is called out on `muted` as "the one
+                        // thing that must never happen to a loop that closed on a
+                        // grid boundary".
+                        //
+                        // A one-shot is the documented exception, and has to be:
+                        // the entire gesture is *play this, from the top, now*.
+                        // Which is also why the mode is a mode — a loop that can
+                        // be fired is a loop that has given up its place in the
+                        // phase-locked set, and that should be a thing you turn
+                        // on rather than a thing a footswitch does to you.
+                        FIRE => {
+                            let len = lp.loop_len.load(Ordering::Acquire);
+                            if len > 0 {
+                                lp.origin.store(stamp, Ordering::Release);
+                                // Backwards, the top of the pass is the *end*.
+                                // Starting at zero and stepping negative wraps
+                                // there anyway, one sample later and audibly.
+                                let from = if lp.speed() < 0.0 { (len - 1) as f64 } else { 0.0 };
+                                lp.warp.store(from.to_bits(), Ordering::Relaxed);
+                                lp.shot_end
+                                    .store(stamp + lp.pass_frames(len), Ordering::Release);
+                                // A fired loop is audible by definition. Leaving
+                                // `muted` set would make the switch do nothing
+                                // for a reason nothing on screen could explain.
+                                lp.muted.store(false, Ordering::Relaxed);
+                            }
+                        }
                         IDLE => {}
                         _ => {}
                     }
@@ -1306,6 +1489,50 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                     sh.ring[i].store(v.to_bits(), Ordering::Relaxed);
                 }
                 sh.in_peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
+
+                // A level-armed loop is *listening*, not recording — it is not
+                // `recording_loop()` and nothing below will write for it. What it
+                // needs is the frame the sound crossed the threshold, found here
+                // because this is the only place that sees individual input
+                // frames. Per-buffer would do at 21 ms granularity, but the
+                // frames are already in hand and the crossing is the one number
+                // the whole mode turns on.
+                //
+                // The crossing is not the start of the note, so the recording is
+                // dated `ARM_REACH_MS` before it. That costs nothing: the ring
+                // has been running since the daemon started.
+                if let Some(li) = sh.armed_loop() {
+                    let thresh = f32::from_bits(sh.arm_thresh.load(Ordering::Relaxed));
+                    if peak >= thresh {
+                        if let Some(f) = (0..frames)
+                            .find(|&f| data[f * in_channels + ch].abs() >= thresh)
+                        {
+                            let lp = sh.lp(li);
+                            let k = sh.k.load(Ordering::Acquire);
+                            let at = (base + f) as i64 + k;
+                            // Quantised wins, as it does for a footswitch: a loop
+                            // told to start on the grid starts on the grid,
+                            // whatever asked for it. There is no back-dating then
+                            // — the boundary is ahead, not behind.
+                            match if lp.quant.load(Ordering::Relaxed) {
+                                sh.next_boundary(at)
+                            } else {
+                                None
+                            } {
+                                Some(t) => {
+                                    lp.arm_from.store(i64::MIN, Ordering::Release);
+                                    lp.request_at.store(t, Ordering::Release);
+                                }
+                                None => {
+                                    let reach = sh.arm_reach.load(Ordering::Relaxed) as i64;
+                                    lp.arm_from.store(at - reach, Ordering::Release);
+                                    lp.request_at.store(i64::MIN, Ordering::Release);
+                                }
+                            }
+                            lp.request.set(ARMED);
+                        }
+                    }
+                }
 
                 // Which loop the input belongs to, asked rather than remembered.
                 // There is one converter, so at most one loop can be recording;
@@ -2307,6 +2534,16 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             "r" => match lp.state.get() {
                 MULTIPLY => multiply_end(sh, li, sr),
                 FIRST | OVERDUB => commit(sh, li, sr, late),
+                // A second press while the loop is waiting for a sound takes the
+                // arm back. There has to be a way out: the sound may never come,
+                // and a loop holding the input for a recording that will never
+                // begin locks out all five others. Asked before the claim checks
+                // below, because it is this loop's own claim being released.
+                ARMED => {
+                    lp.state.set(IDLE);
+                    lp.arm_from.store(i64::MIN, Ordering::Release);
+                    return format!("loop {} has stopped listening.", li);
+                }
                 _ => {
                     if let Some(other) = busy_elsewhere(sh, li) {
                         return other;
@@ -2327,6 +2564,27 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                         // Kept until the recording closes, because the pre-roll
                         // shift that spends it happens at commit.
                         lp.started_late.store(late, Ordering::Release);
+                        // Level-armed: wait for a sound rather than starting on
+                        // the press. Nothing else happens here — the input
+                        // callback finds the crossing and sets the same request
+                        // this would have, so there is one road into `FIRST` and
+                        // not two.
+                        //
+                        // The press's own lateness is dropped, deliberately. It
+                        // measures how late the *foot* was, and the foot is no
+                        // longer what starts this recording; carrying it would
+                        // back-date the loop past the note that began it.
+                        if lp.level_arm.load(Ordering::Relaxed) {
+                            lp.started_late.store(0, Ordering::Release);
+                            lp.arm_from.store(i64::MIN, Ordering::Release);
+                            lp.request_at.store(i64::MIN, Ordering::Release);
+                            lp.state.set(ARMED);
+                            return format!(
+                                "loop {} is listening — it starts when something goes over {}.",
+                                li,
+                                thresh_words(sh)
+                            );
+                        }
                         // Only a FIRST recording needs a deadline. An overdub
                         // records from `origin`, so it is already on whatever
                         // grid its loop sits on and cannot be nudged off it.
@@ -2358,6 +2616,51 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     }
                 }
             },
+            // Fire a one-shot: one pass from the top, now.
+            //
+            // **Lateness is not spent here, and that is a choice.** Every other
+            // time-critical command in this daemon subtracts it, because they all
+            // describe something that has already been captured and can be
+            // re-dated. A fire describes something about to be *played*, and no
+            // speaker can emit a frame that should have gone out 300 ms ago. The
+            // alternative — starting the pass that far in, so it lands where the
+            // foot meant it to — buys grid alignment with the attack, and the
+            // attack is the reason anybody fires a one-shot. So it starts at the
+            // top and is late; `g1` is how you ask for it to be on the grid.
+            "f" => {
+                let len = lp.loop_len.load(Ordering::Acquire);
+                if len == 0 {
+                    return format!("loop {} is empty; there is nothing to fire.", li);
+                }
+                if !lp.one_shot.load(Ordering::Relaxed) {
+                    return format!(
+                        "loop {} is not a one-shot; `{}one1` first, or it would just \
+                         jump to the top and carry on.",
+                        li, li
+                    );
+                }
+                let now = sh.out_frames.load(Ordering::Acquire) as i64;
+                match if lp.quant.load(Ordering::Relaxed) {
+                    sh.next_boundary(now)
+                } else {
+                    None
+                } {
+                    Some(t) => {
+                        lp.request_at.store(t, Ordering::Release);
+                        lp.request.set(FIRE);
+                        return format!(
+                            "loop {} fires on the grid in {:.2} s.",
+                            li,
+                            (t - now).max(0) as f64 / sr as f64
+                        );
+                    }
+                    None => {
+                        lp.request_at.store(i64::MIN, Ordering::Release);
+                        lp.request.set(FIRE);
+                        return format!("loop {} fires.", li);
+                    }
+                }
+            }
             l if l.starts_with('t') => {
                 let secs = l[1..].trim().parse::<f64>().unwrap_or(8.0);
                 take(sh, li, sr, secs, late);
@@ -2553,6 +2856,81 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     }
                 );
             }
+            // One pass per trigger, rather than turning for ever.
+            //
+            // A mode, not a gesture, because it costs a loop its place in the
+            // phase-locked set: firing moves `origin`, which is the one thing
+            // this engine otherwise never does. Making it something you switch on
+            // means a loop cannot lose its grid by accident.
+            "one" | "one1" | "one0" => {
+                let on = match rest {
+                    "one1" => true,
+                    "one0" => false,
+                    _ => !lp.one_shot.load(Ordering::Relaxed),
+                };
+                lp.one_shot.store(on, Ordering::Relaxed);
+                if !on {
+                    // Back to a loop, from wherever the last pass left it. Its
+                    // `origin` has moved and stays moved — that is what firing
+                    // did, and pretending otherwise would put the audio somewhere
+                    // nobody chose.
+                    lp.shot_end.store(i64::MIN, Ordering::Release);
+                }
+                return if on {
+                    format!(
+                        "loop {} is a one-shot: silent now, one pass each time it fires.",
+                        li
+                    )
+                } else {
+                    format!("loop {} turns for ever again.", li)
+                };
+            }
+            // Wait for a sound instead of starting on the press.
+            "lev" | "lev1" | "lev0" => {
+                let on = match rest {
+                    "lev1" => true,
+                    "lev0" => false,
+                    _ => !lp.level_arm.load(Ordering::Relaxed),
+                };
+                lp.level_arm.store(on, Ordering::Relaxed);
+                // Turning it off under a loop that is already waiting has to end
+                // the wait, or the loop keeps the input for a recording that can
+                // no longer begin.
+                if !on && lp.is_armed() {
+                    lp.state.set(IDLE);
+                    lp.arm_from.store(i64::MIN, Ordering::Release);
+                }
+                return if on {
+                    format!(
+                        "loop {} waits for a sound over {} and reaches {:.0} ms back past it.",
+                        li,
+                        thresh_words(sh),
+                        ARM_REACH_MS
+                    )
+                } else {
+                    format!("loop {} records on the press again.", li)
+                };
+            }
+            // The level a sound has to reach. Rig-wide, like the click — it
+            // describes the room and the instrument, not any one loop.
+            _ if rest.starts_with("arm") => {
+                let arg = rest[3..].trim();
+                if arg.is_empty() {
+                    return format!("a level-armed loop starts at {}.", thresh_words(sh));
+                }
+                match arg.parse::<f64>() {
+                    // Full scale to the noise floor. Above zero can never be
+                    // reached and below -80 is the converter's own hiss, so both
+                    // are refused rather than accepted into a mode that would
+                    // then never fire, or fire immediately.
+                    Ok(db) if db <= 0.0 && db >= -80.0 => {
+                        sh.arm_thresh.store(db_to_mag(db).to_bits(), Ordering::Relaxed);
+                        return format!("a level-armed loop now starts at {}.", thresh_words(sh));
+                    }
+                    Ok(db) => return format!("the arm level wants 0 to -80 dBFS, not {}.", db),
+                    _ => return format!("the arm level wants a number of dBFS, not `{}`.", arg),
+                }
+            }
             _ if rest.starts_with("pan") => {
                 match rest[3..].parse::<usize>() {
                     Ok(v) if v <= 127 => {
@@ -2602,6 +2980,13 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 // haunting.
                 lp.plainly();
                 lp.pan.store(64, Ordering::Relaxed);
+                // The modes go too. A cleared slot that still fired once and
+                // waited for a sound would be a loop with someone else's habits,
+                // and the switch that cleared it said nothing about either.
+                lp.one_shot.store(false, Ordering::Relaxed);
+                lp.shot_end.store(i64::MIN, Ordering::Release);
+                lp.level_arm.store(false, Ordering::Relaxed);
+                lp.arm_from.store(i64::MIN, Ordering::Release);
                 lp.n_layers.store(0, Ordering::Release);
                 lp.redo_to.store(0, Ordering::Release);
                 lp.loop_len.store(0, Ordering::Release);
@@ -3197,5 +3582,52 @@ mod tests {
         assert!(lp.plain());
         assert_eq!(lp.speed(), 1.0);
         assert!(!lp.pendulum.load(Ordering::Relaxed));
+    }
+
+    /// How long one pass lasts, which is the only number a one-shot needs and
+    /// the only place in the engine that has to know a cycle can be finite.
+    #[test]
+    fn a_pass_lasts_as_long_as_the_speed_makes_it() {
+        let lp = at_origin();
+        assert_eq!(lp.pass_frames(LEN), LEN as i64);
+        lp.adopt(0, LEN, 0.5, false);
+        assert_eq!(lp.pass_frames(LEN), 2 * LEN as i64, "half speed, twice as long");
+        lp.adopt(0, LEN, 2.0, false);
+        assert_eq!(lp.pass_frames(LEN), LEN as i64 / 2);
+    }
+
+    /// Direction is not duration. Backwards takes exactly as long as forwards,
+    /// which is easy to get wrong when direction lives in the sign of the number
+    /// being divided by.
+    #[test]
+    fn backwards_takes_just_as_long_and_a_pendulum_takes_twice() {
+        let lp = at_origin();
+        lp.adopt(0, LEN, -1.0, false);
+        assert_eq!(lp.pass_frames(LEN), LEN as i64);
+        lp.adopt(0, LEN, -0.5, true);
+        assert_eq!(
+            lp.pass_frames(LEN),
+            4 * LEN as i64,
+            "there and back at half speed"
+        );
+    }
+
+    /// A one-shot is silent until it is fired, and silent again after one pass.
+    /// The whole mode is this comparison, so it is worth stating as a property
+    /// rather than trusting to a mixer branch nobody reads twice.
+    #[test]
+    fn a_one_shot_sounds_only_inside_its_pass() {
+        let lp = at_origin();
+        lp.one_shot.store(true, Ordering::Relaxed);
+        assert!(!lp.firing(0), "silent before it has ever been fired");
+        // Fired at 500: audible for one pass and not a frame more.
+        lp.shot_end.store(500 + lp.pass_frames(LEN), Ordering::Release);
+        assert!(lp.firing(500));
+        assert!(lp.firing(500 + LEN as i64 - 1));
+        assert!(!lp.firing(500 + LEN as i64));
+        // And a loop that is not a one-shot is never "firing", whatever is left
+        // in `shot_end` from before the mode was switched off.
+        lp.one_shot.store(false, Ordering::Relaxed);
+        assert!(!lp.firing(500));
     }
 }

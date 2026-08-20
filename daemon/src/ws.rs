@@ -177,7 +177,9 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                     r#"{{"index":{},"state":"{}","layers":{},"loopFrames":{},"#,
                     r#""loopSecs":{:.4},"pos":{},"phase":{:.5},"armed":{},"#,
                     r#""recording":{},"quant":{},"muted":{},"reverse":{},"pan":{},"#,
-                    r#""speed":{:.4},"pendulum":{},"pendingAt":{},"shapes":[{}]}}"#
+                    r#""speed":{:.4},"pendulum":{},"oneShot":{},"levelArm":{},"#,
+                    r#""firing":{},"#,
+                    r#""pendingAt":{},"shapes":[{}]}}"#
                 ),
                 li,
                 lp.state_name(),
@@ -197,6 +199,17 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                 lp.pan.load(Ordering::Relaxed),
                 lp.speed().abs(),
                 lp.pendulum.load(Ordering::Relaxed),
+                // The two modes. Reported because the pedal cannot show them and
+                // because they change what a *tap* means: a tap on a one-shot
+                // fires it where a tap on any other loop stops it, and the app
+                // has to know which before the foot lands.
+                lp.one_shot.load(Ordering::Relaxed),
+                lp.level_arm.load(Ordering::Relaxed),
+                // Inside a pass, or between them. The playhead never stops — it
+                // cannot — so `pos` alone shows a one-shot sweeping along while
+                // it is silent, which is a display describing something nobody
+                // can hear.
+                lp.firing(cur),
                 // Frames until a scheduled transition fires, or -1 for nothing
                 // pending. A display that can show "starts in 1.4 s" is the
                 // difference between a deliberate wait and a dead button.
