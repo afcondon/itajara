@@ -162,7 +162,14 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
             let shapes: Vec<String> = (0..lp.n_layers.load(Ordering::Acquire))
                 .map(|l| {
                     let (slen, period, phase) = lp.layer_shape(l);
-                    format!(r#"{{"len":{},"period":{},"phase":{}}}"#, slen, period, phase)
+                    // `tail` is the continuation held past this layer's end —
+                    // never sounded, and the only material a seamless wrap
+                    // could be made from. Reported so the display can say a
+                    // loop has it rather than leaving it invisible.
+                    format!(
+                        r#"{{"len":{},"period":{},"phase":{},"tail":{}}}"#,
+                        slen, period, phase, lp.layer_tail(l)
+                    )
                 })
                 .collect();
             format!(

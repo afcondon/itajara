@@ -135,6 +135,11 @@ type LayerShape =
   { len :: Int
   , period :: Int
   , phase :: Int
+  -- | Frames of *continuation* held past this layer's end: what was still
+  -- | being played when the loop closed. Never sounded — playback is
+  -- | `pos % len` — and the only material a seamless wrap could be made from,
+  -- | which is why it is kept rather than trimmed.
+  , tail :: Int
   }
 
 type SocketStatus =

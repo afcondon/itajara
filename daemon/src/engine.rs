@@ -167,6 +167,19 @@ pub struct Loop {
     /// one-bar thing there at all, which is the same reason a `MidiClip` in
     /// Triggerfish stores every note and bakes in no tempo.
     l_len: Vec<AtomicUsize>,
+    /// How many frames of *continuation* sit past each layer's end.
+    ///
+    /// The audio that was played after the loop closed. It is not spare and it
+    /// is not rubbish: it is the only material that can make the wrap seamless,
+    /// because a crossfade at the loop point needs to know what would have come
+    /// next — and what would have come next is exactly what the player kept
+    /// playing while the gesture was still being worked out.
+    ///
+    /// Never sounded. Playback is `pos % l_len`, so anything past the end does
+    /// not exist until something asks for it. *Store everything, flatten late*,
+    /// which is the same rule `MidiClip` follows in Triggerfish for the same
+    /// reason: the lossy step belongs at the end, where it can be undone.
+    l_tail: Vec<AtomicUsize>,
     l_period: Vec<AtomicUsize>,
     l_phase: Vec<AtomicUsize>,
     /// The output frame at which this loop's position zero sits.
@@ -272,6 +285,18 @@ pub struct Loop {
     /// Highest position the first recording reached, so a loop can be closed at
     /// the right length even though the input trails the output.
     reached: AtomicUsize,
+    /// Highest output frame the input callback actually wrote for this
+    /// recording, one past the end.
+    ///
+    /// Asked rather than inferred. Undoing an overdub's wrapped tail means
+    /// subtracting exactly the samples that were added, and "how far did the
+    /// input get" cannot be worked out from a clock afterwards: the flip to
+    /// PLAYING stops the writes, but frames keep arriving and the drain sleep
+    /// lets an in-flight callback finish. Reading `in_frames` afterwards
+    /// therefore names frames that were never recorded, and subtracting those
+    /// would gouge real audio out of the loop head — a ghost where there had
+    /// been a doubling.
+    rec_reached: AtomicI64,
     overflowed: AtomicBool,
     /// How late the press that started this recording was, in frames.
     ///
@@ -298,6 +323,7 @@ impl Loop {
             loop_len: AtomicUsize::new(0),
             n_layers: AtomicUsize::new(0),
             l_len: (0..MAX_LAYERS).map(|_| AtomicUsize::new(0)).collect(),
+            l_tail: (0..MAX_LAYERS).map(|_| AtomicUsize::new(0)).collect(),
             l_period: (0..MAX_LAYERS).map(|_| AtomicUsize::new(1)).collect(),
             l_phase: (0..MAX_LAYERS).map(|_| AtomicUsize::new(0)).collect(),
             origin: AtomicI64::new(0),
@@ -314,6 +340,7 @@ impl Loop {
             request_at: AtomicI64::new(i64::MIN),
             quant: AtomicBool::new(false),
             reached: AtomicUsize::new(0),
+            rec_reached: AtomicI64::new(0),
             overflowed: AtomicBool::new(false),
             rec_from: AtomicI64::new(0),
             started_late: AtomicI64::new(0),
@@ -472,6 +499,10 @@ impl Loop {
             i64::MIN => -1,
             at => (at - now).max(0),
         }
+    }
+    /// How much continuation this layer holds past its end, for a crossfade.
+    pub fn layer_tail(&self, layer: usize) -> usize {
+        self.l_tail[layer].load(Ordering::Acquire)
     }
     pub fn layer_shape(&self, layer: usize) -> (usize, usize, usize) {
         (
@@ -1113,6 +1144,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                     match pending {
                         ARMED => {
                             lp.reached.store(0, Ordering::Release);
+                            lp.rec_reached.store(0, Ordering::Release);
                             let n = lp.n_layers.load(Ordering::Acquire);
                             if n < MAX_LAYERS {
                                 if lp.loop_len.load(Ordering::Acquire) == 0 {
@@ -1292,6 +1324,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                         }
                         sh.write(li, layer, pos, v);
                         lp.reached.fetch_max(pos + 1, Ordering::Relaxed);
+                        lp.rec_reached.fetch_max(out_frame + 1, Ordering::Relaxed);
                     } else {
                         // Modular: an overdub may go round as many times as it
                         // likes, summing into the same cycle.
@@ -1301,6 +1334,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                         let pos = (rel % loop_len as i64) as usize;
                         sh.add(li, layer, pos, v);
                         lp.reached.fetch_max(loop_len, Ordering::Relaxed);
+                        lp.rec_reached.fetch_max(out_frame + 1, Ordering::Relaxed);
                     }
                 }
                 sh.in_frames.store(base + frames, Ordering::Release);
@@ -1604,7 +1638,7 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) {
         let layer = lp.n_layers.load(Ordering::Acquire);
         let origin = lp.origin.load(Ordering::Acquire);
         let new_origin = origin - pre as i64;
-        if pre > 0 && len + pre > sh.max_frames {
+        if pre > 0 && reached.max(len) + pre > sh.max_frames {
             // Shifting anyway would run off the end of this layer's slice and
             // into the next one's, which is silent corruption rather than an
             // error. Refuse instead.
@@ -1614,7 +1648,14 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) {
         } else if pre > 0 && new_origin >= 0 {
             // Shift what was recorded up by `pre`, backwards so the move does
             // not eat its own tail, then fill the vacated front from the ring.
-            for pos in (0..len).rev() {
+            //
+            // **Everything recorded, not just the loop.** The frames past `len`
+            // are the continuation — what the player kept playing while the
+            // gesture was still being worked out — and shifting only the loop
+            // would leave them a `pre` behind and overlapped by the shifted
+            // material. They are never sounded, so nothing would have said so.
+            let moved = reached.max(len).min(sh.max_frames - pre);
+            for pos in (0..moved).rev() {
                 let v = sh.read(li, layer, pos);
                 sh.write(li, layer, pos + pre, v);
             }
@@ -1632,6 +1673,14 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) {
             );
         }
         lp.loop_len.store(len, Ordering::Release);
+        // What was recorded past the end, kept rather than trimmed. A first
+        // recording writes linearly, so the continuation is already sitting
+        // there and costs nothing to keep — it only had to not be thrown away.
+        let layer0 = lp.n_layers.load(Ordering::Acquire);
+        lp.l_tail[layer0].store(
+            (reached.max(len) + if quantised_len.is_some() { 0 } else { pre }).saturating_sub(len),
+            Ordering::Release,
+        );
         // The first loop to acquire a length becomes the grid the rest
         // can align to — first rather than chosen, because that is how a
         // looper has always worked: what you played first is what the
@@ -1644,6 +1693,53 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) {
             240.0 / (len as f64 / sr as f64)
         );
     }
+    // An overdub is modular, so the frames recorded after the press did not
+    // land past the end — they wrapped and SUMMED onto the head of their own
+    // layer. That is a doubled transient at the loop point, not a length error,
+    // and it is why an overdub needs undoing where a first recording only
+    // needed measuring.
+    //
+    // Undone exactly, because the ring holds the very samples that were added:
+    // subtract them where they landed, and write them where they belong — past
+    // the end, as the continuation, the same place a first recording keeps it.
+    // The material is not discarded, because it is the thing a seamless loop is
+    // made of.
+    if state == OVERDUB && late > 0 {
+        let layer = lp.n_layers.load(Ordering::Acquire);
+        let len = lp.loop_len.load(Ordering::Acquire);
+        let k = sh.k.load(Ordering::Acquire);
+        let rec_from = lp.rec_from.load(Ordering::Acquire);
+        // The furthest output frame the input actually reached. From the
+        // callback, not from a clock: `in_frames` keeps advancing after the
+        // flip to PLAYING, so it names frames that were never recorded, and
+        // subtracting those would gouge real audio out of the loop head.
+        let last = lp.rec_reached.load(Ordering::Acquire);
+        let mut undone = 0usize;
+        let mut kept = 0usize;
+        if len > 0 {
+            for f in closed_at..last {
+                let Some(v) = sh.ring_at(f - k) else { continue };
+                let pos = (f - rec_from).rem_euclid(len as i64) as usize;
+                sh.add(li, layer, pos, -v);
+                undone += 1;
+                let at = len + (f - closed_at) as usize;
+                if at < sh.max_frames {
+                    sh.write(li, layer, at, v);
+                    kept += 1;
+                }
+            }
+        }
+        lp.l_tail[layer].store(kept, Ordering::Release);
+        if undone > 0 {
+            println!(
+                "  {:.0} ms recorded after the press unwrapped from the loop head, \
+                 kept as continuation ({} frames).",
+                undone as f64 / sr as f64 * 1000.0,
+                kept
+            );
+        }
+    }
+
     let layer = lp.n_layers.load(Ordering::Acquire);
     let len = lp.loop_len.load(Ordering::Acquire);
     lp.set_layer_shape(layer, len);
