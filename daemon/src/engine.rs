@@ -39,6 +39,9 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
+
 use crate::measure::{choose_input, choose_output, signed_secs, Width};
 
 pub const MAX_LAYERS: usize = 8;
@@ -155,48 +158,6 @@ impl Default for Opts {
 fn thresh_words(sh: &Shared) -> String {
     let mag = f32::from_bits(sh.arm_thresh.load(Ordering::Relaxed));
     format!("{:.0} dBFS", 20.0 * (mag.max(1e-9) as f64).log10())
-}
-
-/// A number in `[0, 1)`, cheap enough for the audio thread.
-///
-/// xorshift64* — three shifts, a multiply, and one relaxed load and store. No
-/// allocation, no lock, no syscall, nothing that can block.
-///
-/// **Not because Rust lacks a better one.** `rand`'s `SmallRng` (xoshiro256++)
-/// and `StdRng` (ChaCha12) are also pure computation over state you own, and
-/// either is fine in a callback once seeded off-thread. `rand` is even already
-/// in this tree, pulled in by tungstenite for WebSocket masking keys, so it
-/// would have cost a feature flag rather than a dependency.
-///
-/// The thing that is genuinely unusable here is `thread_rng()` — the one
-/// everybody reaches for. It is a `ReseedingRng` that pulls fresh entropy from
-/// the operating system every 64 KiB of output, which is a `getrandom` syscall
-/// at a moment nobody chose, on top of lazy thread-local initialisation. That
-/// is what "chance needs a random source in the audio callback" was really
-/// about, and stating it as though randomness itself were the problem is what
-/// left the feature parked for months.
-///
-/// So this stays because it is here, tested and measured, and not because it
-/// had to be written. If it ever wants to be better it should become
-/// `SmallRng`, which is a strictly better-studied generator and no more
-/// expensive.
-///
-/// Twenty-four bits taken off the top, because that is all an `f32` can hold and
-/// because taking the low bits is the classic way to get a generator that looks
-/// random and is not. The multiply is the whole point of the `*`: plain
-/// xorshift is a linear map over GF(2) and shows it, and the multiply is what
-/// scrambles that.
-///
-/// A free function over the atomic rather than a method, so it can be tested
-/// without standing up an engine.
-fn roll(rng: &AtomicU64) -> f32 {
-    let mut x = rng.load(Ordering::Relaxed);
-    x ^= x >> 12;
-    x ^= x << 25;
-    x ^= x >> 27;
-    rng.store(x, Ordering::Relaxed);
-    let bits = (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as u32;
-    bits as f32 / (1u32 << 24) as f32
 }
 
 /// A probability as the board says it, for the acks.
@@ -847,21 +808,6 @@ pub struct Shared {
     pub arm_thresh: AtomicU32,
     /// `ARM_REACH_MS` in frames, resolved once at startup.
     arm_reach: AtomicUsize,
-    /// The rig's random source, for chance.
-    ///
-    /// This is the thing chance was waiting for, and it turned out to be four
-    /// lines. The gap was written as "chance needs a random source in the audio
-    /// callback" on the assumption that randomness on the audio thread is a
-    /// problem — it is, if you reach for the one that allocates, locks, or asks
-    /// the operating system. A xorshift over a single atomic does none of those
-    /// and costs a couple of nanoseconds, which is less than the `cos` already
-    /// being called for the pan.
-    ///
-    /// One stream for all six loops rather than one each. They interleave, which
-    /// is if anything better — six loops pulling from one sequence cannot fall
-    /// into step with each other the way six identically-seeded generators
-    /// would.
-    rng: AtomicU64,
     pub monitor: AtomicBool,
     pub out_peak: AtomicU32,
     pub in_peak: AtomicU32,
@@ -1122,7 +1068,7 @@ impl Shared {
     /// Pulled out of the callback because six loops made it a nested loop worth
     /// naming, and because the self-test now has to be able to ask the same
     /// question of a specific loop.
-    fn loop_at(&self, li: usize, out_frame: i64) -> f32 {
+    fn loop_at(&self, li: usize, out_frame: i64, rng: &mut SmallRng) -> f32 {
         let lp = self.lp(li);
         let len = lp.loop_len.load(Ordering::Acquire);
         if len == 0 {
@@ -1156,7 +1102,7 @@ impl Shared {
             let pass = lp.pass_index(out_frame, len);
             if lp.chance_pass.load(Ordering::Relaxed) != pass {
                 lp.chance_pass.store(pass, Ordering::Relaxed);
-                lp.chance_sounds.store(roll(&self.rng) < p, Ordering::Relaxed);
+                lp.chance_sounds.store(rng.gen::<f32>() < p, Ordering::Relaxed);
             }
             if !lp.chance_sounds.load(Ordering::Relaxed) {
                 return 0.0;
@@ -1369,17 +1315,6 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         ),
         arm_thresh: AtomicU32::new(db_to_mag(opts.arm_db).to_bits()),
         arm_reach: AtomicUsize::new((ARM_REACH_MS / 1000.0 * sr_f).round() as usize),
-        // Seeded from the clock, on the control thread, once. A fixed seed
-        // would make every session drop exactly the same cycles, which is the
-        // opposite of what anybody switches chance on for. The `| 1` is because
-        // xorshift has one fixed point and it is zero.
-        rng: AtomicU64::new(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0x9E3779B97F4A7C15)
-                | 1,
-        ),
         monitor: AtomicBool::new(opts.monitor),
         out_peak: AtomicU32::new(0),
         in_peak: AtomicU32::new(0),
@@ -1410,9 +1345,24 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         let sh = sh.clone();
         let ch = opts.out_ch;
         let dual = opts.dual;
+        // Seeded here rather than inside: `from_entropy` asks the operating
+        // system, which is exactly the thing the callback may not do — and this
+        // runs on the control thread, at stream build, where it costs nothing.
+        // A fixed seed would make every session drop the same cycles, which is
+        // the opposite of what anybody switches chance on for.
+        let mut rng = SmallRng::from_entropy();
         device.build_output_stream(
             &out_cfg,
             move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+                // Chance's generator, owned outright by the thread that rolls
+                // it. No atomic and no sharing, because there is no sharing: the
+                // mixer is the only thing that rolls, and it runs here.
+                //
+                // `SmallRng` is xoshiro256++ — pure arithmetic over its own
+                // state, so it is as safe here as the `cos` next door. What must
+                // never appear in a callback is `thread_rng()`, which reseeds
+                // from the operating system every 64 KiB and so hides a
+                // `getrandom` syscall at a moment nobody chose.
                 for s in data.iter_mut() {
                     *s = 0.0;
                 }
@@ -1582,7 +1532,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                     let mut vr = 0.0f32;
 
                     for li in 0..N_LOOPS {
-                        let s = sh.loop_at(li, out_frame);
+                        let s = sh.loop_at(li, out_frame, &mut rng);
                         vl += s * gains[li].0;
                         vr += s * gains[li].1;
                     }
@@ -3842,38 +3792,19 @@ mod tests {
         assert_eq!(sw.pass_index(2 * LEN as i64, LEN), 1);
     }
 
-    /// The random source, which is what chance was waiting for. Cheap enough
-    /// for the audio thread is the interesting property and cannot be asserted;
-    /// what can is that it stays in range and does not sit still.
-    #[test]
-    fn the_roll_is_in_range_and_actually_moves() {
-        let rng = AtomicU64::new(0x1234_5678_9ABC_DEF1);
-        let mut lo = f32::MAX;
-        let mut hi = f32::MIN;
-        let mut sum = 0.0f64;
-        const N: usize = 20_000;
-        for _ in 0..N {
-            let r = roll(&rng);
-            assert!((0.0..1.0).contains(&r), "roll out of range: {}", r);
-            lo = lo.min(r);
-            hi = hi.max(r);
-            sum += r as f64;
-        }
-        assert!(lo < 0.01 && hi > 0.99, "roll never reached the ends: {}..{}", lo, hi);
-        let mean = sum / N as f64;
-        assert!((mean - 0.5).abs() < 0.02, "mean {} is not near a half", mean);
-    }
-
-    /// And that the gate the mixer actually applies — `roll() < p` — comes out
-    /// at the rate the label promises. A generator with a good mean can still
-    /// have a lumpy tail, and every rung on the ladder except the first lives in
-    /// the tail.
+    /// The gate the mixer applies — `gen::<f32>() < p` — comes out at the rate
+    /// the label promises.
+    ///
+    /// The generator itself is `rand`'s and needs no test from us; what is worth
+    /// asserting is that the *gate* opens as often as the rung says, because
+    /// every rung on the ladder except the first lives in the tail and a
+    /// comparison written the wrong way round would still look plausible.
     #[test]
     fn a_pass_sounds_as_often_as_the_rung_says() {
-        let rng = AtomicU64::new(0xDEAD_BEEF_CAFE_F00D);
+        let mut rng = SmallRng::seed_from_u64(0xDEAD_BEEF_CAFE_F00D);
         const N: usize = 40_000;
         for p in [1.0f32, 0.75, 0.5, 0.25, 0.125] {
-            let hits = (0..N).filter(|_| roll(&rng) < p).count() as f64 / N as f64;
+            let hits = (0..N).filter(|_| rng.gen::<f32>() < p).count() as f64 / N as f64;
             assert!(
                 (hits - p as f64).abs() < 0.01,
                 "at {} the gate opened {:.4} of the time",

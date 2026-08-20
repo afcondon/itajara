@@ -13,6 +13,13 @@ tungstenite = "0.24"
 # these bytes with this crate and es9-daemon decodes them with it, so matching
 # it means a parse bug cannot be a divergence from the thing generating them.
 rosc = "0.10"
+# `SmallRng` for chance, which rolls once per loop per cycle in the audio
+# callback. Already in the tree — tungstenite pulls it for WebSocket masking
+# keys — so this is a feature flag rather than a dependency, and a studied
+# generator rather than a hand-rolled one. The rule it obeys is the ordinary
+# audio rule: own the state, seed it off the callback. `thread_rng()` is the
+# one that must never appear here, since it reseeds from the OS as it goes.
+rand = { version = "0.8", features = ["small_rng"] }
 
 [profile.release]
 opt-level = 3
