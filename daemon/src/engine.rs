@@ -297,6 +297,15 @@ pub struct Loop {
     /// would gouge real audio out of the loop head — a ghost where there had
     /// been a doubling.
     rec_reached: AtomicI64,
+    /// How far back up the layer stack still holds audio, so undo can be
+    /// taken back.
+    ///
+    /// Undo no longer zeroes what it removes, so an undone layer is still
+    /// there and can simply be counted back in. This is the highest layer
+    /// index that is still recoverable; recording into a layer moves it,
+    /// because a take that has been recorded over is not recoverable and
+    /// offering to redo it would be a lie.
+    redo_to: AtomicUsize,
     overflowed: AtomicBool,
     /// How late the press that started this recording was, in frames.
     ///
@@ -341,6 +350,7 @@ impl Loop {
             quant: AtomicBool::new(false),
             reached: AtomicUsize::new(0),
             rec_reached: AtomicI64::new(0),
+            redo_to: AtomicUsize::new(0),
             overflowed: AtomicBool::new(false),
             rec_from: AtomicI64::new(0),
             started_late: AtomicI64::new(0),
@@ -510,6 +520,17 @@ impl Loop {
             self.l_period[layer].load(Ordering::Relaxed).max(1),
             self.l_phase[layer].load(Ordering::Relaxed),
         )
+    }
+    /// One more layer playing, and the redo ceiling raised to match.
+    ///
+    /// Together, always: `redo_to` is how far back up the stack still holds
+    /// audio, and every path that lands a layer — commit, a retroactive take,
+    /// the end of a multiply — is a path where it has just moved. Beside each
+    /// increment they would drift, and the failure would be a redo that raised
+    /// a layer nobody recorded.
+    fn add_layer(&self) {
+        let n = self.n_layers.fetch_add(1, Ordering::AcqRel);
+        self.redo_to.store(n + 1, Ordering::Release);
     }
     /// A freshly committed layer: its own length, sounding every time round.
     ///
@@ -1743,7 +1764,7 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) {
     let layer = lp.n_layers.load(Ordering::Acquire);
     let len = lp.loop_len.load(Ordering::Acquire);
     lp.set_layer_shape(layer, len);
-    lp.n_layers.fetch_add(1, Ordering::AcqRel);
+    lp.add_layer();
     if len > 0 {
         draw_layer(sh, li, layer, len, sr);
     }
@@ -1835,7 +1856,7 @@ fn fill_from_ring(sh: &Shared, li: usize, layer: usize, from_out: i64, len: usiz
 /// afterwards. With no loop yet, `secs` of the past becomes the loop and sets
 /// the cycle. With a loop running, the last complete cycle becomes a new layer,
 /// landing on the existing grid because the fill is addressed in output frames.
-fn take(sh: &Shared, li: usize, sr: u32, secs: f64) {
+fn take(sh: &Shared, li: usize, sr: u32, secs: f64, late: i64) {
     let lp = sh.lp(li);
     if !sh.k_set.load(Ordering::Acquire) {
         println!("  no input has arrived yet.");
@@ -1848,7 +1869,11 @@ fn take(sh: &Shared, li: usize, sr: u32, secs: f64) {
     }
 
     let loop_len = lp.loop_len.load(Ordering::Acquire);
-    let cur = sh.out_frames.load(Ordering::Acquire) as i64;
+    // As of the press, not as of the command. Claiming the past is the one
+    // gesture where the boundary is the whole point — you press because the
+    // good bit has just finished — so the few hundred milliseconds a footswitch
+    // takes to resolve would otherwise be claimed as part of it.
+    let cur = sh.out_frames.load(Ordering::Acquire) as i64 - late.max(0);
 
     let (from_out, len, what) = if loop_len == 0 {
         let len = ((secs * sr as f64).round() as usize).min(sh.max_frames);
@@ -1905,7 +1930,7 @@ fn take(sh: &Shared, li: usize, sr: u32, secs: f64) {
     }
     let taken = lp.n_layers.load(Ordering::Acquire);
     lp.set_layer_shape(taken, lp.loop_len.load(Ordering::Acquire));
-    lp.n_layers.fetch_add(1, Ordering::AcqRel);
+    lp.add_layer();
     draw_layer(sh, li, taken, lp.loop_len.load(Ordering::Acquire), sr);
     println!(
         "  {} layer{} playing.",
@@ -2028,7 +2053,7 @@ fn multiply_end(sh: &Shared, li: usize, sr: u32) {
     );
     let layer = lp.n_layers.load(Ordering::Acquire);
     lp.set_layer_shape(layer, new_len);
-    lp.n_layers.fetch_add(1, Ordering::AcqRel);
+    lp.add_layer();
     draw_layer(sh, li, layer, new_len, sr);
     println!("  committed. {} layers playing.", layer + 1);
 }
@@ -2296,6 +2321,9 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                         // An overdub sums into its layer, so anything left there
                         // from an undone take would bleed into the new one.
                         sh.zero_layer(li, layer);
+                        // Anything above this layer has just been made
+                        // unrecoverable, so redo must not offer it.
+                        lp.redo_to.store(layer, Ordering::Release);
                         // Kept until the recording closes, because the pre-roll
                         // shift that spends it happens at commit.
                         lp.started_late.store(late, Ordering::Release);
@@ -2332,7 +2360,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             },
             l if l.starts_with('t') => {
                 let secs = l[1..].trim().parse::<f64>().unwrap_or(8.0);
-                take(sh, li, sr, secs);
+                take(sh, li, sr, secs, late);
             }
             // **Above `s`, which prefix-matches.** `s` is sparse-multiply and
             // takes anything beginning with an s, so `sp0.5` read as "sparse,
@@ -2418,13 +2446,39 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // message goes back as the ack and both callers display it
             // themselves. Printing here as well got it shown twice.
             l if l.starts_with('w') => return save_take(sh, li, sr, &l[1..]),
+            // Take back an undo. Free, now that undo does not destroy what it
+            // removes: the layer is still there with its shape intact, so this
+            // is one number going back up.
+            "y" => {
+                let n = lp.n_layers.load(Ordering::Acquire);
+                let ceiling = lp.redo_to.load(Ordering::Acquire);
+                if n >= ceiling {
+                    return if ceiling == 0 {
+                        format!("loop {} has nothing to redo.", li)
+                    } else {
+                        format!("loop {} is already at its last take.", li)
+                    };
+                }
+                lp.n_layers.store(n + 1, Ordering::Release);
+                return format!("loop {} redone: {} layers playing.", li, n + 1);
+            }
             "u" => {
                 let n = lp.n_layers.load(Ordering::Acquire);
                 if n == 0 {
                     println!("  nothing to undo.");
                 } else {
                     lp.n_layers.store(n - 1, Ordering::Release);
-                    sh.zero_layer(li, n - 1);
+                    // **Not zeroed.** Undo used to destroy the audio as well as
+                    // remove the layer, which made redo impossible — and the
+                    // destruction was redundant: recording zeroes its layer
+                    // before it starts, precisely so nothing left from an
+                    // undone take can bleed into a new one. The belt was doing
+                    // the braces' job and costing the only thing it prevented.
+                    //
+                    // `redo_to` is how far back up the layer stack still holds
+                    // audio. Recording into a layer moves it, because a take
+                    // that has been recorded over is not recoverable and
+                    // offering to redo it would be a lie.
                     if n == 1 {
                         // Say what is being kept, or it reads as a fault. The
                         // length surviving an undo is the point — the click goes
@@ -2549,6 +2603,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 lp.plainly();
                 lp.pan.store(64, Ordering::Relaxed);
                 lp.n_layers.store(0, Ordering::Release);
+                lp.redo_to.store(0, Ordering::Release);
                 lp.loop_len.store(0, Ordering::Release);
                 for l in 0..MAX_LAYERS {
                     sh.zero_layer(li, l);
@@ -2846,7 +2901,7 @@ fn selftest(sh: &Shared, sr: u32, secs: f64) -> Result<(), Box<dyn Error>> {
     // same grid — so it deserves its own check.
     println!("\nRetroactive take: claiming the last complete cycle from the pre-roll.");
     std::thread::sleep(Duration::from_secs_f64(secs * 1.5));
-    take(sh, li, sr, 0.0);
+    take(sh, li, sr, 0.0, 0);
     std::thread::sleep(Duration::from_millis(100));
 
     let e2 = match onset_of(sh, li, 2, len) {
