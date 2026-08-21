@@ -152,6 +152,10 @@ type LoopState =
   -- | milliseconds; zero is a hard join. In milliseconds rather than frames so
   -- | the display never needs the sample rate to say what a switch did.
   , fadeMs :: Number
+  -- | How much a pass costs the material already there, in decibels; zero holds
+  -- | for ever. The parameter that separates Frippertronics from song looping,
+  -- | and the reason a loop can now have a shape it was not given.
+  , decayDb :: Number
   -- | Frames until a scheduled transition fires, or -1 when nothing is
   -- | pending. What lets the display say "starts in 1.4 s" rather than leaving
   -- | a deliberate wait looking like a dead button.
@@ -168,6 +172,11 @@ type LayerShape =
   -- | `pos % len` — and the only material a seamless wrap could be made from,
   -- | which is why it is kept rather than trimmed.
   , tail :: Int
+  -- | What this layer is currently worth, after however many passes it has
+  -- | lived through. One for every layer of a loop that is not decaying — and
+  -- | the only way the display can show a loop receding, since nothing in the
+  -- | arena changes.
+  , gain :: Number
   }
 
 type SocketStatus =

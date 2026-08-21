@@ -167,8 +167,8 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                     // could be made from. Reported so the display can say a
                     // loop has it rather than leaving it invisible.
                     format!(
-                        r#"{{"len":{},"period":{},"phase":{},"tail":{}}}"#,
-                        slen, period, phase, lp.layer_tail(l)
+                        r#"{{"len":{},"period":{},"phase":{},"tail":{},"gain":{:.5}}}"#,
+                        slen, period, phase, lp.layer_tail(l), lp.layer_gain(l)
                     )
                 })
                 .collect();
@@ -178,7 +178,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                     r#""loopSecs":{:.4},"pos":{},"phase":{:.5},"armed":{},"#,
                     r#""recording":{},"quant":{},"muted":{},"reverse":{},"pan":{},"#,
                     r#""speed":{:.4},"pendulum":{},"oneShot":{},"levelArm":{},"#,
-                    r#""firing":{},"chance":{:.4},"skipping":{},"fadeMs":{:.1},"#,
+                    r#""firing":{},"chance":{:.4},"skipping":{},"fadeMs":{:.1},"decayDb":{:.2},"#,
                     r#""pendingAt":{},"shapes":[{}]}}"#
                 ),
                 li,
@@ -219,6 +219,12 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                 // In milliseconds rather than frames, so the display never has
                 // to know the sample rate to say what a switch did.
                 lp.fade.load(Ordering::Relaxed) as f64 / sr as f64 * 1000.0,
+                // In decibels a pass, the unit it was asked for. Zero holds for
+                // ever, which is what every loop did before this existed.
+                {
+                    let d = lp.decay_of();
+                    if d >= 1.0 { 0.0 } else { 20.0 * (d.max(1e-9) as f64).log10() }
+                },
                 // Frames until a scheduled transition fires, or -1 for nothing
                 // pending. A display that can show "starts in 1.4 s" is the
                 // difference between a deliberate wait and a dead button.

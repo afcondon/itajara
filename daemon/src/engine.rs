@@ -82,6 +82,21 @@ const FIRE: u8 = 6;
 /// and comfortably short of catching the previous bar.
 const ARM_REACH_MS: f64 = 50.0;
 
+/// Everything that makes a layer what it is.
+///
+/// A value rather than three arguments, because three integers in a row is
+/// exactly where a transposition hides — and because it says out loud that a
+/// layer is described in one place. `tail` used to be left alone and went stale;
+/// `born` would do the same, and a layer born at the wrong pass is a layer that
+/// arrives already faded.
+struct Shape {
+    len: usize,
+    /// Frames of continuation past the end, for the wrap fade.
+    tail: usize,
+    /// The pass the layer was laid on: where its decay counts from.
+    born: i64,
+}
+
 /// The longest wrap crossfade, and so the most continuation worth keeping past
 /// a layer's end.
 ///
@@ -179,6 +194,15 @@ fn wrap_mix(head: f32, tail: f32, p: usize, n: usize) -> f32 {
     tail * (1.0 - t) + head * t
 }
 
+/// Decay as the board says it, in the unit it was asked for.
+fn decay_words(lp: &Loop) -> String {
+    let d = lp.decay_of();
+    if d >= 1.0 {
+        return "holds every layer for ever".into();
+    }
+    format!("loses {:.0} dB a pass", -20.0 * d.max(1e-9).log10())
+}
+
 /// The wrap fade as the board says it.
 fn fade_words(lp: &Loop, sr: u32) -> String {
     match lp.fade.load(Ordering::Relaxed) {
@@ -273,6 +297,20 @@ pub struct Loop {
     /// which is the same rule `MidiClip` follows in Triggerfish for the same
     /// reason: the lossy step belongs at the end, where it can be undone.
     l_tail: Vec<AtomicUsize>,
+    /// The pass this layer was laid on, which is where its decay counts from.
+    ///
+    /// Per layer rather than per loop, and that is the whole of what makes decay
+    /// sound like tape rather than like a fader: new material enters at full
+    /// while everything underneath goes on receding from its own beginning. It
+    /// is also what a single feedback gain cannot do, because a feedback gain
+    /// destroys as it goes and has no idea how old anything is.
+    l_born: Vec<AtomicI64>,
+    /// This layer's decay gain right now, recomputed once per buffer.
+    ///
+    /// Cached because it only changes at a pass boundary and the mixer runs per
+    /// frame. Six loops times eight layers of `powi` once a buffer is nothing;
+    /// the same arithmetic per frame would be real.
+    l_gain: Vec<AtomicU32>,
     l_period: Vec<AtomicUsize>,
     l_phase: Vec<AtomicUsize>,
     /// The output frame at which this loop's position zero sits.
@@ -456,6 +494,19 @@ pub struct Loop {
     /// turning it off — the same standing as speed, pan and direction, and the
     /// same reason. *Store everything, flatten late.*
     pub fade: AtomicUsize,
+    /// How much of itself a layer keeps from one pass to the next. `1.0` holds
+    /// for ever, which is the default and what a looper has always done.
+    ///
+    /// **The parameter that separates Frippertronics from song looping.** Two
+    /// Revoxes with the second one feeding back below unity is this number, and
+    /// so is what a tape echo does to its repeats. Without it every layer plays
+    /// at full for ever and the only shape a loop can have is the one it was
+    /// given.
+    ///
+    /// A resolution at playback like speed, pan and the wrap fade — nothing is
+    /// scaled in the arena — so a loop that has faded to nothing is still all
+    /// there, and turning decay off brings it back.
+    pub decay: AtomicU32,
     /// How often a pass sounds, as a probability. `1.0` is always.
     ///
     /// A gate on the mix and nothing else — the playhead keeps turning, `origin`
@@ -480,6 +531,8 @@ impl Loop {
             n_layers: AtomicUsize::new(0),
             l_len: (0..MAX_LAYERS).map(|_| AtomicUsize::new(0)).collect(),
             l_tail: (0..MAX_LAYERS).map(|_| AtomicUsize::new(0)).collect(),
+            l_born: (0..MAX_LAYERS).map(|_| AtomicI64::new(0)).collect(),
+            l_gain: (0..MAX_LAYERS).map(|_| AtomicU32::new(1.0f32.to_bits())).collect(),
             l_period: (0..MAX_LAYERS).map(|_| AtomicUsize::new(1)).collect(),
             l_phase: (0..MAX_LAYERS).map(|_| AtomicUsize::new(0)).collect(),
             origin: AtomicI64::new(0),
@@ -506,6 +559,7 @@ impl Loop {
             level_arm: AtomicBool::new(false),
             arm_from: AtomicI64::new(i64::MIN),
             fade: AtomicUsize::new(0),
+            decay: AtomicU32::new(1.0f32.to_bits()),
             chance: AtomicU32::new(1.0f32.to_bits()),
             chance_pass: AtomicI64::new(i64::MIN),
             chance_sounds: AtomicBool::new(true),
@@ -705,6 +759,33 @@ impl Loop {
     pub fn firing(&self, out_frame: i64) -> bool {
         self.one_shot.load(Ordering::Relaxed) && out_frame < self.shot_end.load(Ordering::Acquire)
     }
+    pub fn decay_of(&self) -> f32 {
+        f32::from_bits(self.decay.load(Ordering::Relaxed))
+    }
+    /// What this layer is currently worth, after however many passes it has
+    /// lived through. One for every layer of a loop that is not decaying.
+    pub fn layer_gain(&self, layer: usize) -> f32 {
+        f32::from_bits(self.l_gain[layer].load(Ordering::Relaxed))
+    }
+    /// Recompute every layer's decay gain for the buffer starting at
+    /// `out_frame`. Called once a buffer from the output callback, which is the
+    /// only thread that knows the frame.
+    fn age(&self, out_frame: i64) {
+        let d = self.decay_of();
+        let now = self.pass_index(out_frame, self.loop_len.load(Ordering::Acquire));
+        for l in 0..MAX_LAYERS {
+            let g = if d >= 1.0 {
+                1.0
+            } else {
+                // Clamped because nothing is louder than silence twice, and an
+                // exponent from a loop that has been running all afternoon
+                // should not be asked of `powi`.
+                let age = (now - self.l_born[l].load(Ordering::Relaxed)).clamp(0, 4096);
+                d.powi(age as i32)
+            };
+            self.l_gain[l].store(g.to_bits(), Ordering::Relaxed);
+        }
+    }
     pub fn chance_of(&self) -> f32 {
         f32::from_bits(self.chance.load(Ordering::Relaxed))
     }
@@ -772,8 +853,8 @@ impl Loop {
     /// its length second leaves a window in which the mix reads a length of
     /// zero and drops it — a buffer of silence at the exact moment a take
     /// lands, which is the least forgivable place for one.
-    /// Declare what a layer is, including whether it has a continuation past
-    /// its end.
+    /// Declare what a layer is: its length, its continuation, and when it was
+    /// born.
     ///
     /// **The tail is a parameter rather than something left alone**, because it
     /// is now read at playback and a stale one is audible. `take` and the
@@ -781,11 +862,13 @@ impl Loop {
     /// whatever the slot held before; the samples there had been zeroed, so the
     /// wrap would have crossfaded into silence — a loop fading in from nothing
     /// every cycle, for a reason nothing on screen could explain.
-    fn set_layer_shape(&self, layer: usize, len: usize, tail: usize) {
-        self.l_len[layer].store(len, Ordering::Release);
+    fn set_layer_shape(&self, layer: usize, s: Shape) {
+        self.l_len[layer].store(s.len, Ordering::Release);
         self.l_period[layer].store(1, Ordering::Release);
         self.l_phase[layer].store(0, Ordering::Release);
-        self.l_tail[layer].store(tail, Ordering::Release);
+        self.l_tail[layer].store(s.tail, Ordering::Release);
+        self.l_born[layer].store(s.born, Ordering::Release);
+        self.l_gain[layer].store(1.0f32.to_bits(), Ordering::Release);
     }
     /// Where in a layer's own buffer the loop position `pos` falls — or `None`
     /// when the layer is silent there.
@@ -1235,9 +1318,16 @@ impl Shared {
     /// neighbouring positions, and summing the layers first is the same number
     /// as interpolating each layer and summing after — for half the reads.
     fn mix_at(&self, li: usize, n: usize, pos: usize) -> f32 {
+        let lp = self.lp(li);
         let mut v = 0.0f32;
         for l in 0..n {
-            v += self.sample_at(li, l, pos);
+            let g = lp.layer_gain(l);
+            // Eighty decibels down is not quiet, it is gone — and skipping it
+            // saves the arena read and the wrap fade's second read with it. The
+            // audio is still there; only the reading of it stops.
+            if g > 1.0e-4 {
+                v += self.sample_at(li, l, pos) * g;
+            }
         }
         v
     }
@@ -1500,6 +1590,10 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                             lp.cfg_pend.load(Ordering::Relaxed),
                         );
                     }
+                    // Decay, at the buffer start and for the same reason: it
+                    // only changes at a pass boundary, so a `powi` per layer per
+                    // buffer is free where per frame would not be.
+                    lp.age(base as i64);
                     // Peek, not take: a request with a deadline in the future
                     // has to survive this buffer and be reconsidered on the
                     // next. Consuming first and re-arming would lose it if the
@@ -2220,7 +2314,9 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) {
 
     let layer = lp.n_layers.load(Ordering::Acquire);
     let len = lp.loop_len.load(Ordering::Acquire);
-    lp.set_layer_shape(layer, len, tail);
+    // Born on the pass it was committed on, which is when it starts existing as
+    // something to be heard — and so when it starts getting older.
+    lp.set_layer_shape(layer, Shape { len, tail, born: lp.pass_index(closed_at, len) });
     lp.add_layer();
     if len > 0 {
         draw_layer(sh, li, layer, len, sr);
@@ -2406,7 +2502,9 @@ fn take(sh: &Shared, li: usize, sr: u32, secs: f64, late: i64) {
     let taken_len = lp.loop_len.load(Ordering::Acquire);
     let want = sh.max_fade.min(sh.max_frames.saturating_sub(taken_len));
     let tail = fill_from_ring(sh, li, taken, from_out + taken_len as i64, want, taken_len, false);
-    lp.set_layer_shape(taken, taken_len, tail);
+    // A claimed layer is born now, not when the audio in it was played. It
+    // starts being heard at this instant, and decay is about what you can hear.
+    lp.set_layer_shape(taken, Shape { len: taken_len, tail, born: lp.pass_index(cur, taken_len) });
     lp.add_layer();
     draw_layer(sh, li, taken, lp.loop_len.load(Ordering::Acquire), sr);
     println!(
@@ -2529,8 +2627,10 @@ fn multiply_end(sh: &Shared, li: usize, sr: u32) {
         loop_len as f64 / sr as f64
     );
     let layer = lp.n_layers.load(Ordering::Acquire);
-    // A multiplied layer ends where the multiply ended; nothing follows it.
-    lp.set_layer_shape(layer, new_len, 0);
+    // A multiplied layer ends where the multiply ended; nothing follows it. Born
+    // at zero because a multiply redefines the cycle, so every pass count on
+    // this loop starts again from here.
+    lp.set_layer_shape(layer, Shape { len: new_len, tail: 0, born: 0 });
     lp.add_layer();
     draw_layer(sh, li, layer, new_len, sr);
     println!("  committed. {} layers playing.", layer + 1);
@@ -3162,6 +3262,37 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     format!("loop {} records on the press again.", li)
                 };
             }
+            // How much a pass costs the material already there, in decibels.
+            //
+            // Decibels rather than a gain, because that is the unit the effect
+            // is actually thought in — "three down a pass" is a musical
+            // statement where "point seven oh eight" is a number — and because
+            // it makes the ladder on the pedal readable.
+            _ if rest.starts_with("dec") => {
+                let arg = rest[3..].trim();
+                if arg.is_empty() {
+                    return format!("loop {} {}.", li, decay_words(lp));
+                }
+                match arg.parse::<f32>() {
+                    // Positive would be feedback above unity, which is not a
+                    // longer decay, it is a loop that gets louder until it
+                    // clips. Refused by name rather than clamped.
+                    Ok(db) if db > 0.0 => {
+                        return format!(
+                            "decay is a loss, so it wants zero or less; {} per pass would \
+                             run away.",
+                            db
+                        )
+                    }
+                    Ok(db) if db >= -60.0 => {
+                        lp.decay
+                            .store(10f32.powf(db / 20.0).to_bits(), Ordering::Relaxed);
+                        return format!("loop {} {}.", li, decay_words(lp));
+                    }
+                    Ok(db) => return format!("decay wants 0 to -60 dB a pass, not {}.", db),
+                    _ => return format!("decay wants decibels a pass, not `{}`.", arg),
+                }
+            }
             // Crossfade the wrap, in milliseconds. Zero is off.
             //
             // Says when it will do nothing. A loop whose layers kept no
@@ -3313,6 +3444,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 lp.level_arm.store(false, Ordering::Relaxed);
                 lp.arm_from.store(i64::MIN, Ordering::Release);
                 lp.fade.store(0, Ordering::Relaxed);
+                lp.decay.store(1.0f32.to_bits(), Ordering::Relaxed);
                 lp.chance.store(1.0f32.to_bits(), Ordering::Relaxed);
                 lp.chance_pass.store(i64::MIN, Ordering::Relaxed);
                 lp.chance_sounds.store(true, Ordering::Relaxed);
@@ -3321,7 +3453,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 lp.loop_len.store(0, Ordering::Release);
                 for l in 0..MAX_LAYERS {
                     sh.zero_layer(li, l);
-                    lp.set_layer_shape(l, 0, 0);
+                    lp.set_layer_shape(l, Shape { len: 0, tail: 0, born: 0 });
                 }
                 sh.release_anchor(li);
                 println!("  cleared.");
@@ -4054,6 +4186,53 @@ mod tests {
                 p
             );
         }
+    }
+
+    /// Decay is per layer, counted from its own birth — which is the whole of
+    /// what makes it sound like tape rather than like a fader. New material
+    /// enters at full while everything underneath goes on receding.
+    #[test]
+    fn every_layer_recedes_from_its_own_beginning() {
+        let lp = at_origin();
+        lp.loop_len.store(LEN, Ordering::Release);
+        // Six decibels a pass: a half each time round.
+        lp.decay.store(10f32.powf(-6.0206 / 20.0).to_bits(), Ordering::Relaxed);
+        // Layer 0 laid at the start; layer 1 laid three passes later.
+        lp.set_layer_shape(0, Shape { len: LEN, tail: 0, born: 0 });
+        lp.set_layer_shape(1, Shape { len: LEN, tail: 0, born: 3 });
+
+        lp.age(3 * LEN as i64);
+        assert!(
+            (lp.layer_gain(0) - 0.125).abs() < 0.01,
+            "three passes old should be an eighth, got {}",
+            lp.layer_gain(0)
+        );
+        assert!(
+            (lp.layer_gain(1) - 1.0).abs() < 0.01,
+            "a layer laid this pass enters at full, got {}",
+            lp.layer_gain(1)
+        );
+
+        // Three passes further on they have both lost the same amount, which is
+        // what "from its own beginning" means.
+        lp.age(6 * LEN as i64);
+        assert!((lp.layer_gain(1) - 0.125).abs() < 0.01);
+        assert!(lp.layer_gain(0) < lp.layer_gain(1));
+    }
+
+    /// And that turning it off brings everything back, because nothing was
+    /// scaled in the arena — the whole reason it is a resolution and not an edit.
+    #[test]
+    fn decay_is_a_resolution_and_undoes_by_being_turned_off() {
+        let lp = at_origin();
+        lp.loop_len.store(LEN, Ordering::Release);
+        lp.set_layer_shape(0, Shape { len: LEN, tail: 0, born: 0 });
+        lp.decay.store(0.5f32.to_bits(), Ordering::Relaxed);
+        lp.age(8 * LEN as i64);
+        assert!(lp.layer_gain(0) < 0.01, "should have faded away by now");
+        lp.decay.store(1.0f32.to_bits(), Ordering::Relaxed);
+        lp.age(8 * LEN as i64);
+        assert_eq!(lp.layer_gain(0), 1.0, "turning decay off must bring it back");
     }
 
     /// A one-shot is silent until it is fired, and silent again after one pass.
