@@ -82,6 +82,14 @@ const FIRE: u8 = 6;
 /// and comfortably short of catching the previous bar.
 const ARM_REACH_MS: f64 = 50.0;
 
+/// The longest wrap crossfade, and so the most continuation worth keeping past
+/// a layer's end.
+///
+/// Half a second is already far longer than a join wants; past that it stops
+/// being a join and becomes a different effect, which should be asked for by
+/// its own name rather than by winding this one up.
+const MAX_FADE_MS: f64 = 500.0;
+
 pub struct Opts {
     pub device: String,
     pub in_ch: usize,
@@ -158,6 +166,25 @@ impl Default for Opts {
 fn thresh_words(sh: &Shared) -> String {
     let mag = f32::from_bits(sh.arm_thresh.load(Ordering::Relaxed));
     format!("{:.0} dBFS", 20.0 * (mag.max(1e-9) as f64).log10())
+}
+
+/// One frame of the wrap fade: the head arrived at through the continuation.
+///
+/// At `p = 0` this is almost entirely the continuation — the frame that truly
+/// followed the last one played — and by `p = n` it is the recording again.
+/// Split out from `sample_at` so the property it exists for can be asserted
+/// without standing up an arena.
+fn wrap_mix(head: f32, tail: f32, p: usize, n: usize) -> f32 {
+    let t = (p + 1) as f32 / (n + 1) as f32;
+    tail * (1.0 - t) + head * t
+}
+
+/// The wrap fade as the board says it.
+fn fade_words(lp: &Loop, sr: u32) -> String {
+    match lp.fade.load(Ordering::Relaxed) {
+        0 => "a hard join".into(),
+        f => format!("{:.0} ms of crossfade", f as f64 / sr as f64 * 1000.0),
+    }
 }
 
 /// A probability as the board says it, for the acks.
@@ -420,6 +447,15 @@ pub struct Loop {
     /// and spent as pre-roll, which is the machinery a late footswitch already
     /// built.
     arm_from: AtomicI64,
+    /// How many frames of the wrap are crossfaded with the layer's continuation.
+    /// Zero is off, which is the default.
+    ///
+    /// **A resolution applied at playback, not an edit.** The samples are never
+    /// touched: the mixer reads two of them near a wrap instead of one. So the
+    /// length can be changed while the loop plays, turned off, and undone by
+    /// turning it off — the same standing as speed, pan and direction, and the
+    /// same reason. *Store everything, flatten late.*
+    pub fade: AtomicUsize,
     /// How often a pass sounds, as a probability. `1.0` is always.
     ///
     /// A gate on the mix and nothing else — the playhead keeps turning, `origin`
@@ -469,6 +505,7 @@ impl Loop {
             shot_end: AtomicI64::new(i64::MIN),
             level_arm: AtomicBool::new(false),
             arm_from: AtomicI64::new(i64::MIN),
+            fade: AtomicUsize::new(0),
             chance: AtomicU32::new(1.0f32.to_bits()),
             chance_pass: AtomicI64::new(i64::MIN),
             chance_sounds: AtomicBool::new(true),
@@ -735,10 +772,20 @@ impl Loop {
     /// its length second leaves a window in which the mix reads a length of
     /// zero and drops it — a buffer of silence at the exact moment a take
     /// lands, which is the least forgivable place for one.
-    fn set_layer_shape(&self, layer: usize, len: usize) {
+    /// Declare what a layer is, including whether it has a continuation past
+    /// its end.
+    ///
+    /// **The tail is a parameter rather than something left alone**, because it
+    /// is now read at playback and a stale one is audible. `take` and the
+    /// multiply family write a layer without a continuation and used to leave
+    /// whatever the slot held before; the samples there had been zeroed, so the
+    /// wrap would have crossfaded into silence — a loop fading in from nothing
+    /// every cycle, for a reason nothing on screen could explain.
+    fn set_layer_shape(&self, layer: usize, len: usize, tail: usize) {
         self.l_len[layer].store(len, Ordering::Release);
         self.l_period[layer].store(1, Ordering::Release);
         self.l_phase[layer].store(0, Ordering::Release);
+        self.l_tail[layer].store(tail, Ordering::Release);
     }
     /// Where in a layer's own buffer the loop position `pos` falls — or `None`
     /// when the layer is silent there.
@@ -808,6 +855,9 @@ pub struct Shared {
     pub arm_thresh: AtomicU32,
     /// `ARM_REACH_MS` in frames, resolved once at startup.
     arm_reach: AtomicUsize,
+    /// `MAX_FADE_MS` in frames: the most continuation worth keeping past a
+    /// layer's end, since nothing longer can ever be crossfaded into the wrap.
+    max_fade: usize,
     pub monitor: AtomicBool,
     pub out_peak: AtomicU32,
     pub in_peak: AtomicU32,
@@ -1050,11 +1100,63 @@ impl Shared {
     /// and became a calculation, while the audio was correct. A test that can
     /// disagree with the audio path about what is audible is testing the wrong
     /// thing.
+    /// One layer's contribution at one loop position, with the wrap made
+    /// continuous if it has been asked for.
+    ///
+    /// ## What is actually wrong at a loop point
+    ///
+    /// A first recording is written linearly and then cut: frame `len - 1` is
+    /// followed at playback by frame `0`, but the frame that *truly* followed it
+    /// when it was played is the first of the continuation. So the join is a
+    /// step in the waveform — a click — and whatever was sustaining is chopped.
+    ///
+    /// The fix is to arrive at the head through the continuation. Over the first
+    /// `n` frames of the layer, fade from the tail into the head: at `p = 0` you
+    /// hear almost exactly what followed `len - 1`, and by `p = n` you are back
+    /// on the recording. Continuous by construction, because the two are the
+    /// same performance either side of the same instant.
+    ///
+    /// **Linear, and deliberately.** Equal-power is for crossfading *unrelated*
+    /// sources; these two are one performance a cycle apart and are correlated
+    /// at the join, where a linear pair sums to unity and equal-power would add
+    /// three decibels. Where they are uncorrelated — a different drum hit at
+    /// each end — linear dips, but only by a few decibels over a few
+    /// milliseconds, which is the cheaper failure.
+    ///
+    /// ## Only a layer that was cut needs it
+    ///
+    /// An **overdub** is recorded modularly, into `pos % len`, so the sample at
+    /// position zero genuinely is the one that followed position `len - 1` — it
+    /// was played that way. Nothing to fix. Its tail exists for a different
+    /// reason (unwrapping the frames recorded after the press), and using it
+    /// here costs nothing and does no harm.
+    ///
+    /// A **tiled** layer is skipped outright. Its blocks are separated by
+    /// silence, so there is no step to smooth, and blending the continuation in
+    /// there would insert audio at a moment nothing was playing.
     fn sample_at(&self, li: usize, layer: usize, pos: usize) -> f32 {
-        match self.lp(li).layer_pos(layer, pos) {
-            Some(p) => self.read(li, layer, p),
-            None => 0.0,
+        let lp = self.lp(li);
+        let Some(p) = lp.layer_pos(layer, pos) else {
+            return 0.0;
+        };
+        let v = self.read(li, layer, p);
+        let xf = lp.fade.load(Ordering::Relaxed);
+        // The ordinary case, and the first test is the cheap one: away from a
+        // wrap this is the single read it has always been.
+        if xf == 0 || p >= xf || lp.l_period[layer].load(Ordering::Relaxed) > 1 {
+            return v;
         }
+        let len = lp.l_len[layer].load(Ordering::Relaxed);
+        // Bounded by what the layer actually kept, and by where its slice of the
+        // arena ends — reading past that would read the next layer's audio,
+        // which is silent corruption rather than an error.
+        let n = xf
+            .min(lp.l_tail[layer].load(Ordering::Acquire))
+            .min(self.max_frames.saturating_sub(len));
+        if p >= n {
+            return v;
+        }
+        wrap_mix(v, self.read(li, layer, len + p), p, n)
     }
 
     fn zero_layer(&self, li: usize, layer: usize) {
@@ -1315,6 +1417,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         ),
         arm_thresh: AtomicU32::new(db_to_mag(opts.arm_db).to_bits()),
         arm_reach: AtomicUsize::new((ARM_REACH_MS / 1000.0 * sr_f).round() as usize),
+        max_fade: (MAX_FADE_MS / 1000.0 * sr_f).round() as usize,
         monitor: AtomicBool::new(opts.monitor),
         out_peak: AtomicU32::new(0),
         in_peak: AtomicU32::new(0),
@@ -1952,6 +2055,12 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) {
         None
     };
 
+    // Frames of continuation past this layer's end, filled in by whichever
+    // branch below runs and handed to `set_layer_shape` at the bottom — one
+    // place that decides a layer's shape, rather than two that each remember to
+    // set part of it.
+    let mut tail = 0usize;
+
     // Let the input drain: it trails the output by K, so the last frames of the
     // loop have not arrived yet. Without this the tail of every recording is
     // missing, which is exactly the kind of fault that sounds like "feel".
@@ -2034,7 +2143,7 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) {
             for pos in 0..pre {
                 sh.write(li, layer, pos, 0.0);
             }
-            let got = fill_from_ring(sh, li, layer, new_origin, pre, false);
+            let got = fill_from_ring(sh, li, layer, new_origin, pre, 0, false);
             lp.origin.store(new_origin, Ordering::Release);
             len += pre;
             println!(
@@ -2048,11 +2157,8 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) {
         // What was recorded past the end, kept rather than trimmed. A first
         // recording writes linearly, so the continuation is already sitting
         // there and costs nothing to keep — it only had to not be thrown away.
-        let layer0 = lp.n_layers.load(Ordering::Acquire);
-        lp.l_tail[layer0].store(
-            (reached.max(len) + if quantised_len.is_some() { 0 } else { pre }).saturating_sub(len),
-            Ordering::Release,
-        );
+        tail = (reached.max(len) + if quantised_len.is_some() { 0 } else { pre })
+            .saturating_sub(len);
         // The first loop to acquire a length becomes the grid the rest
         // can align to — first rather than chosen, because that is how a
         // looper has always worked: what you played first is what the
@@ -2101,7 +2207,7 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) {
                 }
             }
         }
-        lp.l_tail[layer].store(kept, Ordering::Release);
+        tail = kept;
         if undone > 0 {
             println!(
                 "  {:.0} ms recorded after the press unwrapped from the loop head, \
@@ -2114,7 +2220,7 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) {
 
     let layer = lp.n_layers.load(Ordering::Acquire);
     let len = lp.loop_len.load(Ordering::Acquire);
-    lp.set_layer_shape(layer, len);
+    lp.set_layer_shape(layer, len, tail);
     lp.add_layer();
     if len > 0 {
         draw_layer(sh, li, layer, len, sr);
@@ -2183,7 +2289,15 @@ fn draw_layer(sh: &Shared, li: usize, layer: usize, len: usize, sr: u32) {
 /// error — it means the request reached back further than the ring holds, and
 /// the caller should say so rather than silently hand over a loop with a
 /// truncated front.
-fn fill_from_ring(sh: &Shared, li: usize, layer: usize, from_out: i64, len: usize, additive: bool) -> usize {
+fn fill_from_ring(
+    sh: &Shared,
+    li: usize,
+    layer: usize,
+    from_out: i64,
+    len: usize,
+    at: usize,
+    additive: bool,
+) -> usize {
     let k = sh.k.load(Ordering::Acquire);
     let mut got = 0;
     for pos in 0..len {
@@ -2191,9 +2305,9 @@ fn fill_from_ring(sh: &Shared, li: usize, layer: usize, from_out: i64, len: usiz
             continue;
         };
         if additive {
-            sh.add(li, layer, pos, v);
+            sh.add(li, layer, at + pos, v);
         } else {
-            sh.write(li, layer, pos, v);
+            sh.write(li, layer, at + pos, v);
         }
         got += 1;
     }
@@ -2247,7 +2361,7 @@ fn take(sh: &Shared, li: usize, sr: u32, secs: f64, late: i64) {
     }
 
     sh.zero_layer(li, layer);
-    let got = fill_from_ring(sh, li, layer, from_out, len, false);
+    let got = fill_from_ring(sh, li, layer, from_out, len, 0, false);
     if got == 0 {
         println!("  the pre-roll does not reach back that far.");
         return;
@@ -2280,7 +2394,19 @@ fn take(sh: &Shared, li: usize, sr: u32, secs: f64, late: i64) {
         println!("  took the last complete cycle as a new {}.", what);
     }
     let taken = lp.n_layers.load(Ordering::Acquire);
-    lp.set_layer_shape(taken, lp.loop_len.load(Ordering::Acquire));
+    // The continuation comes from the ring too, so a claimed layer wraps as
+    // seamlessly as a recorded one.
+    //
+    // It is free where it is available and empty where it is not, and the ring
+    // says which: claiming the last complete *cycle* means what followed it has
+    // already gone by, but claiming the last few seconds as the loop itself ends
+    // at now, and nothing has followed now. `ring_at` refuses a frame it does
+    // not hold, so the second case simply keeps nothing rather than reading a
+    // minute-old slot as though it were the future.
+    let taken_len = lp.loop_len.load(Ordering::Acquire);
+    let want = sh.max_fade.min(sh.max_frames.saturating_sub(taken_len));
+    let tail = fill_from_ring(sh, li, taken, from_out + taken_len as i64, want, taken_len, false);
+    lp.set_layer_shape(taken, taken_len, tail);
     lp.add_layer();
     draw_layer(sh, li, taken, lp.loop_len.load(Ordering::Acquire), sr);
     println!(
@@ -2327,7 +2453,7 @@ fn multiply_start(sh: &Shared, li: usize, sr: u32) {
     // the multiply really does begin on the boundary.
     let behind = (cur - from) as usize;
     if behind > 0 {
-        let got = fill_from_ring(sh, li, layer, from, behind, false);
+        let got = fill_from_ring(sh, li, layer, from, behind, 0, false);
         lp.reached.fetch_max(got, Ordering::Relaxed);
         println!(
             "  multiplying from the start of this cycle — {:.2} s of it recovered \
@@ -2403,7 +2529,8 @@ fn multiply_end(sh: &Shared, li: usize, sr: u32) {
         loop_len as f64 / sr as f64
     );
     let layer = lp.n_layers.load(Ordering::Acquire);
-    lp.set_layer_shape(layer, new_len);
+    // A multiplied layer ends where the multiply ended; nothing follows it.
+    lp.set_layer_shape(layer, new_len, 0);
     lp.add_layer();
     draw_layer(sh, li, layer, new_len, sr);
     println!("  committed. {} layers playing.", layer + 1);
@@ -3035,6 +3162,54 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     format!("loop {} records on the press again.", li)
                 };
             }
+            // Crossfade the wrap, in milliseconds. Zero is off.
+            //
+            // Says when it will do nothing. A loop whose layers kept no
+            // continuation has nothing to fade *from*, so the setting takes and
+            // is inaudible — which is the exact shape of failure this surface
+            // exists to prevent, and costs one sentence to rule out.
+            _ if rest.starts_with("xf") => {
+                let arg = rest[2..].trim();
+                if arg.is_empty() {
+                    return format!("loop {} wraps with {}.", li, fade_words(lp, sr));
+                }
+                match arg.parse::<f64>() {
+                    // Half a second is already far longer than a wrap wants; past
+                    // that it is not a join, it is a different effect.
+                    Ok(ms) if (0.0..=MAX_FADE_MS).contains(&ms) => {
+                        lp.fade
+                            .store((ms / 1000.0 * sr as f64).round() as usize, Ordering::Relaxed);
+                        // Which layers can actually use it, said in numbers.
+                        //
+                        // All-or-nothing was the first version and it was the
+                        // usual half-truth: a loop where two layers of three
+                        // kept a continuation wraps two-thirds seamlessly and
+                        // reported nothing at all, so the one hard join left
+                        // would have been a click with no explanation anywhere.
+                        let n = lp.n_layers.load(Ordering::Acquire);
+                        let kept = (0..n).filter(|&l| lp.layer_tail(l) > 0).count();
+                        return format!(
+                            "loop {} wraps with {}.{}",
+                            li,
+                            fade_words(lp, sr),
+                            match (ms > 0.0, kept, n) {
+                                (false, _, _) | (_, _, 0) => String::new(),
+                                (_, 0, _) => "  Nothing here kept a continuation, though, so \
+                                              there is nothing to fade from."
+                                    .into(),
+                                (_, k, n) if k == n => String::new(),
+                                (_, k, n) => format!(
+                                    "  {} of {} layers kept a continuation; the rest still \
+                                     join hard.",
+                                    k, n
+                                ),
+                            }
+                        );
+                    }
+                    Ok(ms) => return format!("the wrap fade wants 0 to {:.0} ms, not {}.", MAX_FADE_MS, ms),
+                    _ => return format!("the wrap fade wants milliseconds, not `{}`.", arg),
+                }
+            }
             // How often a pass sounds. A probability rather than a ratio,
             // because the ladder the board offers (always, 3 in 4, 1 in 2, 1 in
             // 4, 1 in 8) is a choice the *app* makes about which values are
@@ -3137,6 +3312,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 lp.shot_end.store(i64::MIN, Ordering::Release);
                 lp.level_arm.store(false, Ordering::Relaxed);
                 lp.arm_from.store(i64::MIN, Ordering::Release);
+                lp.fade.store(0, Ordering::Relaxed);
                 lp.chance.store(1.0f32.to_bits(), Ordering::Relaxed);
                 lp.chance_pass.store(i64::MIN, Ordering::Relaxed);
                 lp.chance_sounds.store(true, Ordering::Relaxed);
@@ -3145,7 +3321,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 lp.loop_len.store(0, Ordering::Release);
                 for l in 0..MAX_LAYERS {
                     sh.zero_layer(li, l);
-                    lp.set_layer_shape(l, 0);
+                    lp.set_layer_shape(l, 0, 0);
                 }
                 sh.release_anchor(li);
                 println!("  cleared.");
@@ -3810,6 +3986,72 @@ mod tests {
                 "at {} the gate opened {:.4} of the time",
                 p,
                 hits
+            );
+        }
+    }
+
+    /// The whole point of keeping the tail: the loop point stops being a step in
+    /// the waveform.
+    ///
+    /// A first recording is cut, so frame `len - 1` is followed at playback by
+    /// frame `0` — which is not what followed it when it was played. Here the
+    /// performance is a sine whose period does not divide the loop length, so
+    /// the naked splice is a large step; the fade should bring it down to
+    /// roughly what one sample of the signal moves anyway.
+    #[test]
+    fn the_wrap_stops_being_a_step_in_the_waveform() {
+        const LEN: usize = 997;
+        const N: usize = 64;
+        // One continuous performance, sampled past the loop's end. `head` is what
+        // was kept as the loop; `tail` is what carried on.
+        let x = |i: usize| (i as f32 * 0.021_37).sin();
+        let head = |i: usize| x(i);
+        let tail = |j: usize| x(LEN + j);
+
+        // How much the signal moves in one sample, at its steepest. Anything
+        // near this is not a discontinuity, it is the waveform.
+        let natural = (1..LEN).map(|i| (x(i) - x(i - 1)).abs()).fold(0.0f32, f32::max);
+
+        let naked = (head(0) - head(LEN - 1)).abs();
+        assert!(
+            naked > natural * 20.0,
+            "the test signal does not actually have a bad splice: {} vs {}",
+            naked,
+            natural
+        );
+
+        // Now walk the wrap with the fade on, and measure the biggest step
+        // anywhere across it — including back out of the fade at `p = n`.
+        let faded = |p: usize| wrap_mix(head(p), tail(p), p, N);
+        let mut worst = (faded(0) - head(LEN - 1)).abs();
+        for p in 1..N {
+            worst = worst.max((faded(p) - faded(p - 1)).abs());
+        }
+        worst = worst.max((head(N) - faded(N - 1)).abs());
+        assert!(
+            worst < natural * 2.0,
+            "the crossfaded wrap still steps by {} where the signal itself moves {}",
+            worst,
+            natural
+        );
+    }
+
+    /// And that it arrives where it should at both ends, which is what makes the
+    /// continuity above hold rather than being an accident of one signal.
+    #[test]
+    fn a_wrap_fade_starts_on_the_continuation_and_ends_on_the_recording() {
+        const N: usize = 100;
+        // Head and tail held at opposite constants, so the blend is readable.
+        assert!(wrap_mix(1.0, 0.0, 0, N) < 0.02, "does not start on the continuation");
+        assert!(wrap_mix(1.0, 0.0, N - 1, N) > 0.98, "does not end on the recording");
+        // Correlated material — the usual case, since the two ends are one
+        // performance a cycle apart — keeps its level all the way through. This
+        // is what linear buys and equal-power would not.
+        for p in 0..N {
+            assert!(
+                (wrap_mix(0.7, 0.7, p, N) - 0.7).abs() < 1e-5,
+                "the level moved at {}",
+                p
             );
         }
     }

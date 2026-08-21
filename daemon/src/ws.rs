@@ -178,7 +178,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                     r#""loopSecs":{:.4},"pos":{},"phase":{:.5},"armed":{},"#,
                     r#""recording":{},"quant":{},"muted":{},"reverse":{},"pan":{},"#,
                     r#""speed":{:.4},"pendulum":{},"oneShot":{},"levelArm":{},"#,
-                    r#""firing":{},"chance":{:.4},"skipping":{},"#,
+                    r#""firing":{},"chance":{:.4},"skipping":{},"fadeMs":{:.1},"#,
                     r#""pendingAt":{},"shapes":[{}]}}"#
                 ),
                 li,
@@ -216,6 +216,9 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                 // whether anybody was looking.
                 lp.chance_of(),
                 lp.skipping(cur, len),
+                // In milliseconds rather than frames, so the display never has
+                // to know the sample rate to say what a switch did.
+                lp.fade.load(Ordering::Relaxed) as f64 / sr as f64 * 1000.0,
                 // Frames until a scheduled transition fires, or -1 for nothing
                 // pending. A display that can show "starts in 1.4 s" is the
                 // difference between a deliberate wait and a dead button.

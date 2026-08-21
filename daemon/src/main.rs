@@ -41,6 +41,7 @@ USAGE
         one  one pass per trigger      f  fire it
         lev  wait for a sound          arm [db]  the level it waits for
         ch [p]  how often a pass sounds, 0 to 1
+        xf [ms]  crossfade the loop wrap with what followed it
 
       `one` and `lev` are per-loop modes and take `0`/`1` to set rather than
       flip: `2one1` makes loop 2 a one-shot, silent until `2f` fires it from

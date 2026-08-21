@@ -148,6 +148,10 @@ type LoopState =
   -- | the audio callback, and a display that rolled its own would disagree with
   -- | what is coming out of the speakers.
   , skipping :: Boolean
+  -- | How much of the wrap is crossfaded with the layer's continuation, in
+  -- | milliseconds; zero is a hard join. In milliseconds rather than frames so
+  -- | the display never needs the sample rate to say what a switch did.
+  , fadeMs :: Number
   -- | Frames until a scheduled transition fires, or -1 when nothing is
   -- | pending. What lets the display say "starts in 1.4 s" rather than leaving
   -- | a deliberate wait looking like a dead button.
