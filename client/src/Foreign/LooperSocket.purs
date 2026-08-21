@@ -177,6 +177,18 @@ type LayerShape =
   -- | the only way the display can show a loop receding, since nothing in the
   -- | arena changes.
   , gain :: Number
+  -- | The layer's shape, as peaks 0-255 across its own length.
+  -- |
+  -- | **Absolute and logarithmic, never normalised per layer.** The picture is
+  -- | for telling one loop from another at a glance and for not firing the loud
+  -- | one when you meant the quiet one — and the second of those is destroyed
+  -- | the moment each layer is scaled to its own peak. Zero is silence, 255 is
+  -- | full scale, and the floor is -60 dBFS.
+  -- |
+  -- | Small enough to ride in the ordinary snapshot, which is why there is no
+  -- | second message type, no request to trigger one, and no way for the
+  -- | picture to be of audio that has changed since.
+  , env :: Array Int
   }
 
 type SocketStatus =

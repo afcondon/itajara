@@ -167,8 +167,21 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                     // could be made from. Reported so the display can say a
                     // loop has it rather than leaving it invisible.
                     format!(
-                        r#"{{"len":{},"period":{},"phase":{},"tail":{},"gain":{:.5}}}"#,
-                        slen, period, phase, lp.layer_tail(l), lp.layer_gain(l)
+                        r#"{{"len":{},"period":{},"phase":{},"tail":{},"gain":{:.5},"env":[{}]}}"#,
+                        slen,
+                        period,
+                        phase,
+                        lp.layer_tail(l),
+                        lp.layer_gain(l),
+                        // Forty-eight bytes, and only for layers that exist —
+                        // small enough to ride here rather than needing a
+                        // message of its own, a request to trigger it, and a
+                        // way for it to be out of date.
+                        lp.layer_env(l)
+                            .iter()
+                            .map(|b| b.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
                     )
                 })
                 .collect();

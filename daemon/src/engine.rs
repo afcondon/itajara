@@ -97,6 +97,28 @@ struct Shape {
     born: i64,
 }
 
+/// How many buckets a layer's envelope is drawn with.
+///
+/// **Deliberately coarse.** The job the picture does is telling one loop from
+/// another at a glance and not firing the loud one when you meant the quiet one
+/// — both of which are questions about *shape*, and a shape is legible long
+/// before it is detailed. Forty-eight is about a bucket every two millimetres
+/// at the size a slot actually is, and it makes the whole envelope for six
+/// loops small enough to ride in the ordinary snapshot rather than needing a
+/// message of its own.
+const ENV_BUCKETS: usize = 48;
+
+/// The quietest thing the envelope draws, in dBFS.
+///
+/// **Absolute, and on a decibel curve, which is the whole point.** Scaling each
+/// layer to its own peak is what a waveform editor does and it would destroy the
+/// one thing this is for: a quiet loop would draw exactly as tall as a loud one.
+/// Linear against full scale is honest and useless — a loop peaking at -20 dBFS
+/// would be a tenth of the height and one at -40 would be invisible. Sixty
+/// decibels of range on a log curve is what every meter does, for the same
+/// reason.
+const ENV_FLOOR_DB: f32 = -60.0;
+
 /// The longest wrap crossfade, and so the most continuation worth keeping past
 /// a layer's end.
 ///
@@ -211,6 +233,21 @@ fn fade_words(lp: &Loop, sr: u32) -> String {
     }
 }
 
+/// A peak as a byte on the envelope's decibel scale.
+///
+/// Zero is silence and 255 is full scale, with `ENV_FLOOR_DB` at the bottom.
+/// Absolute, never per layer: a loop twelve decibels quieter than its neighbour
+/// has to *look* twelve decibels quieter, or the picture cannot do the one job
+/// it is here for.
+fn to_byte(peak: f32) -> u8 {
+    if peak <= 0.0 {
+        return 0;
+    }
+    let db = 20.0 * peak.log10();
+    let t = 1.0 + db / -ENV_FLOOR_DB;
+    (t.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
 /// A probability as the board says it, for the acks.
 ///
 /// The named rungs are the ones the app's ladder offers, so a press and its ack
@@ -305,6 +342,14 @@ pub struct Loop {
     /// is also what a single feedback gain cannot do, because a feedback gain
     /// destroys as it goes and has no idea how old anything is.
     l_born: Vec<AtomicI64>,
+    /// Each layer's envelope, as `ENV_BUCKETS` bytes on the scale
+    /// `ENV_FLOOR_DB` describes.
+    ///
+    /// A mutex rather than atomics because nothing real-time goes near it: the
+    /// control thread writes it when a layer's content changes, and the socket
+    /// thread reads it to build a snapshot. The audio thread has no business
+    /// here at all.
+    env: Mutex<Vec<Vec<u8>>>,
     /// This layer's decay gain right now, recomputed once per buffer.
     ///
     /// Cached because it only changes at a pass boundary and the mixer runs per
@@ -533,6 +578,7 @@ impl Loop {
             l_tail: (0..MAX_LAYERS).map(|_| AtomicUsize::new(0)).collect(),
             l_born: (0..MAX_LAYERS).map(|_| AtomicI64::new(0)).collect(),
             l_gain: (0..MAX_LAYERS).map(|_| AtomicU32::new(1.0f32.to_bits())).collect(),
+            env: Mutex::new((0..MAX_LAYERS).map(|_| Vec::new()).collect()),
             l_period: (0..MAX_LAYERS).map(|_| AtomicUsize::new(1)).collect(),
             l_phase: (0..MAX_LAYERS).map(|_| AtomicUsize::new(0)).collect(),
             origin: AtomicI64::new(0),
@@ -764,6 +810,13 @@ impl Loop {
     }
     /// What this layer is currently worth, after however many passes it has
     /// lived through. One for every layer of a loop that is not decaying.
+    /// This layer's envelope, or empty when it has none yet.
+    pub fn layer_env(&self, layer: usize) -> Vec<u8> {
+        self.env
+            .lock()
+            .map(|e| e[layer].clone())
+            .unwrap_or_default()
+    }
     pub fn layer_gain(&self, layer: usize) -> f32 {
         f32::from_bits(self.l_gain[layer].load(Ordering::Relaxed))
     }
@@ -1245,6 +1298,47 @@ impl Shared {
     fn zero_layer(&self, li: usize, layer: usize) {
         for i in 0..self.max_frames {
             self.cell(li, layer, i).store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Redraw a layer's envelope from what is actually in the arena.
+    ///
+    /// Called from the control thread whenever a layer's *content* changes —
+    /// a shorter list than it looks: recording, claiming and multiplying. Undo
+    /// and redo move a layer count; sparse and rotate move period and phase;
+    /// speed, pan, decay and the wrap fade are resolutions applied at playback.
+    /// None of them touch a sample, which is exactly why a picture of the stored
+    /// audio can be cached and still be true.
+    ///
+    /// Linear in the layer's length — about a millisecond for a thirty-second
+    /// take — which is why it is cached rather than computed per snapshot.
+    fn rebuild_env(&self, li: usize, layer: usize) {
+        let lp = self.lp(li);
+        let len = lp.l_len[layer].load(Ordering::Acquire);
+        let mut out = Vec::new();
+        if len > 0 {
+            out.reserve(ENV_BUCKETS);
+            for b in 0..ENV_BUCKETS {
+                let from = b * len / ENV_BUCKETS;
+                let to = (((b + 1) * len) / ENV_BUCKETS).max(from + 1).min(len);
+                let mut peak = 0.0f32;
+                for p in from..to {
+                    peak = peak.max(self.read(li, layer, p).abs());
+                }
+                out.push(to_byte(peak));
+            }
+        }
+        if let Ok(mut e) = lp.env.lock() {
+            e[layer] = out;
+        }
+    }
+
+    /// Forget every envelope on a loop, for when its audio goes.
+    fn clear_env(&self, li: usize) {
+        if let Ok(mut e) = self.lp(li).env.lock() {
+            for v in e.iter_mut() {
+                v.clear();
+            }
         }
     }
 
@@ -2317,6 +2411,7 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) {
     // Born on the pass it was committed on, which is when it starts existing as
     // something to be heard — and so when it starts getting older.
     lp.set_layer_shape(layer, Shape { len, tail, born: lp.pass_index(closed_at, len) });
+    sh.rebuild_env(li, layer);
     lp.add_layer();
     if len > 0 {
         draw_layer(sh, li, layer, len, sr);
@@ -2505,6 +2600,7 @@ fn take(sh: &Shared, li: usize, sr: u32, secs: f64, late: i64) {
     // A claimed layer is born now, not when the audio in it was played. It
     // starts being heard at this instant, and decay is about what you can hear.
     lp.set_layer_shape(taken, Shape { len: taken_len, tail, born: lp.pass_index(cur, taken_len) });
+    sh.rebuild_env(li, taken);
     lp.add_layer();
     draw_layer(sh, li, taken, lp.loop_len.load(Ordering::Acquire), sr);
     println!(
@@ -2631,6 +2727,7 @@ fn multiply_end(sh: &Shared, li: usize, sr: u32) {
     // at zero because a multiply redefines the cycle, so every pass count on
     // this loop starts again from here.
     lp.set_layer_shape(layer, Shape { len: new_len, tail: 0, born: 0 });
+    sh.rebuild_env(li, layer);
     lp.add_layer();
     draw_layer(sh, li, layer, new_len, sr);
     println!("  committed. {} layers playing.", layer + 1);
@@ -2909,6 +3006,10 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                         // An overdub sums into its layer, so anything left there
                         // from an undone take would bleed into the new one.
                         sh.zero_layer(li, layer);
+                        // And the picture of it, which is now of audio that no
+                        // longer exists. Redrawn at commit; blank until then,
+                        // which reads as "being recorded" rather than as a lie.
+                        sh.rebuild_env(li, layer);
                         // Anything above this layer has just been made
                         // unrecoverable, so redo must not offer it.
                         lp.redo_to.store(layer, Ordering::Release);
@@ -3455,6 +3556,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     sh.zero_layer(li, l);
                     lp.set_layer_shape(l, Shape { len: 0, tail: 0, born: 0 });
                 }
+                sh.clear_env(li);
                 sh.release_anchor(li);
                 println!("  cleared.");
             }
@@ -4233,6 +4335,35 @@ mod tests {
         lp.decay.store(1.0f32.to_bits(), Ordering::Relaxed);
         lp.age(8 * LEN as i64);
         assert_eq!(lp.layer_gain(0), 1.0, "turning decay off must bring it back");
+    }
+
+    /// The envelope's scale is absolute and logarithmic, which is the whole of
+    /// what makes the picture useful.
+    ///
+    /// Per-layer normalisation is what a waveform editor does, and it would
+    /// destroy the one job this has: a quiet loop must not draw as tall as a
+    /// loud one. Linear against full scale would be honest and useless — a take
+    /// peaking at -20 dBFS is a tenth of the height and one at -40 is invisible.
+    #[test]
+    fn a_quieter_loop_draws_shorter_and_stays_visible() {
+        assert_eq!(to_byte(0.0), 0, "silence is nothing");
+        assert_eq!(to_byte(1.0), 255, "full scale is everything");
+        // Twelve decibels down should be visibly shorter and still plainly
+        // there. On a linear scale it would be a quarter; here it is four
+        // fifths, which is what keeps forty decibels of range legible.
+        let loud = to_byte(1.0) as i32;
+        let quiet = to_byte(0.251) as i32; // -12 dBFS
+        assert!(quiet < loud - 30, "-12 dB did not read as quieter: {}", quiet);
+        assert!(quiet > loud / 2, "-12 dB fell off the picture: {}", quiet);
+        // The floor is the floor, and below it there is nothing to draw.
+        assert_eq!(to_byte(0.0001), 0, "-80 dBFS is under the floor");
+        // Monotone, or two loudnesses could draw the same height.
+        let mut last = 0u8;
+        for i in 1..=100 {
+            let b = to_byte(i as f32 / 100.0);
+            assert!(b >= last, "not monotone at {}", i);
+            last = b;
+        }
     }
 
     /// A one-shot is silent until it is fired, and silent again after one pass.
