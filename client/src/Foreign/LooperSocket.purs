@@ -12,6 +12,7 @@
 module Foreign.LooperSocket
   ( LooperState
   , LoopState
+  , isWriting
   , LayerShape
   , SocketStatus
   , connect
@@ -162,6 +163,26 @@ type LoopState =
   , pendingAt :: Int
   , shapes :: Array LayerShape
   }
+
+-- | Whether the loop has the input open right now, in any of the three ways it
+-- | can have it.
+-- |
+-- | **One predicate, because two copies of this disagreed and it cost a
+-- | session.** The daemon reports three writing states and every consumer has to
+-- | know the same three: the meaning table, to decide whether a press closes
+-- | something; the display, to colour it. `Data.Looper.Machine` had its own
+-- | list, `Component.Looper.Slots` had a different one, and the difference was
+-- | exactly `overdubbing` — so a loop that had been undone to nothing and then
+-- | recorded into again was **actively writing and drawn as empty**, holding the
+-- | one converter the rig has with nothing on screen to say so.
+-- |
+-- | Note this is deliberately *not* `st.recording`, which the daemon also
+-- | reports. Trusting a derived boolean over the state it was derived from is
+-- | how the two got out of step in the first place; the state is the thing the
+-- | engine actually switches on.
+isWriting :: LoopState -> Boolean
+isWriting st =
+  st.state == "recordingFirst" || st.state == "overdubbing" || st.state == "multiplying"
 
 type LayerShape =
   { len :: Int
