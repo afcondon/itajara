@@ -176,3 +176,10 @@ export const statusImpl = function () {
     url: state.url === null ? "" : state.url
   };
 };
+
+// How long ago the newest snapshot arrived, in milliseconds. Lets the page say
+// "this picture is old" rather than presenting it as the present.
+export const snapshotAgeImpl = function () {
+  if (!state.lastMessageAt) return -1;
+  return Date.now() - state.lastMessageAt;
+};

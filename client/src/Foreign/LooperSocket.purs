@@ -20,6 +20,7 @@ module Foreign.LooperSocket
   , latest
   , status
   , defaultUrl
+  , snapshotAge
   ) where
 
 import Prelude
@@ -226,6 +227,22 @@ foreign import connectImpl :: String -> Effect Unit
 foreign import sendImpl :: String -> Effect Boolean
 foreign import latestImpl :: Effect (Nullable LooperState)
 foreign import statusImpl :: Effect SocketStatus
+
+-- | Milliseconds since the newest snapshot arrived, or negative if none has.
+-- |
+-- | **This one has to come from JavaScript, and only this one.** The arrival
+-- | time is kept by the socket callbacks in this module's own JS state, which
+-- | is what an FFI wrapper around `WebSocket` is for — there is no PureScript
+-- | side to read it from. A timer, by contrast, did *not* need to come from
+-- | here: that was a shortcut around a problem whose real fix was structural,
+-- | and it is gone. See `Component.App`'s poll subscription.
+-- |
+-- | Note it only helps while something is still redrawing. A frozen renderer
+-- | cannot announce that it is frozen.
+foreign import snapshotAgeImpl :: Effect Number
+
+snapshotAge :: Effect Number
+snapshotAge = snapshotAgeImpl
 
 -- | Idempotent: calling it again with the same URL leaves the connection
 -- | alone, so it is safe to call on every initialise.
