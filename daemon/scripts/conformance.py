@@ -95,6 +95,11 @@ PER_LOOP = [
     ("Chance",        "ch1.0",    False),
 ]
 
+# Verbs that change what is in the loop, and so must not be run one after
+# another against a loaded loop — the second would be testing whatever the first
+# left behind. Phase B re-establishes a fresh closed layer before each of these.
+DISTURBS = {"r", "x", "u", "z", "c", "t", "w", "s2", "o", "d"}
+
 # Not loop-scoped. Sent bare, exactly as the app sends them, and restored after.
 GLOBAL = [
     ("Click on",      "k1"),
@@ -216,18 +221,44 @@ def main():
     time.sleep(0.3)
 
     skipped = [(lbl, sfx) for lbl, sfx, needs in PER_LOOP if needs]
+    loaded = {}
     if args.with_audio:
-        print("\n--- Phase B: with material (records into the scratch loop) ---")
-        probe.send(f"{args.loop}r")
-        time.sleep(3.0)
-        probe.send(f"{args.loop}r")
-        time.sleep(0.4)
+        print("\n--- Phase B: every per-loop verb against a LOADED loop ---")
+        print("    Phase A could only ever test the nothing-to-do path: an arm is")
+        print("    free to return a refusal and print its success. This is the")
+        print("    other side, and it is the column that matters.")
+
+        def reestablish():
+            """Put the scratch loop back to one closed layer, quietly."""
+            rig.send(f"{args.loop}c")
+            time.sleep(0.4)
+            rig.send(f"{args.loop}r")
+            time.sleep(2.5)
+            rig.send(f"{args.loop}r")
+            time.sleep(0.6)
+
+        reestablish()
         snap = rig.snapshot(0.3)
         lp = loop_of(snap, args.loop)
-        print(f"    recorded {lp['loopSecs']:.2f}s, {lp['layers']} layer(s)")
-        results += run(skipped, probe, scratch=args.loop)
-        print("    clearing the scratch loop")
-        probe.send(f"{args.loop}c")
+        print(f"    baseline: {lp['loopSecs']:.2f}s, {lp['layers']} layer(s)\n")
+
+        # Before **every** verb, not only the destructive ones. The first
+        # version re-established only ahead of `DISTURBS`, and `f` — which is
+        # not in that set — ran straight after `c` and duly reported the loop
+        # empty. A verb tested on the wreckage of the one before it is not
+        # tested on a loaded loop, whatever the phase is called.
+        for label, suffix, _ in PER_LOOP:
+            reestablish()
+            probe.seq = rig.snapshot(0.3)["ackSeq"]
+            text = f"{args.loop}{suffix}"
+            ack, _ = probe.send(text)
+            loaded[suffix] = ack
+            results.append((label + " (loaded)", text, ack))
+            print(f"  {'ack ' if ack else 'SILENT'}  {text:<10} {label:<16} {ack or ''}")
+
+        print("\n    clearing the scratch loop")
+        rig.send(f"{args.loop}c")
+        time.sleep(0.4)
     else:
         print("\n--- Phase B skipped (no --with-audio) ---")
         print("    These need material, and one of them writes files:")
