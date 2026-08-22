@@ -12,6 +12,10 @@
 module Foreign.LooperSocket
   ( LooperState
   , LoopState
+  , LoopPhase(..)
+  , phaseOf
+  , phaseName
+  , allPhases
   , isWriting
   , LayerShape
   , SocketStatus
@@ -28,6 +32,92 @@ import Prelude
 import Data.Maybe (Maybe)
 import Data.Nullable (Nullable, toMaybe)
 import Effect (Effect)
+
+-- | Which of the six things a loop can be doing.
+-- |
+-- | **The daemon has an enum; the wire has a string; we had neither.** The
+-- | snapshot carries `state` as text, and until now every consumer matched it
+-- | against bare literals — five modules, twenty-odd string comparisons, and no
+-- | single place saying what the alternatives were. So a missed case was not a
+-- | type error, it was a wrong colour on a slot, and that is precisely how a
+-- | loop came to be *actively recording and drawn as empty* for a whole
+-- | session: `Slots` kept its own list of writing states, `Machine` kept a
+-- | different one, and nothing could have told them apart.
+-- |
+-- | The set is closed and it is closed *at the source*: `state_name` in
+-- | `itajara/src/engine.rs` matches on the engine's own state constants and can
+-- | return exactly these six words. This type mirrors that function, and if one
+-- | changes the other must — the same contract `LooperState` already has with
+-- | `snapshot` in `ws.rs`.
+data LoopPhase
+  -- | Waiting for a sound rather than for a foot. Empty by definition: this is
+  -- | what a loop is while it waits to stop being empty.
+  = Armed
+  -- | The three ways the input is open. `RecordingFirst` is laying material
+  -- | into an empty loop; `Overdubbing` is another pass over what is there;
+  -- | `Multiplying` is extending the length as it goes.
+  | RecordingFirst
+  | Overdubbing
+  | Multiplying
+  -- | Turning. Note this says nothing about being *audible* — `muted`,
+  -- | `skipping` and `chance` are all orthogonal flags, which is why the
+  -- | display asks them separately.
+  | Playing
+  -- | Nothing doing. Also where an unrecognised word lands — see `phaseOf`.
+  | Idle
+
+derive instance Eq LoopPhase
+derive instance Ord LoopPhase
+
+instance Show LoopPhase where
+  show = phaseName
+
+-- | The daemon's own word for a phase. The inverse of `phaseOf` on the six.
+-- |
+-- | Kept so the round trip can be tested against the strings the daemon really
+-- | sends, rather than against a second copy of this list written in the test.
+phaseName :: LoopPhase -> String
+phaseName = case _ of
+  Armed -> "armed"
+  RecordingFirst -> "recordingFirst"
+  Overdubbing -> "overdubbing"
+  Multiplying -> "multiplying"
+  Playing -> "playing"
+  Idle -> "idle"
+
+-- | Every phase, for tests and for anything that needs to enumerate them.
+allPhases :: Array LoopPhase
+allPhases = [ Armed, RecordingFirst, Overdubbing, Multiplying, Playing, Idle ]
+
+-- | The wire's word, as a phase.
+-- |
+-- | **Total, and unknown words become `Idle` rather than a seventh case.** That
+-- | is not a shrug — it is what the daemon itself does. `state_name` ends in
+-- | `_ => "idle"`, so an engine state this app has never heard of already
+-- | arrives called "idle"; adding an `Unknown String` constructor here would
+-- | re-open the very set that closing is the point of, and force every `case`
+-- | to carry a branch that can only be reached by a version skew that the
+-- | constructor would not fix anyway.
+-- |
+-- | The cost is that a genuinely new seventh state would be silently read as
+-- | idle. Three things guard that: the round-trip test over `allPhases`, the
+-- | note above telling whoever edits `state_name` to come here, and the
+-- | diagnostics readout in `Component.App`, which prints `state` raw — the one
+-- | place an unrecognised word is still visible after this function has run.
+-- |
+-- | Row-polymorphic because the snapshot carries `state` twice: once per loop,
+-- | and once at the top level where the flat legacy fields still describe
+-- | whichever loop is selected. Those flat fields are on their way out, and
+-- | taking the row rather than the record means this does not have to care
+-- | when they go.
+phaseOf :: forall r. { state :: String | r } -> LoopPhase
+phaseOf st = case st.state of
+  "armed" -> Armed
+  "recordingFirst" -> RecordingFirst
+  "overdubbing" -> Overdubbing
+  "multiplying" -> Multiplying
+  "playing" -> Playing
+  _ -> Idle
 
 -- | What the daemon says about itself. Mirrors `snapshot` in `itajara/src/ws.rs`
 -- | field for field; if one changes the other must.
@@ -181,9 +271,17 @@ type LoopState =
 -- | reports. Trusting a derived boolean over the state it was derived from is
 -- | how the two got out of step in the first place; the state is the thing the
 -- | engine actually switches on.
+-- |
+-- | Written as an exhaustive `case` rather than a chain of `||`, so that adding
+-- | a seventh phase makes the compiler ask whether it writes.
 isWriting :: LoopState -> Boolean
-isWriting st =
-  st.state == "recordingFirst" || st.state == "overdubbing" || st.state == "multiplying"
+isWriting st = case phaseOf st of
+  RecordingFirst -> true
+  Overdubbing -> true
+  Multiplying -> true
+  Armed -> false
+  Playing -> false
+  Idle -> false
 
 type LayerShape =
   { len :: Int
