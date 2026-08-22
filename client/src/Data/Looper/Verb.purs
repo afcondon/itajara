@@ -92,6 +92,12 @@ data Verb
   -- | daemon's default. The daemon returns where it put them, which is the
   -- | whole point of the command and the reason it answers on the ack rather
   -- | than on its own stdout.
+  -- |
+  -- | **Send this with `at`, never bare.** Unprefixed it saves the daemon's
+  -- | selected loop, and nothing on the six-loop surface writes that field — so
+  -- | it silently wrote loop 1 whatever the board was focused on, and said it
+  -- | had succeeded. True of every per-loop verb here; it is called out on this
+  -- | one because this is the one it actually happened to.
   | SaveTake String
 
   -- | Flip the metronome rather than setting it.
