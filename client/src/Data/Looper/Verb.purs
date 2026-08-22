@@ -18,6 +18,19 @@
 -- | So the vocabulary is a type, `render` is the only place a verb becomes text,
 -- | and the two tables now spell from the same book.
 -- |
+-- | ## Two tests, and only one of them is an oracle
+-- |
+-- | `test/Main.purs` pins every spelling — but against constants a human typed
+-- | while reading `engine.rs`. That catches an accidental edit to `render` and
+-- | nothing at all on the far side of the wire.
+-- |
+-- | `tools/check-verbs.py` is the other half: it reads **both** sources and
+-- | checks that every verb this module can render has an arm in `dispatch`. Run
+-- | it after touching either side. It found a mistake in this file's own
+-- | comments the first time it ran — `t` had been written off as unimplemented
+-- | because its arm is a char guard rather than a string match, and a grep for
+-- | `"t"` finds nothing.
+-- |
 -- | ## The grammar, which is the daemon's and not ours
 -- |
 -- | `dispatch` in `itajara/src/engine.rs` accepts three shapes, and this type has
@@ -80,13 +93,21 @@ data Verb
   | Clear
   -- | Fire a one-shot: one pass, rather than turning for ever.
   | Fire
-  -- | Claim what just happened, from the daemon's pre-roll ring.
+  -- | Claim what just happened, from the daemon's pre-roll ring — the one thing
+  -- | no pedal can do, since it needs sixty seconds of input kept whether
+  -- | anything was recording or not.
   -- |
-  -- | **Not implemented by the daemon.** The ring is written on every input
-  -- | frame and `ring_at` can read it back, but `dispatch` has no arm for `t` —
-  -- | so this returns `unknown command "t"` on the ack path. Kept because the
-  -- | surface offers it and the engine is half-built for it, not because it
-  -- | works.
+  -- | Takes seconds; the daemon defaults to 8 when the argument is absent or
+  -- | unreadable, and we send nothing, so this is `t` and means eight seconds.
+  -- | Carried as a constructor without a payload until there is a control for
+  -- | the duration, rather than hard-coding 8 here and pretending it was
+  -- | chosen.
+  -- |
+  -- | Its arm in `dispatch` is a **char guard** — `l if l.starts_with('t')` —
+  -- | not a string match, which is worth knowing: a grep for `"t"` in engine.rs
+  -- | finds nothing and reads exactly like an unimplemented verb. It is not.
+  -- | What is true is that `take` reports only to stdout and returns unit, so a
+  -- | successful claim is silent on the ack path.
   | ClaimPast
   -- | Write the loop's layers out as WAV files, under this name; empty takes the
   -- | daemon's default. The daemon returns where it put them, which is the
