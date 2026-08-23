@@ -119,8 +119,13 @@ class Probe:
         self.seq = snap["ackSeq"]
 
     def send(self, text, settle=0.35):
+        # **With the lateness suffix, because the app never sends anything
+        # without one.** `Component.App.runAction` appends `@<ms>` to every
+        # command; a harness sending the bare form is testing a wire format
+        # nothing in this repo produces. `@0` is what a click in the board
+        # simulator sends, a footswitch sends the real measurement.
         before = self.seq
-        self.rig.send(text)
+        self.rig.send(text + "@0")
         deadline = time.time() + 1.2
         while time.time() < deadline:
             snap = self.rig.snapshot(settle)
@@ -175,10 +180,20 @@ def preflight(rig, scratch):
     return snap
 
 
-def run(rows, probe, scratch=None, phase=""):
-    """Send each row; return (label, sent, ack-or-None)."""
+def run(rows, probe, scratch=None, reset=None):
+    """Send each row; return (label, sent, ack-or-None).
+
+    `reset` runs before every verb. It is not optional decoration: without it
+    the loop carries whatever the previous verb left, so `r` opens a recording
+    and the `x` after it is answering "finish this recording first" rather than
+    anything about an empty loop. Two runs then disagree, which is how this was
+    noticed — 40/18 one time and 39/19 the next, from the same script.
+    """
     out = []
     for label, suffix in rows:
+        if reset:
+            reset()
+            probe.seq = probe.rig.snapshot(0.3)["ackSeq"]
         text = f"{scratch}{suffix}" if scratch is not None else suffix
         ack, _ = probe.send(text)
         out.append((label, text, ack))
@@ -202,8 +217,13 @@ def main():
     print("\n--- Phase A: every verb against an empty loop ---")
     print("    (a refusal is an ack and is the expected answer for most of these)")
     print("    NB `r` starts a take on the scratch loop; it is cleared below.")
+
+    def empty():
+        rig.send(f"{args.loop}c")
+        time.sleep(0.35)
+
     rows = [(lbl, sfx) for lbl, sfx, needs in PER_LOOP if not needs]
-    results += run(rows, probe, scratch=args.loop)
+    results += run(rows, probe, scratch=args.loop, reset=empty)
     # `r` opened the input on the scratch loop and `c` appears in the list above,
     # so this is usually a no-op — usually is not a guarantee, and leaving a loop
     # listening because the ordering changed is exactly the trap Stop All used to
