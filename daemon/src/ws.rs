@@ -86,6 +86,21 @@ fn talk(
     loop {
         match ws.read() {
             Ok(tungstenite::Message::Text(cmd)) => {
+                // **Every command, before anything is decided about it.**
+                //
+                // The ack below is conditional — `dispatch` returns a string
+                // for some arms and `println!`s for others — so for fourteen
+                // verbs, the transport among them, a command used to arrive
+                // and leave no trace anywhere at all. Nothing outside this
+                // process could then answer "did the app send it, or did the
+                // app not send it": not the snapshot, not stdout, not the
+                // client. A press that did nothing and a press that never
+                // happened looked the same from every angle.
+                //
+                // So this is unconditional and comes first. It is the only
+                // place that knows a command arrived rather than what it
+                // meant, and that is exactly the fact worth keeping.
+                println!("  [cmd] {}", cmd.trim());
                 // On its own thread, because some commands block on purpose.
                 // Ending a multiply waits for the cycle boundary to arrive —
                 // up to half a cycle — and committing waits for the input to
