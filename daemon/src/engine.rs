@@ -3194,7 +3194,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             }
             "o" => println!("  {}", rotate(sh, li)),
             "d" => println!("  {}", dense(sh, li)),
-            "z" => println!("  {}", free_length(sh, li, sr)),
+            "z" => return free_length(sh, li, sr),
             // Returned rather than printed. This is the one command whose whole
             // point is *where* it put something, and a path printed on the
             // daemon's stdout is a path the app cannot show anyone — so the
@@ -3220,7 +3220,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             "u" => {
                 let n = lp.n_layers.load(Ordering::Acquire);
                 if n == 0 {
-                    println!("  nothing to undo.");
+                    return format!("loop {} has nothing to undo.", li);
                 } else {
                     lp.n_layers.store(n - 1, Ordering::Release);
                     // **Not zeroed.** Undo used to destroy the audio as well as
@@ -3241,13 +3241,15 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                         // the same grid — but a length with nothing in it looks
                         // exactly like a looper that has stopped listening.
                         let len = lp.loop_len.load(Ordering::Acquire);
-                        println!(
-                            "  layer 1 removed. Empty now, but still {:.3} s long, so the next \
-                             take lands on the same grid — `z` to forget the length.",
-                            len as f64 / sr as f64
+                        return format!(
+                            "loop {} layer 1 removed. Empty now, but still {:.3} s long, so the \
+                             next take lands on the same grid — `{}z` to forget the length.",
+                            li,
+                            len as f64 / sr as f64,
+                            li
                         );
                     } else {
-                        println!("  layer {} removed, {} left.", n, n - 1);
+                        return format!("loop {} layer {} removed, {} left.", li, n, n - 1);
                     }
                 }
             }
@@ -3571,7 +3573,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     _ => !sh.click.load(Ordering::Relaxed),
                 };
                 sh.click.store(on, Ordering::Relaxed);
-                println!("  click {}.", if on { "on" } else { "off" });
+                return format!("click {}.", if on { "on" } else { "off" });
             }
             "m" | "m1" | "m0" => {
                 let on = match line.trim() {
@@ -3580,8 +3582,8 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     _ => !sh.monitor.load(Ordering::Relaxed),
                 };
                 sh.monitor.store(on, Ordering::Relaxed);
-                println!(
-                    "  input monitoring {}.{}",
+                return format!(
+                    "input monitoring {}.{}",
                     if on { "on" } else { "off" },
                     if on {
                         "  (the interface's own direct monitoring is lower latency)"
