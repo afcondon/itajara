@@ -31,8 +31,67 @@
 // one that says it has lost the daemon, because only the second one can be
 // believed the rest of the time.
 
+// ## Where to dial is ASKED, not assumed
+//
+// The stall described above happens on an established connection through the
+// dev router's relay. Bosun's `broker` mode exists to get that relay out of the
+// path entirely — but a brokered port answers a WebSocket upgrade with a `307`
+// carrying the real address, and no WebSocket client follows a redirect. So the
+// address has to be resolved BEFORE the socket is opened, which is what
+// `resolveAddress` does.
+//
+// The good property is that the fleet's `serveMode` becomes the only switch,
+// with nothing to change here: under `proxy` Bosun answers with the registered
+// port and the relay stays in the path; under `broker` it answers with the
+// daemon's own port and the relay is gone. Re-resolved on every reconnect, so
+// flipping the fleet while the page is open is picked up rather than requiring
+// a reload.
+//
+// Every step falls back to the next, so the worst case — no router, no answer,
+// a timeout — is exactly the behaviour that existed before any of this.
+var CONTROL_PORT = 3997;
+var RESOLVE_TIMEOUT_MS = 1200;
+
+function resolveAddress(registered) {
+  // 1. An explicit `?looper=ws://…` wins outright: it is how you point the app
+  //    at a daemon you started by hand, and it must not be second-guessed.
+  try {
+    var override = new URLSearchParams(window.location.search).get("looper");
+    if (override) return Promise.resolve(override);
+  } catch (e) { /* no window/search — fall through */ }
+
+  var port;
+  try {
+    port = new URL(registered).port;
+  } catch (e) {
+    return Promise.resolve(registered);
+  }
+  if (!port) return Promise.resolve(registered);
+
+  // 2. Ask Bosun. `/where` also STARTS the service if it is down, so this
+  //    doubles as the thing that brings the daemon up on page load.
+  var ctl = new AbortController();
+  var timer = setTimeout(function () { ctl.abort(); }, RESOLVE_TIMEOUT_MS);
+  return fetch("http://127.0.0.1:" + CONTROL_PORT + "/where?port=" + port, { signal: ctl.signal })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (body) {
+      // Build the address from host+port rather than taking `at.url`: the
+      // locator's scheme describes the transport Bosun probed (`http`), and we
+      // want a WebSocket. Host and port are the facts; the scheme is ours.
+      if (!body || !body.at || !body.at.host || !body.at.port) return registered;
+      return "ws://" + body.at.host + ":" + body.at.port;
+    })
+    // 3. No router, refused, timed out, malformed — dial what we were given.
+    .catch(function () { return registered; })
+    .then(function (url) { clearTimeout(timer); return url; });
+}
+
 var state = {
   socket: null,
+  // The address we were REGISTERED with (the port in the fleet), kept apart
+  // from the address we actually dialled: a reconnect re-resolves from the
+  // first, and re-resolving from the second would pin us to a stale answer.
+  registered: null,
   url: null,
   latest: null,
   connected: false,
@@ -87,12 +146,22 @@ function startWatchdog() {
   }, 500);
 }
 
-function connect(url) {
-  state.url = url;
+function connect(registered) {
+  state.registered = registered;
   if (state.retry) {
     clearTimeout(state.retry);
     state.retry = null;
   }
+  resolveAddress(registered).then(function (url) {
+    // A connect that resolved while a later one was already in flight must not
+    // open a second socket behind it.
+    if (state.registered !== registered) return;
+    openSocket(url);
+  });
+}
+
+function openSocket(url) {
+  state.url = url;
   try {
     var ws = new WebSocket(url);
   } catch (e) {
@@ -129,6 +198,11 @@ function connect(url) {
   };
 
   ws.onclose = function () {
+    // Only if THIS socket is still the current one. Resolution made `connect`
+    // asynchronous, so a replaced socket's `onclose` can now arrive after its
+    // successor is already open — and un-guarded it would null out the live
+    // socket and schedule a retry on top of a working connection.
+    if (state.socket !== ws) return;
     state.connected = false;
     state.socket = null;
     state.latest = null;
@@ -140,13 +214,16 @@ function scheduleRetry() {
   if (state.retry) return;
   state.retry = setTimeout(function () {
     state.retry = null;
-    if (state.url) connect(state.url);
+    // Re-resolve, rather than redialling the address that just failed: the
+    // fleet may have flipped proxy↔broker underneath us, and a daemon that
+    // moved is exactly the case a reconnect should recover from.
+    if (state.registered) connect(state.registered);
   }, 2000);
 }
 
 export const connectImpl = function (url) {
   return function () {
-    if (state.socket && state.url === url) return;
+    if (state.socket && state.registered === url) return;
     if (state.socket) state.socket.close();
     connect(url);
   };

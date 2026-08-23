@@ -359,6 +359,13 @@ latest = toMaybe <$> latestImpl
 status :: Effect SocketStatus
 status = statusImpl
 
--- | The daemon binds loopback only, so this is not configurable by accident.
+-- | The daemon's REGISTERED address — the port the fleet knows it by, which is
+-- | not necessarily the port it is listening on. `connect` resolves this
+-- | through Bosun's `/where` before dialling (and re-resolves on every
+-- | reconnect), so under `serveMode: broker` the socket goes straight to the
+-- | daemon and the relay leaves the path without a line changing here. See the
+-- | header of `LooperSocket.js`; `?looper=ws://…` overrides the lot.
+-- |
+-- | Loopback only, either way: the daemon binds nothing else.
 defaultUrl :: String
 defaultUrl = "ws://127.0.0.1:3028"
