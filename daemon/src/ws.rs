@@ -277,12 +277,30 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
     // a loop and not what is in it: two takes of the same length look identical
     // when one of them plays one bar in four, and that is precisely the thing
     // the display exists to make visible.
+    // The SAME six fields as the per-loop shapes above, and it has to stay that
+    // way: both are read as one `LayerShape` type on the other side, coerced
+    // from JSON with nothing checking. Sending three here and six there did not
+    // fail politely — the app compares snapshots to decide whether to redraw,
+    // that comparison reads `env`, and PureScript's array equality opens with
+    // `xs.length`, so a missing field threw a TypeError ten times a second and
+    // froze the display while the socket, the commands and the audio all stayed
+    // healthy (2026-08-23). Two serialisers for one type is the whole bug; if
+    // this ever needs to diverge again, give it its own type on both sides.
     let shapes: Vec<String> = (0..cl.n_layers.load(Ordering::Acquire))
         .map(|l| {
             let (len, period, phase) = cl.layer_shape(l);
             format!(
-                r#"{{"len":{},"period":{},"phase":{}}}"#,
-                len, period, phase
+                r#"{{"len":{},"period":{},"phase":{},"tail":{},"gain":{:.5},"env":[{}]}}"#,
+                len,
+                period,
+                phase,
+                cl.layer_tail(l),
+                cl.layer_gain(l),
+                cl.layer_env(l)
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
             )
         })
         .collect();
