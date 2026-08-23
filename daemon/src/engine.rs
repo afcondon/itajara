@@ -2193,11 +2193,15 @@ fn supervise<F>(
 /// those milliseconds is already in the arena, and the loop simply ends
 /// earlier than the last frame recorded. Which is also why adding a double-tap
 /// to a switch stopped costing anything recorded.
-fn commit(sh: &Shared, li: usize, sr: u32, late: i64) {
+fn commit(sh: &Shared, li: usize, sr: u32, late: i64) -> String {
     let lp = sh.lp(li);
     let state = lp.state.get();
     if state != FIRST && state != OVERDUB {
-        return;
+        // The callers only reach here from FIRST or OVERDUB, so this is a guard
+        // rather than a path — but it answers anyway. Returning nothing is how
+        // fourteen verbs became invisible, and a guard is exactly the sort of
+        // thing that stops being unreachable without anyone noticing.
+        return format!("loop {} is not recording.", li);
     }
 
     // The frame the foot went down on. Taken before anything below sleeps —
@@ -2272,8 +2276,7 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) {
             want.min(reached)
         });
         if len == 0 {
-            println!("  nothing recorded.");
-            return;
+            return format!("loop {} recorded nothing.", li);
         }
         if late > 0 && quantised_len.is_none() && len < reached {
             println!(
@@ -2416,11 +2419,18 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) {
     if len > 0 {
         draw_layer(sh, li, layer, len, sr);
     }
-    println!(
-        "  committed. {} layer{} playing.",
+    // The length belongs in the ack even though the snapshot also carries it:
+    // this is the sentence that appears when the press lands, and "committed"
+    // on its own cannot be told apart from the previous "committed". The
+    // detail prints above stay on the console — they are several lines each and
+    // diagnostic rather than an outcome.
+    format!(
+        "loop {} committed: {:.3} s, {} layer{} playing.",
+        li,
+        len as f64 / sr as f64,
         layer + 1,
         if layer == 0 { "" } else { "s" }
-    );
+    )
 }
 
 /// What a layer actually contains, drawn.
@@ -2512,16 +2522,17 @@ fn fill_from_ring(
 /// afterwards. With no loop yet, `secs` of the past becomes the loop and sets
 /// the cycle. With a loop running, the last complete cycle becomes a new layer,
 /// landing on the existing grid because the fill is addressed in output frames.
-fn take(sh: &Shared, li: usize, sr: u32, secs: f64, late: i64) {
+fn take(sh: &Shared, li: usize, sr: u32, secs: f64, late: i64) -> String {
     let lp = sh.lp(li);
     if !sh.k_set.load(Ordering::Acquire) {
-        println!("  no input has arrived yet.");
-        return;
+        return "no input has arrived yet.".to_string();
     }
     let layer = lp.n_layers.load(Ordering::Acquire);
     if layer >= MAX_LAYERS {
-        println!("  {} layers is the ceiling; undo one first.", MAX_LAYERS);
-        return;
+        return format!(
+            "loop {} is at {} layers, the ceiling; undo one first.",
+            li, MAX_LAYERS
+        );
     }
 
     let loop_len = lp.loop_len.load(Ordering::Acquire);
@@ -2540,31 +2551,35 @@ fn take(sh: &Shared, li: usize, sr: u32, secs: f64, late: i64) {
         let origin = lp.origin.load(Ordering::Acquire);
         let done = (cur - origin).div_euclid(loop_len as i64);
         if done < 1 {
-            println!("  not one complete cycle has gone by yet.");
-            return;
+            return format!("loop {}: not one complete cycle has gone by yet.", li);
         }
         (origin + (done - 1) * loop_len as i64, loop_len, "layer")
     };
 
     if from_out < 0 {
-        println!("  that reaches back before the engine started.");
-        return;
+        return "that reaches back before the engine started.".to_string();
     }
 
     sh.zero_layer(li, layer);
     let got = fill_from_ring(sh, li, layer, from_out, len, 0, false);
     if got == 0 {
-        println!("  the pre-roll does not reach back that far.");
-        return;
+        return "the pre-roll does not reach back that far.".to_string();
     }
-    if got < len {
-        println!(
-            "  only {:.2} s of the {:.2} s asked for was still in the pre-roll.",
+    // A short take is not a failed one: it succeeded with less than was asked
+    // for. So this is a PREFIX to whatever the outcome turns out to be, not a
+    // branch of its own — the app has to be told both that it worked and that
+    // it is shorter than you meant, in one sentence.
+    let shortfall = if got < len {
+        format!(
+            "only {:.2} s of the {:.2} s asked for was still in the pre-roll — ",
             got as f64 / sr as f64,
             len as f64 / sr as f64
-        );
-    }
+        )
+    } else {
+        String::new()
+    };
 
+    let headline;
     if loop_len == 0 {
         lp.loop_len.store(len, Ordering::Release);
         // The first loop to acquire a length becomes the grid the rest
@@ -2574,15 +2589,16 @@ fn take(sh: &Shared, li: usize, sr: u32, secs: f64, late: i64) {
         sh.claim_anchor(li);
         lp.origin.store(from_out, Ordering::Release);
         lp.state.set(PLAYING);
-        println!(
-            "  took the last {:.3} s as the {}: {} frames, {:.1} bpm if that is one bar of 4/4",
+        headline = format!(
+            "loop {} took the last {:.3} s as the {}: {} frames, {:.1} bpm if that is one bar of 4/4",
+            li,
             len as f64 / sr as f64,
             what,
             len,
             240.0 / (len as f64 / sr as f64)
         );
     } else {
-        println!("  took the last complete cycle as a new {}.", what);
+        headline = format!("loop {} took the last complete cycle as a new {}.", li, what);
     }
     let taken = lp.n_layers.load(Ordering::Acquire);
     // The continuation comes from the ring too, so a claimed layer wraps as
@@ -2603,11 +2619,13 @@ fn take(sh: &Shared, li: usize, sr: u32, secs: f64, late: i64) {
     sh.rebuild_env(li, taken);
     lp.add_layer();
     draw_layer(sh, li, taken, lp.loop_len.load(Ordering::Acquire), sr);
-    println!(
-        "  {} layer{} playing.",
+    format!(
+        "{}{} — {} layer{} playing.",
+        shortfall,
+        headline.trim_end_matches('.'),
         taken + 1,
         if taken == 0 { "" } else { "s" }
-    );
+    )
 }
 
 /// Begin a multiply: keep the loop playing and start recording across it.
@@ -2620,16 +2638,17 @@ fn take(sh: &Shared, li: usize, sr: u32, secs: f64, late: i64) {
 /// The pre-roll holds that cycle already, so the part you have played of it is
 /// recovered rather than lost, and the multiply lands on the grid instead of
 /// wherever your foot happened to be. Pressing late is free.
-fn multiply_start(sh: &Shared, li: usize, sr: u32) {
+fn multiply_start(sh: &Shared, li: usize, sr: u32) -> String {
     let lp = sh.lp(li);
     let loop_len = lp.loop_len.load(Ordering::Acquire);
     if loop_len == 0 {
-        println!("  nothing to multiply — record a loop first.");
-        return;
+        return format!("loop {} has nothing to multiply — record a loop first.", li);
     }
     if lp.n_layers.load(Ordering::Acquire) >= MAX_LAYERS {
-        println!("  {} layers is the ceiling; undo one first.", MAX_LAYERS);
-        return;
+        return format!(
+            "loop {} is at {} layers, the ceiling; undo one first.",
+            li, MAX_LAYERS
+        );
     }
 
     let origin = lp.origin.load(Ordering::Acquire);
@@ -2646,18 +2665,26 @@ fn multiply_start(sh: &Shared, li: usize, sr: u32) {
     // The part of this cycle already played is in the pre-roll; claim it, so
     // the multiply really does begin on the boundary.
     let behind = (cur - from) as usize;
+    // One sentence, not three. At a console three lines read as a paragraph; in
+    // a single-line display the last one wins and the other two never existed.
+    // The instruction ("x again to end it") is the part worth keeping, because
+    // a multiply is the one gesture that is not finished when you let go.
     if behind > 0 {
         let got = fill_from_ring(sh, li, layer, from, behind, 0, false);
         lp.reached.fetch_max(got, Ordering::Relaxed);
-        println!(
-            "  multiplying from the start of this cycle — {:.2} s of it recovered \
-             from the pre-roll.",
+        format!(
+            "loop {} multiplying from the start of this cycle ({:.2} s recovered from \
+             the pre-roll) — play across as many cycles as you want, then x again.",
+            li,
             got as f64 / sr as f64
-        );
+        )
     } else {
-        println!("  multiplying from this cycle's start.");
+        format!(
+            "loop {} multiplying from this cycle's start — play across as many cycles \
+             as you want, then x again.",
+            li
+        )
     }
-    println!("  play across as many cycles as you want, then x again.");
 }
 
 /// End a multiply: round to whole cycles and grow the loop to fit.
@@ -2665,7 +2692,7 @@ fn multiply_start(sh: &Shared, li: usize, sr: u32) {
 /// Rounding rather than truncating, because at nine tenths of the way through
 /// the fourth cycle you meant four. Which means sometimes waiting for the
 /// boundary to arrive rather than cutting the loop short at the press.
-fn multiply_end(sh: &Shared, li: usize, sr: u32) {
+fn multiply_end(sh: &Shared, li: usize, sr: u32) -> String {
     let lp = sh.lp(li);
     let loop_len = lp.loop_len.load(Ordering::Acquire);
     let from = lp.rec_from.load(Ordering::Acquire);
@@ -2675,26 +2702,34 @@ fn multiply_end(sh: &Shared, li: usize, sr: u32) {
     let n = ((elapsed / loop_len as f64).round() as usize).max(1);
     let new_len = n * loop_len;
     if new_len > sh.max_frames {
-        println!(
-            "  {} cycles would be {:.1} s, past the --max-secs ceiling of {:.1} s. \
+        lp.state.set(PLAYING);
+        return format!(
+            "loop {}: {} cycles would be {:.1} s, past the --max-secs ceiling of {:.1} s. \
              Stopping at the old length.",
+            li,
             n,
             new_len as f64 / sr as f64,
             sh.max_frames as f64 / sr as f64
         );
-        lp.state.set(PLAYING);
-        return;
     }
 
     // If the rounding went up, the last cycle has not finished yet. Wait for it
     // rather than hand back a loop that is short by however late the press was.
     let target = from + new_len as i64;
-    if target > cur {
-        println!(
-            "  rounding up to {} cycles; waiting {:.2} s for the boundary.",
-            n,
+    // Said in the ACK rather than only here, and after the fact rather than
+    // before it: this call blocks until the boundary arrives, so a message sent
+    // now could not reach the app before the outcome does anyway. It matters
+    // because a press that appears to do nothing for half a cycle is exactly
+    // the kind of pause that gets pressed again.
+    let rounded = if target > cur {
+        format!(
+            " (rounded up, waited {:.2} s for the boundary)",
             (target - cur) as f64 / sr as f64
-        );
+        )
+    } else {
+        String::new()
+    };
+    if target > cur {
         while (sh.out_frames.load(Ordering::Acquire) as i64) < target {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -2715,13 +2750,6 @@ fn multiply_end(sh: &Shared, li: usize, sr: u32) {
     lp.origin.store(from, Ordering::Release);
     lp.loop_len.store(new_len, Ordering::Release);
 
-    println!(
-        "  x{}: loop is now {:.3} s ({} cycles of {:.3} s).",
-        n,
-        new_len as f64 / sr as f64,
-        n,
-        loop_len as f64 / sr as f64
-    );
     let layer = lp.n_layers.load(Ordering::Acquire);
     // A multiplied layer ends where the multiply ended; nothing follows it. Born
     // at zero because a multiply redefines the cycle, so every pass count on
@@ -2730,7 +2758,16 @@ fn multiply_end(sh: &Shared, li: usize, sr: u32) {
     sh.rebuild_env(li, layer);
     lp.add_layer();
     draw_layer(sh, li, layer, new_len, sr);
-    println!("  committed. {} layers playing.", layer + 1);
+    format!(
+        "loop {} x{}: now {:.3} s ({} cycles of {:.3} s){} — {} layers playing.",
+        li,
+        n,
+        new_len as f64 / sr as f64,
+        n,
+        loop_len as f64 / sr as f64,
+        rounded,
+        layer + 1
+    )
 }
 
 /// The other multiply: keep the layer one bar long and give it room.
@@ -2967,8 +3004,8 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
     {
         match rest {
             "x" => match lp.state.get() {
-                MULTIPLY => multiply_end(sh, li, sr),
-                FIRST | OVERDUB => println!("  finish this recording first."),
+                MULTIPLY => return multiply_end(sh, li, sr),
+                FIRST | OVERDUB => return format!("loop {} is still recording — finish that first.", li),
                 _ => {
                     if let Some(other) = busy_elsewhere(sh, li) {
                         return other;
@@ -2976,12 +3013,12 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     if let Some(no) = not_plain(lp, li) {
                         return no;
                     }
-                    multiply_start(sh, li, sr)
+                    return multiply_start(sh, li, sr);
                 }
             },
             "r" => match lp.state.get() {
-                MULTIPLY => multiply_end(sh, li, sr),
-                FIRST | OVERDUB => commit(sh, li, sr, late),
+                MULTIPLY => return multiply_end(sh, li, sr),
+                FIRST | OVERDUB => return commit(sh, li, sr, late),
                 // A second press while the loop is waiting for a sound takes the
                 // arm back. There has to be a way out: the sound may never come,
                 // and a loop holding the input for a recording that will never
@@ -3001,7 +3038,10 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     }
                     let layer = lp.n_layers.load(Ordering::Acquire);
                     if layer >= MAX_LAYERS {
-                        println!("  {} layers is the ceiling; undo one first.", MAX_LAYERS);
+                        return format!(
+                            "loop {} is at {} layers, the ceiling; undo one first.",
+                            li, MAX_LAYERS
+                        );
                     } else {
                         // An overdub sums into its layer, so anything left there
                         // from an undone take would bleed into the new one.
@@ -3062,7 +3102,17 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                             None => {
                                 lp.request_at.store(i64::MIN, Ordering::Release);
                                 lp.request.set(ARMED);
-                                println!("  recording...");
+                                // The press you make most often, and until now
+                                // the one that said least. Which layer matters:
+                                // "recording" on an empty loop and "recording"
+                                // onto layer 5 are different enough that a
+                                // display showing neither is the reason nobody
+                                // could tell an overdub had started.
+                                return if layer == 0 {
+                                    format!("loop {} recording.", li)
+                                } else {
+                                    format!("loop {} overdubbing onto layer {}.", li, layer + 1)
+                                };
                             }
                         }
                     }
@@ -3115,7 +3165,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             }
             l if l.starts_with('t') => {
                 let secs = l[1..].trim().parse::<f64>().unwrap_or(8.0);
-                take(sh, li, sr, secs, late);
+                return take(sh, li, sr, secs, late);
             }
             // **Above `s`, which prefix-matches.** `s` is sparse-multiply and
             // takes anything beginning with an s, so `sp0.5` read as "sparse,
@@ -3157,7 +3207,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 // beginning with an s into a multiply nobody asked for.
                 let arg = l[1..].trim();
                 match if arg.is_empty() { Ok(2) } else { arg.parse::<usize>() } {
-                    Ok(n) => println!("  {}", sparse(sh, li, sr, n)),
+                    Ok(n) => return sparse(sh, li, sr, n),
                     Err(_) => return format!("`{}` is not a command; `s` wants a count.", l),
                 }
             }
@@ -3192,8 +3242,8 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     ),
                 };
             }
-            "o" => println!("  {}", rotate(sh, li)),
-            "d" => println!("  {}", dense(sh, li)),
+            "o" => return rotate(sh, li),
+            "d" => return dense(sh, li),
             "z" => return free_length(sh, li, sr),
             // Returned rather than printed. This is the one command whose whole
             // point is *where* it put something, and a path printed on the
@@ -3560,7 +3610,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 }
                 sh.clear_env(li);
                 sh.release_anchor(li);
-                println!("  cleared.");
+                return format!("loop {} cleared.", li);
             }
             // `k` and `m` flip, which is right at a console and wrong over a
             // wire: a client that sets rather than flips drifts out of step the
