@@ -753,6 +753,45 @@ impl Loop {
         self.cfg_armed.store(false, Ordering::Relaxed);
     }
 
+    /// Everything a clear forgets about one loop.
+    ///
+    /// Lifted out of the `c` arm of `dispatch` because it had grown to twenty
+    /// lines in the middle of a very long match, and a list that long inside a
+    /// match arm is a list nothing can test. It was missing `quant`: measured
+    /// on the running daemon 2026-08-24, every other mode reset across a clear
+    /// and `grid` stayed lit, so a cleared slot silently waited for the next
+    /// bar before it began recording — a surprise you diagnose as a broken
+    /// footswitch rather than as a setting.
+    ///
+    /// The rule this encodes: **a cleared slot has nobody's habits.** A loop
+    /// that came back at half speed, backwards, hard left, firing once and
+    /// waiting for a sound would be a haunting, and the switch that cleared it
+    /// said nothing about any of that.
+    ///
+    /// Audio-side clearing — layer shapes, the envelope, the anchor — stays
+    /// with the caller, which is the only thing holding `Shared`.
+    fn cleared(&self) {
+        self.state.set(IDLE);
+        // An empty loop that is still silenced would refuse to record audibly
+        // for a reason nothing on screen could explain.
+        self.muted.store(false, Ordering::Relaxed);
+        self.plainly();
+        self.pan.store(64, Ordering::Relaxed);
+        self.one_shot.store(false, Ordering::Relaxed);
+        self.shot_end.store(i64::MIN, Ordering::Release);
+        self.level_arm.store(false, Ordering::Relaxed);
+        self.arm_from.store(i64::MIN, Ordering::Release);
+        self.quant.store(false, Ordering::Relaxed);
+        self.fade.store(0, Ordering::Relaxed);
+        self.decay.store(1.0f32.to_bits(), Ordering::Relaxed);
+        self.chance.store(1.0f32.to_bits(), Ordering::Relaxed);
+        self.chance_pass.store(i64::MIN, Ordering::Relaxed);
+        self.chance_sounds.store(true, Ordering::Relaxed);
+        self.n_layers.store(0, Ordering::Release);
+        self.redo_to.store(0, Ordering::Release);
+        self.loop_len.store(0, Ordering::Release);
+    }
+
     /// Ask for a speed and pendulum. Applied by the callback, at its own frame.
     fn want(&self, speed: f64, pend: bool) {
         self.cfg_speed.store(speed.to_bits(), Ordering::Relaxed);
@@ -3579,31 +3618,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 );
             }
             "c" => {
-                lp.state.set(IDLE);
-                // A cleared loop is an empty loop, and an empty loop that is
-                // still silenced would refuse to record audibly for a reason
-                // nothing on screen could explain.
-                lp.muted.store(false, Ordering::Relaxed);
-                // The resolutions go with the audio. A cleared loop that came
-                // back at half speed backwards and hard left would be a
-                // haunting.
-                lp.plainly();
-                lp.pan.store(64, Ordering::Relaxed);
-                // The modes go too. A cleared slot that still fired once and
-                // waited for a sound would be a loop with someone else's habits,
-                // and the switch that cleared it said nothing about either.
-                lp.one_shot.store(false, Ordering::Relaxed);
-                lp.shot_end.store(i64::MIN, Ordering::Release);
-                lp.level_arm.store(false, Ordering::Relaxed);
-                lp.arm_from.store(i64::MIN, Ordering::Release);
-                lp.fade.store(0, Ordering::Relaxed);
-                lp.decay.store(1.0f32.to_bits(), Ordering::Relaxed);
-                lp.chance.store(1.0f32.to_bits(), Ordering::Relaxed);
-                lp.chance_pass.store(i64::MIN, Ordering::Relaxed);
-                lp.chance_sounds.store(true, Ordering::Relaxed);
-                lp.n_layers.store(0, Ordering::Release);
-                lp.redo_to.store(0, Ordering::Release);
-                lp.loop_len.store(0, Ordering::Release);
+                lp.cleared();
                 for l in 0..MAX_LAYERS {
                     sh.zero_layer(li, l);
                     lp.set_layer_shape(l, Shape { len: 0, tail: 0, born: 0 });
@@ -4197,6 +4212,46 @@ mod tests {
         assert!(lp.plain());
         assert_eq!(lp.speed(), 1.0);
         assert!(!lp.pendulum.load(Ordering::Relaxed));
+    }
+
+    /// A cleared slot has nobody's habits.
+    ///
+    /// Written after `quant` was found surviving a clear on the running daemon
+    /// (2026-08-24) — every other mode reset and `grid` stayed lit, so a cleared
+    /// slot silently waited for the next bar before recording. The list is
+    /// exhaustive on purpose: the previous version of this test checked three
+    /// fields, and the field it did not check was the one that was wrong.
+    #[test]
+    fn a_cleared_slot_has_nobody_s_habits() {
+        let lp = at_origin();
+
+        // Turn on everything a player can turn on.
+        lp.adopt(0, LEN, -0.5, true);
+        lp.muted.store(true, Ordering::Relaxed);
+        lp.pan.store(100, Ordering::Relaxed);
+        lp.one_shot.store(true, Ordering::Relaxed);
+        lp.level_arm.store(true, Ordering::Relaxed);
+        lp.quant.store(true, Ordering::Relaxed);
+        lp.fade.store(250, Ordering::Relaxed);
+        lp.decay.store(0.5f32.to_bits(), Ordering::Relaxed);
+        lp.chance.store(0.5f32.to_bits(), Ordering::Relaxed);
+        lp.n_layers.store(3, Ordering::Release);
+        lp.loop_len.store(LEN, Ordering::Release);
+
+        lp.cleared();
+
+        assert_eq!(lp.speed(), 1.0, "speed");
+        assert!(!lp.pendulum.load(Ordering::Relaxed), "pendulum");
+        assert!(!lp.muted.load(Ordering::Relaxed), "muted");
+        assert_eq!(lp.pan.load(Ordering::Relaxed), 64, "pan");
+        assert!(!lp.one_shot.load(Ordering::Relaxed), "one shot");
+        assert!(!lp.level_arm.load(Ordering::Relaxed), "level arm");
+        assert!(!lp.quant.load(Ordering::Relaxed), "quantise");
+        assert_eq!(lp.fade.load(Ordering::Relaxed), 0, "fade");
+        assert_eq!(f32::from_bits(lp.decay.load(Ordering::Relaxed)), 1.0, "decay");
+        assert_eq!(f32::from_bits(lp.chance.load(Ordering::Relaxed)), 1.0, "chance");
+        assert_eq!(lp.n_layers.load(Ordering::Acquire), 0, "layers");
+        assert_eq!(lp.loop_len.load(Ordering::Acquire), 0, "length");
     }
 
     /// How long one pass lasts, which is the only number a one-shot needs and
