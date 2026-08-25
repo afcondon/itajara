@@ -183,6 +183,13 @@ data Verb
   -- | instrument, not any one loop, which is the daemon's own reasoning and the
   -- | same shape as `Click` and `Monitor`.
   | ArmLevel Number
+  -- | Thread an empty tape of this many seconds: a loop with a length and one
+  -- | silent layer, going round, ready to be played onto.
+  -- |
+  -- | **The only way a loop gets a length without being recorded.** Refused when
+  -- | the loop has anything in it — resizing a loop with material in it would be
+  -- | a trim, which this engine does not have.
+  | Blank Number
   -- | What a Revox pass leaves of what was under it, in decibels; 0 to -60.
   | Feedback Number
   -- | This loop's own level, in decibels; `0.0` is unity and `-60.0` is
@@ -243,6 +250,7 @@ render = case _ of
   Fade n -> "xf" <> show n
   Decay n -> "dec" <> show n
   ArmLevel n -> "arm" <> show n
+  Blank n -> "blank" <> show n
   Feedback n -> "fb" <> show n
   Level n -> "vol" <> show n
   Chance n -> "ch" <> show n

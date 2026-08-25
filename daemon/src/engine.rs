@@ -637,6 +637,19 @@ pub struct Loop {
     /// hidden: **undo goes away**, because there is nothing kept to go back to.
     /// Entering flattens the loop to one layer — a tape has no layers — and
     /// leaving does not unflatten it.
+    /// Whether this loop's one layer is a **threaded empty tape** — a length
+    /// with nothing played onto it yet.
+    ///
+    /// The distinction `n_layers` cannot make. A threaded tape has one layer so
+    /// that it *plays* (see `blank`), which makes it indistinguishable from a
+    /// recorded loop by layer count alone — and that made the length knob a
+    /// one-shot: the first turn threaded eight seconds and every turn after was
+    /// refused as "there is something in it". There is not. Adjusting the length
+    /// of a tape you have not played onto is exactly how you choose a length.
+    ///
+    /// Cleared the moment anything is recorded, which is the moment resizing
+    /// would become a trim.
+    pub threaded: AtomicBool,
     pub revox: AtomicBool,
     /// What a Revox pass leaves of what was under it, as a linear gain. `1.0`
     /// is a tape that never erases; `0.0` is one that replaces.
@@ -704,6 +717,7 @@ impl Loop {
             decay: AtomicU32::new(1.0f32.to_bits()),
             vol: AtomicU32::new(1.0f32.to_bits()),
             rec_env: (0..ENV_BUCKETS).map(|_| AtomicU8::new(0)).collect(),
+            threaded: AtomicBool::new(false),
             revox: AtomicBool::new(false),
             fb: AtomicU32::new(10f32.powf(-3.0 / 20.0).to_bits()),
             chance: AtomicU32::new(1.0f32.to_bits()),
@@ -885,6 +899,7 @@ impl Loop {
         // like the other settings that describe how you work rather than what
         // is in the loop.
         self.revox.store(false, Ordering::Relaxed);
+        self.threaded.store(false, Ordering::Relaxed);
         self.plainly();
         self.pan.store(64, Ordering::Relaxed);
         self.one_shot.store(false, Ordering::Relaxed);
@@ -1973,6 +1988,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                                     lp.origin.store(stamp, Ordering::Release);
                                     lp.rec_from.store(stamp, Ordering::Release);
                                     lp.clear_rec_env();
+                                    lp.threaded.store(false, Ordering::Relaxed);
                                     lp.state.set(FIRST);
                                 } else {
                                     // An overdub is modular against the existing
@@ -1981,6 +1997,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                                     lp.rec_from
                                         .store(lp.origin.load(Ordering::Acquire), Ordering::Release);
                                     lp.clear_rec_env();
+                                    lp.threaded.store(false, Ordering::Relaxed);
                                     lp.state.set(OVERDUB);
                                 }
                             }
@@ -3622,6 +3639,81 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // Forward, then back. Doubles the cycle, which is the point: a
             // pendulum that fitted into one cycle would be a different effect
             // wearing the name.
+            // **An empty tape of a stated length.**
+            //
+            // Every other way a loop gets its length is by *recording* one: a
+            // first take defines the cycle, a multiply extends it. A tape does
+            // not work that way — you thread a loop of a chosen length and
+            // then play onto it — so Revox needs a way to say "eight seconds,
+            // empty, going round" before anything has been played.
+            //
+            // **One silent layer, not none.** Playback sums `0..n_layers` and
+            // the layer being recorded sits *at* `n_layers`, so a loop with no
+            // layers is silent even while something is being written into it.
+            // In Revox that would matter: `erase_add` writes into layer zero,
+            // which is exactly the layer that has to be playing for the tape to
+            // come round under your hands.
+            //
+            // Refused rather than applied when the loop has anything in it. It
+            // is a way of *starting*, and quietly resizing a loop with material
+            // in it would be a trim — a thing this engine does not have and
+            // should not grow by accident.
+            _ if rest.starts_with("blank") => {
+                let arg = rest[5..].trim();
+                let secs = match arg.parse::<f64>() {
+                    Ok(v) if v > 0.0 => v,
+                    Ok(_) => return format!("a tape wants a length in seconds, not {}.", arg),
+                    _ => return format!("a tape wants a length in seconds, not `{}`.", arg),
+                };
+                if lp.is_recording() {
+                    return format!("loop {} is recording; finish that first.", li);
+                }
+                // **Threaded, not recorded** is the test — not the layer count,
+                // which cannot tell them apart because a threaded tape has one
+                // layer in order to play at all.
+                if lp.n_layers.load(Ordering::Acquire) > 0
+                    && !lp.threaded.load(Ordering::Relaxed)
+                {
+                    return format!(
+                        "loop {} has something in it; clear it before threading a tape.",
+                        li
+                    );
+                }
+                let mut len = (secs * sr as f64).round() as usize;
+                if len > sh.max_frames {
+                    return format!(
+                        "{:.1} s is past --max-secs; the longest tape here is {:.1} s.",
+                        secs,
+                        sh.max_frames as f64 / sr as f64
+                    );
+                }
+                // The grid rounds it, because only the engine knows where the
+                // grid is — and a tape that does not line up with the anchor
+                // loop is a tape that drifts against everything else.
+                let mut said = String::new();
+                if lp.quant.load(Ordering::Relaxed) {
+                    if let Some((_, glen)) = sh.grid() {
+                        let n = ((len as f64 / glen as f64).round() as usize).max(1);
+                        len = n * glen;
+                        said = format!(" ({} grid cycle{})", n, if n == 1 { "" } else { "s" });
+                    }
+                }
+                let now = sh.out_frames.load(Ordering::Acquire) as i64;
+                sh.zero_layer(li, 0);
+                lp.origin.store(now, Ordering::Release);
+                lp.loop_len.store(len, Ordering::Release);
+                lp.set_layer_shape(0, Shape { len, tail: 0, born: 0 });
+                lp.n_layers.store(1, Ordering::Release);
+                lp.threaded.store(true, Ordering::Relaxed);
+                lp.state.set(PLAYING);
+                sh.rebuild_env(li, 0);
+                return format!(
+                    "loop {} is an empty {:.3} s tape{}, going round.",
+                    li,
+                    len as f64 / sr as f64,
+                    said
+                );
+            }
             // **Revox mode: the loop becomes a tape.**
             //
             // Entering flattens what is there to one layer, because a tape has
