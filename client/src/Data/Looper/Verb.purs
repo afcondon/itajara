@@ -121,16 +121,6 @@ data Verb
   -- | one because this is the one it actually happened to.
   | SaveTake String
 
-  -- | Flip the metronome rather than setting it.
-  -- |
-  -- | **The one toggling form still sent**, and it contradicts the rule stated
-  -- | at the top of this module. It survives because `Data.Looper.Machine.act`
-  -- | is given `Rig`, which carries the loops and the focus and not the global
-  -- | flags — so there is nothing there to compute `Click (not current)` from.
-  -- | Harmless today only because the app also mirrors the daemon's reported
-  -- | `click` back on every poll, so a dropped command is corrected within
-  -- | 33 ms. `Click` is the form to prefer wherever the current value is known.
-  | ClickToggle
 
   -- | Audible, or silenced but still turning. `Sounding false` is `h0`.
   -- |
@@ -147,20 +137,62 @@ data Verb
   | LevelArm Boolean
   -- | The metronome, and input monitoring. Global rather than per-loop in the
   -- | engine, but addressed the same way.
+  -- |
+  -- | **There was a `ClickToggle` here until 2026-08-25**, rendering the bare
+  -- | flipping `k`, and it carried a paragraph excusing itself: the machine was
+  -- | given a `Rig` that held the loops and the focus and not the global flags,
+  -- | so there was nothing to compute `Click (not current)` from. `Rig` carries
+  -- | them now. The excuse expired and the constructor went with it, which is
+  -- | the rule at the top of this module doing its job: what the app does not
+  -- | send is not constructible.
   | Click Boolean
   | Monitor Boolean
 
-  -- | Loop frames per output frame, as a percentage: `100` is unity.
+  -- | Loop frames per output frame, as a **multiplier**: `1.0` is unity.
+  -- |
+  -- | The daemon takes 0.125 to 4 either sign, and the sign is the direction —
+  -- | so `Rate (-2.0)` is twice speed backwards and `Reversed` is the same fact
+  -- | said the other way. Refused rather than clamped outside that range,
+  -- | because below an eighth the interpolation is audibly a filter and above
+  -- | four the aliasing is the loudest thing in the sound.
+  -- |
+  -- | **This said "as a percentage: 100 is unity" until 2026-08-25**, which no
+  -- | caller ever believed — the Speed bank has always sent `Rate 0.25`. A
+  -- | comment that disagrees with every call site is worse than none, because
+  -- | the next surface is written from the comment.
   | Rate Number
   -- | Where it sits in the stereo field, 0-127, 64 centre.
   | Place Int
   -- | How much of the wrap is crossfaded with the layer's continuation, in
-  -- | milliseconds. Zero is a hard join.
+  -- | milliseconds. Zero is a hard join, and half a second is the ceiling —
+  -- | past that it is not a join, it is a different effect.
   | Fade Number
   -- | How much a pass costs the material already there, in decibels. Zero holds
-  -- | for ever.
+  -- | for ever; -60 is the floor. Positive is refused by the daemon rather than
+  -- | clamped, because feedback above unity is not a longer decay, it is a loop
+  -- | that gets louder until it clips.
   | Decay Number
-  -- | How often a pass sounds, as a percentage. `100` is always.
+  -- | The level a sound has to reach before a level-armed loop starts, in
+  -- | decibels; 0 to -80.
+  -- |
+  -- | **Rig-wide, so it goes unprefixed** — it describes the room and the
+  -- | instrument, not any one loop, which is the daemon's own reasoning and the
+  -- | same shape as `Click` and `Monitor`.
+  | ArmLevel Number
+  -- | This loop's own level, in decibels; `0.0` is unity and `-60.0` is
+  -- | silence. Above unity is refused rather than clamped, like `Decay`.
+  -- |
+  -- | **The engine had no level until 2026-08-25**, and the reason it managed
+  -- | without one is worth keeping: a looper whose loops are either in or out
+  -- | needs no faders, because mute says everything. What changed is a
+  -- | controller with a knob per loop — and the first thing a hand does with a
+  -- | knob is set how loud something is.
+  | Level Number
+  -- | How often a pass sounds, as a **probability**. `1.0` is always.
+  -- |
+  -- | Zero to one, and refused outside it. Same correction as `Rate` above and
+  -- | on the same day: this claimed percentages while `chanceLadder` has always
+  -- | held 1.0, 0.75, 0.5.
   | Chance Number
 
 derive instance Eq Verb
@@ -187,7 +219,6 @@ render = case _ of
   Fire -> "f"
   ClaimPast -> "t"
   SaveTake name -> "w" <> name
-  ClickToggle -> "k"
 
   Sounding on -> flag "h" on
   OnGrid on -> flag "g" on
@@ -202,6 +233,8 @@ render = case _ of
   Place n -> "pan" <> show n
   Fade n -> "xf" <> show n
   Decay n -> "dec" <> show n
+  ArmLevel n -> "arm" <> show n
+  Level n -> "vol" <> show n
   Chance n -> "ch" <> show n
 
 -- | The explicit form of a flag, never the bare toggling form. See the note on

@@ -29,7 +29,13 @@
 //! startup, so no callback ever touches the allocator.
 //!
 //! The price is a fixed ceiling on loop length and layer count, which is what
-//! `--max-secs` and `MAX_LAYERS` are. At the defaults the arena is 46 MB.
+//! `--max-secs` and `MAX_LAYERS` are. At the defaults — eight loops, eight
+//! layers, thirty seconds, 48 kHz — the arena is 351 MiB.
+//!
+//! **This said 46 MB until 2026-08-25**, which was true of some earlier set of
+//! defaults and of nothing since; the figure beside `N_LOOPS` was right and
+//! this one had simply never been recomputed. Both are now derived from the
+//! same arithmetic in the comment on that constant.
 
 use cpal::traits::{DeviceTrait, StreamTrait};
 use std::error::Error;
@@ -225,6 +231,19 @@ fn decay_words(lp: &Loop) -> String {
     format!("loses {:.0} dB a pass", -20.0 * d.max(1e-9).log10())
 }
 
+/// A loop's level as the board says it. Silence is a word, not a number:
+/// "-inf dB" is a thing a meter says, not a thing a person does.
+fn vol_words(lp: &Loop) -> String {
+    let g = f32::from_bits(lp.vol.load(Ordering::Relaxed));
+    if g <= 0.0 {
+        return "is turned all the way down".into();
+    }
+    if g >= 1.0 {
+        return "plays at full level".into();
+    }
+    format!("plays {:.1} dB down", -20.0 * g.max(1e-9).log10())
+}
+
 /// The wrap fade as the board says it.
 fn fade_words(lp: &Loop, sr: u32) -> String {
     match lp.fade.load(Ordering::Relaxed) {
@@ -287,12 +306,22 @@ pub fn default_takes_dir() -> PathBuf {
 /// Everything both callbacks and the control thread touch.
 /// How many loops the engine holds.
 ///
-/// Six, because the MC6 has six main switches and the whole design rests on one
-/// switch owning one loop. The cost is linear and paid at startup: the arena is
-/// `N_LOOPS × MAX_LAYERS × max_secs`, so six loops of eight layers at the
-/// default thirty seconds is 259 MB, allocated once and never touched by the
-/// allocator again.
-pub const N_LOOPS: usize = 6;
+/// **Eight since 2026-08-25, and it was six for the MC6's sake.** The original
+/// reason was that the pedal has six main switches and the design rests on one
+/// switch owning one loop. That reasoning inverted when the web page became the
+/// reference surface and the Midifighter Twister a second controller: the loop
+/// count comes from the instrument, and the foot reaches what it can. Eight
+/// fills the top two rows of the Twister's 4×4, and loops 7 and 8 are simply
+/// not on the pedal. See `docs/DESIGN-TWISTER.md` §5.
+///
+/// Nothing on the wire changed: `dispatch` picks the loop from a single leading
+/// digit, so 0–7 still fits.
+///
+/// The cost is linear and paid at startup: the arena is
+/// `N_LOOPS × MAX_LAYERS × max_secs × 4 bytes`, so eight loops of eight layers
+/// at the default thirty seconds and 48 kHz is **351 MiB**, up from 263. It is
+/// allocated once and never touched by the allocator again.
+pub const N_LOOPS: usize = 8;
 
 /// One loop: its layers, its cycle, and where it stands in it.
 ///
@@ -360,7 +389,7 @@ pub struct Loop {
     l_phase: Vec<AtomicUsize>,
     /// The output frame at which this loop's position zero sits.
     ///
-    /// Per loop, which is what lets six loops of different lengths run at once
+    /// Per loop, which is what lets eight loops of different lengths run at once
     /// without any of them being the master. Whether they *should* be free of
     /// each other is a musical question, and the answer is a quantisation
     /// policy applied when a loop closes — not a shared origin, which would
@@ -370,7 +399,7 @@ pub struct Loop {
     ///
     /// **Phase-locked, deliberately.** The playhead keeps advancing while a loop
     /// is stopped, so bringing it back is not "start again" but "become audible
-    /// again, where you would have been". With six loops that is the only
+    /// again, where you would have been". With eight loops that is the only
     /// behaviour worth having: a loop that restarted from its own zero would
     /// come back out of phase with everything it was recorded against.
     ///
@@ -552,6 +581,22 @@ pub struct Loop {
     /// scaled in the arena — so a loop that has faded to nothing is still all
     /// there, and turning decay off brings it back.
     pub decay: AtomicU32,
+    /// This loop's own level, as a linear gain. `1.0` is unity, which is where
+    /// every loop starts.
+    ///
+    /// **Added 2026-08-25, and the engine went without it for a reason that
+    /// stopped being true.** A looper whose loops are either in or out needs no
+    /// faders: mute says everything. What changed is the Twister — eight loops
+    /// with a knob each, and the first thing a hand does with a knob is set how
+    /// loud something is. `chance` was standing in for it and is not a level;
+    /// it is a gate on whole passes.
+    ///
+    /// A resolution at playback like speed, pan and decay: nothing is scaled in
+    /// the arena, so turning a loop down and back up loses nothing.
+    ///
+    /// Multiplied into the pan gains once per buffer, so it costs nothing in
+    /// the frame loop.
+    pub vol: AtomicU32,
     /// How often a pass sounds, as a probability. `1.0` is always.
     ///
     /// A gate on the mix and nothing else — the playhead keeps turning, `origin`
@@ -606,6 +651,7 @@ impl Loop {
             arm_from: AtomicI64::new(i64::MIN),
             fade: AtomicUsize::new(0),
             decay: AtomicU32::new(1.0f32.to_bits()),
+            vol: AtomicU32::new(1.0f32.to_bits()),
             chance: AtomicU32::new(1.0f32.to_bits()),
             chance_pass: AtomicI64::new(i64::MIN),
             chance_sounds: AtomicBool::new(true),
@@ -775,6 +821,12 @@ impl Loop {
         // An empty loop that is still silenced would refuse to record audibly
         // for a reason nothing on screen could explain.
         self.muted.store(false, Ordering::Relaxed);
+        // And for the same reason, at full level. A cleared slot sitting at
+        // -58 dB is silenced by a different mechanism and looks identical from
+        // outside — which is exactly how it was found: a loop recorded happily
+        // into a cleared slot and made no sound, and `Clear All` did not fix it
+        // because clearing was the thing that had failed to reset it.
+        self.vol.store(1.0f32.to_bits(), Ordering::Relaxed);
         self.plainly();
         self.pan.store(64, Ordering::Relaxed);
         self.one_shot.store(false, Ordering::Relaxed);
@@ -858,6 +910,14 @@ impl Loop {
     }
     pub fn layer_gain(&self, layer: usize) -> f32 {
         f32::from_bits(self.l_gain[layer].load(Ordering::Relaxed))
+    }
+
+    /// The pass this layer was laid on. Reported so a quiet layer can say why
+    /// it is quiet: `gain` alone shows that it has receded and not how far back
+    /// it started, and the difference between "born three passes ago" and "born
+    /// with the loop" is the whole of what per-layer decay means.
+    pub fn layer_born(&self, layer: usize) -> i64 {
+        self.l_born[layer].load(Ordering::Relaxed)
     }
     /// Recompute every layer's decay gain for the buffer starting at
     /// `out_frame`. Called once a buffer from the output callback, which is the
@@ -995,7 +1055,7 @@ pub struct Shared {
     /// no such memory to spare and so must be told to record *before* the good
     /// bit happens. Here the good bit can be claimed afterwards.
     ///
-    /// One ring for all six loops, because there is one input. Which loop a
+    /// One ring for every loop, because there is one input. Which loop a
     /// retroactive take lands in is a decision made when `t` is pressed, not
     /// something the capture has to anticipate.
     ring: Vec<AtomicU32>,
@@ -1172,7 +1232,7 @@ impl Shared {
     /// the bar falls, and aligning to a boundary needs both — so until the
     /// frame-to-wall-clock join lands, the grid the engine can honestly offer
     /// is another loop's cycle. That is also the grid that matters most here:
-    /// six loops agreeing with each other is the point, and agreeing with
+    /// the loops agreeing with each other is the point, and agreeing with
     /// Ableton is a bonus.
     pub fn grid(&self) -> Option<(i64, usize)> {
         let a = self.anchor.load(Ordering::Acquire);
@@ -1853,7 +1913,14 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                 // trig calls is free here and wasteful inside the frame loop.
                 let mut gains = [(0.0f32, 0.0f32); N_LOOPS];
                 for li in 0..N_LOOPS {
-                    gains[li] = sh.lp(li).pan_gains();
+                    let lp = sh.lp(li);
+                    // Level folded into the pan gains rather than applied in
+                    // the frame loop: it is a per-buffer constant like the pan
+                    // itself, and one multiply here is eight thousand fewer
+                    // down there.
+                    let v = f32::from_bits(lp.vol.load(Ordering::Relaxed));
+                    let (l, r) = lp.pan_gains();
+                    gains[li] = (l * v, r * v);
                 }
 
                 for f in 0..frames {
@@ -3579,6 +3646,33 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     _ => return format!("the arm level wants a number of dBFS, not `{}`.", arg),
                 }
             }
+            // This loop's level, in decibels, with **silence at the bottom
+            // rather than a very quiet loop**. A fader that cannot reach zero
+            // is a fader you do not trust, and -60 dB is inaudible anyway —
+            // saying "silent" is more honest than reporting a number nobody can
+            // hear.
+            //
+            // Above unity is refused rather than clamped, for the same reason
+            // decay refuses positive: a level control that quietly declined to
+            // do what it was told would be worse than one that says no.
+            _ if rest.starts_with("vol") => {
+                let arg = rest[3..].trim();
+                if arg.is_empty() {
+                    return format!("loop {} {}.", li, vol_words(lp));
+                }
+                match arg.parse::<f32>() {
+                    Ok(db) if db > 0.0 => {
+                        return format!("a loop plays at unity or below; {} dB would clip.", db)
+                    }
+                    Ok(db) if db >= -60.0 => {
+                        let g = if db <= -60.0 { 0.0 } else { 10f32.powf(db / 20.0) };
+                        lp.vol.store(g.to_bits(), Ordering::Relaxed);
+                        return format!("loop {} {}.", li, vol_words(lp));
+                    }
+                    Ok(db) => return format!("level wants 0 to -60 dB, not {}.", db),
+                    _ => return format!("level wants decibels, not `{}`.", arg),
+                }
+            }
             _ if rest.starts_with("pan") => {
                 match rest[3..].parse::<usize>() {
                     Ok(v) if v <= 127 => {
@@ -4235,6 +4329,7 @@ mod tests {
         lp.fade.store(250, Ordering::Relaxed);
         lp.decay.store(0.5f32.to_bits(), Ordering::Relaxed);
         lp.chance.store(0.5f32.to_bits(), Ordering::Relaxed);
+        lp.vol.store(0.001f32.to_bits(), Ordering::Relaxed);
         lp.n_layers.store(3, Ordering::Release);
         lp.loop_len.store(LEN, Ordering::Release);
 
@@ -4250,6 +4345,7 @@ mod tests {
         assert_eq!(lp.fade.load(Ordering::Relaxed), 0, "fade");
         assert_eq!(f32::from_bits(lp.decay.load(Ordering::Relaxed)), 1.0, "decay");
         assert_eq!(f32::from_bits(lp.chance.load(Ordering::Relaxed)), 1.0, "chance");
+        assert_eq!(f32::from_bits(lp.vol.load(Ordering::Relaxed)), 1.0, "level");
         assert_eq!(lp.n_layers.load(Ordering::Acquire), 0, "layers");
         assert_eq!(lp.loop_len.load(Ordering::Acquire), 0, "length");
     }

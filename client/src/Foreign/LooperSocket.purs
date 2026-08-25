@@ -134,6 +134,11 @@ type LooperState =
   , outDb :: Number
   , click :: Boolean
   , monitor :: Boolean
+  -- | The level a sound has to reach before a level-armed loop starts, in
+  -- | decibels. Rig-wide — it describes the room and the instrument, not any
+  -- | one loop — and reported since 2026-08-25 because a control that sets it
+  -- | needs to be able to show it.
+  , armDb :: Number
   , armed :: Boolean
   , recording :: Boolean
   , calibrated :: Boolean
@@ -244,6 +249,13 @@ type LoopState =
   -- | milliseconds; zero is a hard join. In milliseconds rather than frames so
   -- | the display never needs the sample rate to say what a switch did.
   , fadeMs :: Number
+  -- | This loop's level, in decibels; zero is unity and -60 is silence.
+  -- |
+  -- | **The floor is the floor, not negative infinity.** A silent loop reports
+  -- | -60 because that is a number a knob can be put at and JSON can carry, and
+  -- | because -60 dB is inaudible anyway — the distinction between "off" and
+  -- | "sixty down" is not one anybody can hear.
+  , volDb :: Number
   -- | How much a pass costs the material already there, in decibels; zero holds
   -- | for ever. The parameter that separates Frippertronics from song looping,
   -- | and the reason a loop can now have a shape it was not given.
@@ -297,6 +309,16 @@ type LayerShape =
   -- | the only way the display can show a loop receding, since nothing in the
   -- | arena changes.
   , gain :: Number
+  -- | The pass this layer was laid on, counted from the loop's origin.
+  -- |
+  -- | Reported so that a quiet layer can say *why* it is quiet. `gain` shows
+  -- | that a layer has receded and not how far back it started, and the
+  -- | difference between "born three passes ago" and "born with the loop" is
+  -- | the whole of what per-layer decay means — it is also the only way to tell
+  -- | a decay that is working from one that is labelling new material with an
+  -- | old age, which is exactly the question that could not be answered from
+  -- | outside when it was asked (2026-08-25).
+  , born :: Int
   -- | The layer's shape, as peaks 0-255 across its own length.
   -- |
   -- | **Absolute and logarithmic, never normalised per layer.** The picture is

@@ -182,12 +182,13 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                     // could be made from. Reported so the display can say a
                     // loop has it rather than leaving it invisible.
                     format!(
-                        r#"{{"len":{},"period":{},"phase":{},"tail":{},"gain":{:.5},"env":[{}]}}"#,
+                        r#"{{"len":{},"period":{},"phase":{},"tail":{},"gain":{:.5},"born":{},"env":[{}]}}"#,
                         slen,
                         period,
                         phase,
                         lp.layer_tail(l),
                         lp.layer_gain(l),
+                        lp.layer_born(l),
                         // Forty-eight bytes, and only for layers that exist —
                         // small enough to ride here rather than needing a
                         // message of its own, a request to trigger it, and a
@@ -207,7 +208,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                     r#""recording":{},"quant":{},"muted":{},"reverse":{},"pan":{},"#,
                     r#""speed":{:.4},"pendulum":{},"oneShot":{},"levelArm":{},"#,
                     r#""firing":{},"chance":{:.4},"skipping":{},"fadeMs":{:.1},"decayDb":{:.2},"#,
-                    r#""pendingAt":{},"shapes":[{}]}}"#
+                    r#""volDb":{:.2},"pendingAt":{},"shapes":[{}]}}"#
                 ),
                 li,
                 lp.state_name(),
@@ -253,6 +254,17 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                     let d = lp.decay_of();
                     if d >= 1.0 { 0.0 } else { 20.0 * (d.max(1e-9) as f64).log10() }
                 },
+                // This loop's level, in decibels, unity at zero. **Silence is
+                // reported as the floor rather than as negative infinity**,
+                // which is not a number JSON has and not a number a knob can be
+                // put at — the client's own scale bottoms out at -60 and reads
+                // that as off.
+                {
+                    let g = f32::from_bits(lp.vol.load(Ordering::Relaxed));
+                    if g >= 1.0 { 0.0 }
+                    else if g <= 0.0 { -60.0 }
+                    else { 20.0 * (g.max(1e-9) as f64).log10() }
+                },
                 // Frames until a scheduled transition fires, or -1 for nothing
                 // pending. A display that can show "starts in 1.4 s" is the
                 // difference between a deliberate wait and a dead button.
@@ -290,12 +302,13 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
         .map(|l| {
             let (len, period, phase) = cl.layer_shape(l);
             format!(
-                r#"{{"len":{},"period":{},"phase":{},"tail":{},"gain":{:.5},"env":[{}]}}"#,
+                r#"{{"len":{},"period":{},"phase":{},"tail":{},"gain":{:.5},"born":{},"env":[{}]}}"#,
                 len,
                 period,
                 phase,
                 cl.layer_tail(l),
                 cl.layer_gain(l),
+                cl.layer_born(l),
                 cl.layer_env(l)
                     .iter()
                     .map(|v| v.to_string())
@@ -317,7 +330,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
         concat!(
             r#"{{"state":"{}","layers":{},"maxLayers":{},"loopFrames":{},"#,
             r#""loopSecs":{:.4},"pos":{},"phase":{:.5},"sampleRate":{},"#,
-            r#""inDb":{:.1},"outDb":{:.1},"click":{},"monitor":{},"#,
+            r#""inDb":{:.1},"outDb":{:.1},"click":{},"monitor":{},"armDb":{:.1},"#,
             r#""armed":{},"recording":{},"calibrated":{},"k":{},"#,
             r#""audioAlive":{},"deviceLost":{},"reopens":{},"shapes":[{}],"#,
             r#""ack":"{}","ackSeq":{},"linkTempo":{:.4},"linkQuantum":{:.4},"#,
@@ -336,6 +349,16 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
         db(out_peak),
         sh.click.load(Ordering::Relaxed),
         sh.monitor.load(Ordering::Relaxed),
+        // The level a sound has to reach to start a level-armed loop, in
+        // decibels. Rig-wide, like the click — it describes the room and the
+        // instrument, not any one loop.
+        //
+        // Reported because it is on a knob now, and a knob that holds a value
+        // nothing can read back is a knob that can only be wrong.
+        {
+            let m = f32::from_bits(sh.arm_thresh.load(Ordering::Relaxed));
+            if m <= 0.0 { -80.0 } else { (20.0 * (m.max(1e-9) as f64).log10()).max(-80.0) }
+        },
         cl.is_armed(),
         cl.is_recording(),
         sh.k_set.load(Ordering::Acquire),
