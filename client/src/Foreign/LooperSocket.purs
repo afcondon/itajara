@@ -256,6 +256,26 @@ type LoopState =
   -- | because -60 dB is inaudible anyway — the distinction between "off" and
   -- | "sixty down" is not one anybody can hear.
   , volDb :: Number
+  -- | Whether this loop is a **tape**: an overdub writes over what is there
+  -- | rather than beside it, and undo is gone.
+  -- |
+  -- | Reported because it changes what every other control means, and a mode
+  -- | you cannot see is a mode you will be surprised by.
+  , revox :: Boolean
+  -- | What a Revox pass leaves of what was under it, in decibels. Zero leaves
+  -- | everything, -60 replaces it.
+  -- |
+  -- | Its own number rather than `decayDb`: the same musical idea by two
+  -- | mechanisms, one destroying and one not.
+  , fbDb :: Number
+  -- | The picture of the take **being recorded right now**, on the same scale
+  -- | as a layer's `env`, and **empty whenever nothing is recording**.
+  -- |
+  -- | One test for the display rather than working the state out for itself,
+  -- | and a finished take stops being drawn twice the instant it becomes a
+  -- | layer. Written from the audio callback into atomics, since the layer
+  -- | envelopes live behind a mutex a callback must not touch.
+  , recEnv :: Array Int
   -- | How much a pass costs the material already there, in decibels; zero holds
   -- | for ever. The parameter that separates Frippertronics from song looping,
   -- | and the reason a loop can now have a shape it was not given.

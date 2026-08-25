@@ -130,6 +130,10 @@ data Verb
   -- | starting, and rounds its length to a whole number of those.
   | OnGrid Boolean
   | Reversed Boolean
+  -- | Make this loop a tape, or stop. **Entering flattens it to one layer and
+  -- | that is not reversible** — `Revox false` stops the erasing and does not
+  -- | unfold what was folded.
+  | Revox Boolean
   | Pendulum Boolean
   -- | One pass per trigger rather than turning for ever.
   | OneShot Boolean
@@ -179,6 +183,8 @@ data Verb
   -- | instrument, not any one loop, which is the daemon's own reasoning and the
   -- | same shape as `Click` and `Monitor`.
   | ArmLevel Number
+  -- | What a Revox pass leaves of what was under it, in decibels; 0 to -60.
+  | Feedback Number
   -- | This loop's own level, in decibels; `0.0` is unity and `-60.0` is
   -- | silence. Above unity is refused rather than clamped, like `Decay`.
   -- |
@@ -223,6 +229,9 @@ render = case _ of
   Sounding on -> flag "h" on
   OnGrid on -> flag "g" on
   Reversed on -> flag "rev" on
+  -- `rvx`, not `rev`: reverse got there first and a prefix collision on the
+  -- wire is a command that silently means something else.
+  Revox on -> flag "rvx" on
   Pendulum on -> flag "pend" on
   OneShot on -> flag "one" on
   LevelArm on -> flag "lev" on
@@ -234,6 +243,7 @@ render = case _ of
   Fade n -> "xf" <> show n
   Decay n -> "dec" <> show n
   ArmLevel n -> "arm" <> show n
+  Feedback n -> "fb" <> show n
   Level n -> "vol" <> show n
   Chance n -> "ch" <> show n
 

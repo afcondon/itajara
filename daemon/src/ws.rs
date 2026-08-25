@@ -208,7 +208,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                     r#""recording":{},"quant":{},"muted":{},"reverse":{},"pan":{},"#,
                     r#""speed":{:.4},"pendulum":{},"oneShot":{},"levelArm":{},"#,
                     r#""firing":{},"chance":{:.4},"skipping":{},"fadeMs":{:.1},"decayDb":{:.2},"#,
-                    r#""volDb":{:.2},"pendingAt":{},"shapes":[{}]}}"#
+                    r#""volDb":{:.2},"revox":{},"fbDb":{:.2},"pendingAt":{},"recEnv":[{}],"shapes":[{}]}}"#
                 ),
                 li,
                 lp.state_name(),
@@ -268,7 +268,32 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                 // Frames until a scheduled transition fires, or -1 for nothing
                 // pending. A display that can show "starts in 1.4 s" is the
                 // difference between a deliberate wait and a dead button.
+                // Whether this loop is a tape, and what a pass over it leaves.
+                // Reported because it changes what every other control means —
+                // undo is gone, an overdub makes no layer — and a mode you
+                // cannot see is a mode you will be surprised by.
+                lp.revox.load(Ordering::Relaxed),
+                {
+                    let g = f32::from_bits(lp.fb.load(Ordering::Relaxed));
+                    if g >= 1.0 { 0.0 }
+                    else if g <= 0.0 { -60.0 }
+                    else { 20.0 * (g.max(1e-9) as f64).log10() }
+                },
                 lp.pending_in(cur),
+                // **The take in hand, drawn while it is being played.** Empty
+                // whenever nothing is recording, so the display has one test
+                // rather than having to work the state out for itself — and so
+                // a finished take stops being drawn twice the instant it
+                // becomes a layer.
+                if lp.is_recording() {
+                    lp.rec_env_bytes()
+                        .iter()
+                        .map(|b| b.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                } else {
+                    String::new()
+                },
                 shapes.join(","),
             )
         })

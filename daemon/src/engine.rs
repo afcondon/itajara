@@ -41,7 +41,7 @@ use cpal::traits::{DeviceTrait, StreamTrait};
 use std::error::Error;
 use std::io::BufRead;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -242,6 +242,18 @@ fn vol_words(lp: &Loop) -> String {
         return "plays at full level".into();
     }
     format!("plays {:.1} dB down", -20.0 * g.max(1e-9).log10())
+}
+
+/// The Revox feedback as the board says it.
+fn fb_words(lp: &Loop) -> String {
+    let g = f32::from_bits(lp.fb.load(Ordering::Relaxed));
+    if g <= 0.0 {
+        return "nothing".into();
+    }
+    if g >= 1.0 {
+        return "everything".into();
+    }
+    format!("{:.0} dB down", -20.0 * g.max(1e-9).log10())
 }
 
 /// The wrap fade as the board says it.
@@ -597,6 +609,45 @@ pub struct Loop {
     /// Multiplied into the pan gains once per buffer, so it costs nothing in
     /// the frame loop.
     pub vol: AtomicU32,
+    /// The envelope of the recording **that is happening right now**, as
+    /// `ENV_BUCKETS` bytes on the same absolute -60 dBFS scale as the committed
+    /// ones.
+    ///
+    /// **Atomics rather than the `env` mutex**, because this is written from the
+    /// audio callback and that one is not. `rebuild_env` runs on the command
+    /// path at commit and can afford a lock; a live picture cannot, and a
+    /// callback that blocks on a mutex is a callback that eventually misses a
+    /// buffer.
+    ///
+    /// Empty of meaning while nothing is recording — cleared when a recording
+    /// starts rather than when it ends, so what you see is always the take in
+    /// hand and never the last one.
+    pub rec_env: Vec<AtomicU8>,
+    /// **Revox mode: the loop is a tape, and an overdub writes over it.**
+    ///
+    /// Everywhere else in this engine a pass is non-destructive — layers are
+    /// kept whole and `decay` is a *resolution* applied at playback, which is
+    /// why turning decay off brings a faded loop back. That is the right
+    /// default and it is not what a tape does. Two Revoxes with the second one
+    /// feeding back below unity erase as they record: what is under the head
+    /// comes back quieter each time round, and there is no version of it that
+    /// was not erased.
+    ///
+    /// So this is a mode you opt into, and the price is stated rather than
+    /// hidden: **undo goes away**, because there is nothing kept to go back to.
+    /// Entering flattens the loop to one layer — a tape has no layers — and
+    /// leaving does not unflatten it.
+    pub revox: AtomicBool,
+    /// What a Revox pass leaves of what was under it, as a linear gain. `1.0`
+    /// is a tape that never erases; `0.0` is one that replaces.
+    ///
+    /// **Its own value rather than `decay`'s**, deliberately. They are the same
+    /// musical idea by two mechanisms — one destroys and one does not — and a
+    /// single number meaning "resolution here, erase-head there" depending on a
+    /// flag is the kind of overload this codebase spends whole comments
+    /// regretting. `dec` still works in Revox mode and still does what it always
+    /// did.
+    pub fb: AtomicU32,
     /// How often a pass sounds, as a probability. `1.0` is always.
     ///
     /// A gate on the mix and nothing else — the playhead keeps turning, `origin`
@@ -652,6 +703,9 @@ impl Loop {
             fade: AtomicUsize::new(0),
             decay: AtomicU32::new(1.0f32.to_bits()),
             vol: AtomicU32::new(1.0f32.to_bits()),
+            rec_env: (0..ENV_BUCKETS).map(|_| AtomicU8::new(0)).collect(),
+            revox: AtomicBool::new(false),
+            fb: AtomicU32::new(10f32.powf(-3.0 / 20.0).to_bits()),
             chance: AtomicU32::new(1.0f32.to_bits()),
             chance_pass: AtomicI64::new(i64::MIN),
             chance_sounds: AtomicBool::new(true),
@@ -827,6 +881,10 @@ impl Loop {
         // into a cleared slot and made no sound, and `Clear All` did not fix it
         // because clearing was the thing that had failed to reset it.
         self.vol.store(1.0f32.to_bits(), Ordering::Relaxed);
+        // A cleared slot is not still a tape. The feedback amount survives,
+        // like the other settings that describe how you work rather than what
+        // is in the loop.
+        self.revox.store(false, Ordering::Relaxed);
         self.plainly();
         self.pan.store(64, Ordering::Relaxed);
         self.one_shot.store(false, Ordering::Relaxed);
@@ -902,6 +960,29 @@ impl Loop {
     /// What this layer is currently worth, after however many passes it has
     /// lived through. One for every layer of a loop that is not decaying.
     /// This layer's envelope, or empty when it has none yet.
+    /// Forget the live picture. Called when a recording *starts*.
+    pub fn clear_rec_env(&self) {
+        for b in self.rec_env.iter() {
+            b.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// The live picture, or empty when nothing is being recorded — which the
+    /// caller decides, because only it knows the state.
+    pub fn rec_env_bytes(&self) -> Vec<u8> {
+        self.rec_env.iter().map(|b| b.load(Ordering::Relaxed)).collect()
+    }
+
+    /// Raise one bucket to a peak. `fetch_max` rather than a store: a bucket
+    /// spans hundreds of frames and the loudest of them is the one worth
+    /// drawing, which is the same thing `rebuild_env` does with a `max` over a
+    /// range.
+    pub fn mark_rec_env(&self, bucket: usize, peak: f32) {
+        if let Some(b) = self.rec_env.get(bucket) {
+            b.fetch_max(to_byte(peak), Ordering::Relaxed);
+        }
+    }
+
     pub fn layer_env(&self, layer: usize) -> Vec<u8> {
         self.env
             .lock()
@@ -1309,6 +1390,19 @@ impl Shared {
         let cur = f32::from_bits(c.load(Ordering::Relaxed));
         c.store((cur + v).to_bits(), Ordering::Relaxed)
     }
+    /// The Revox write: what was here comes back quieter, and the input goes on
+    /// top of it.
+    ///
+    /// **The one place in this engine that destroys stored audio**, and it is
+    /// reached only from a mode you asked for. `add` sums into a fresh layer and
+    /// leaves everything underneath exactly as recorded; this reads, attenuates
+    /// and writes back to the same cell, so the pass before is gone. That is
+    /// what an erase head does and it is the whole of what makes the sound.
+    fn erase_add(&self, li: usize, layer: usize, pos: usize, v: f32, fb: f32) {
+        let c = self.cell(li, layer, pos);
+        let cur = f32::from_bits(c.load(Ordering::Relaxed));
+        c.store((cur * fb + v).to_bits(), Ordering::Relaxed)
+    }
     /// The captured sample for an input frame, if the ring still holds it.
     fn ring_at(&self, in_frame: i64) -> Option<f32> {
         if in_frame < 0 {
@@ -1430,6 +1524,44 @@ impl Shared {
         if let Ok(mut e) = lp.env.lock() {
             e[layer] = out;
         }
+    }
+
+    /// Fold every layer into one, at the gains they are being heard at.
+    ///
+    /// **A tape has no layers**, which is the whole of why entering Revox does
+    /// this. Leaving them stacked and writing over layer zero would erase one
+    /// voice of several and leave the rest untouched — a mode that only half
+    /// applies, which is worse than either.
+    ///
+    /// Folded at each layer's *current* decay gain, so what you hear the instant
+    /// before is what you hear the instant after. That does mean decay stops
+    /// being undoable for the material folded in: it has been resolved into the
+    /// tape. Said out loud on the verb, because it is the moment a loop stops
+    /// being recoverable.
+    fn flatten(&self, li: usize, at: i64) {
+        let lp = self.lp(li);
+        let n = lp.n_layers.load(Ordering::Acquire);
+        let len = lp.loop_len.load(Ordering::Acquire);
+        if len == 0 || n == 0 {
+            return;
+        }
+        if n > 1 {
+            for p in 0..len {
+                let mut v = 0.0f32;
+                for l in 0..n {
+                    v += self.read(li, l, p) * lp.layer_gain(l);
+                }
+                self.write(li, 0, p, v);
+            }
+            for l in 1..n {
+                self.zero_layer(li, l);
+                lp.set_layer_shape(l, Shape { len: 0, tail: 0, born: 0 });
+            }
+        }
+        // Born now: the tape is one age, and the age it is starts here.
+        lp.set_layer_shape(0, Shape { len, tail: 0, born: lp.pass_index(at, len) });
+        lp.n_layers.store(1, Ordering::Release);
+        self.rebuild_env(li, 0);
     }
 
     /// Forget every envelope on a loop, for when its audio goes.
@@ -1840,6 +1972,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                                     // sides move together.
                                     lp.origin.store(stamp, Ordering::Release);
                                     lp.rec_from.store(stamp, Ordering::Release);
+                                    lp.clear_rec_env();
                                     lp.state.set(FIRST);
                                 } else {
                                     // An overdub is modular against the existing
@@ -1847,6 +1980,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                                     // the loop plays from.
                                     lp.rec_from
                                         .store(lp.origin.load(Ordering::Acquire), Ordering::Release);
+                                    lp.clear_rec_env();
                                     lp.state.set(OVERDUB);
                                 }
                             }
@@ -2070,7 +2204,9 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                 let origin = lp.rec_from.load(Ordering::Acquire);
                 let loop_len = lp.loop_len.load(Ordering::Acquire);
                 let layer = lp.n_layers.load(Ordering::Acquire);
-                if layer >= MAX_LAYERS {
+                let revox = lp.revox.load(Ordering::Relaxed);
+                let fb = f32::from_bits(lp.fb.load(Ordering::Relaxed));
+                if layer >= MAX_LAYERS && !revox {
                     sh.in_frames.store(base + frames, Ordering::Release);
                     return;
                 }
@@ -2094,6 +2230,13 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                         sh.write(li, layer, pos, v);
                         lp.reached.fetch_max(pos + 1, Ordering::Relaxed);
                         lp.rec_reached.fetch_max(out_frame + 1, Ordering::Relaxed);
+                        // **A first take has no length yet**, so its picture
+                        // cannot be laid out against one. It is drawn against
+                        // the arena instead and rescales itself when the loop
+                        // closes — which is what a tape counter does, and it
+                        // means the bar fills left to right as you play rather
+                        // than sitting empty until you stop.
+                        lp.mark_rec_env(pos * ENV_BUCKETS / sh.max_frames, v.abs());
                     } else {
                         // Modular: an overdub may go round as many times as it
                         // likes, summing into the same cycle.
@@ -2101,9 +2244,24 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                             continue;
                         }
                         let pos = (rel % loop_len as i64) as usize;
-                        sh.add(li, layer, pos, v);
+                        // **Revox writes over the tape; everything else writes
+                        // beside it.** In Revox mode there is one layer by
+                        // construction and the overdub goes into *that*, not
+                        // into a new one — which is why `layer` is zero here and
+                        // why the loop does not grow a layer per pass.
+                        if revox {
+                            sh.erase_add(li, 0, pos, v, fb);
+                        } else {
+                            sh.add(li, layer, pos, v);
+                        }
                         lp.reached.fetch_max(loop_len, Ordering::Relaxed);
                         lp.rec_reached.fetch_max(out_frame + 1, Ordering::Relaxed);
+                        // An overdub already knows the cycle it is going round,
+                        // so its picture is laid out against that and fills in
+                        // wherever the playhead is — including on the second and
+                        // third time round, which is why this is a peak and not
+                        // a store.
+                        lp.mark_rec_env(pos * ENV_BUCKETS / loop_len, v.abs());
                     }
                 }
                 sh.in_frames.store(base + frames, Ordering::Release);
@@ -2517,6 +2675,21 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) -> String {
 
     let layer = lp.n_layers.load(Ordering::Acquire);
     let len = lp.loop_len.load(Ordering::Acquire);
+
+    // **A Revox pass makes no layer.** It went over the tape, so what changed
+    // is layer zero and there is nothing new to shape or to count. The picture
+    // has to be redrawn because the audio under it moved, which is the one
+    // thing this branch still owes.
+    if lp.revox.load(Ordering::Relaxed) {
+        lp.state.set(PLAYING);
+        sh.rebuild_env(li, 0);
+        return format!(
+            "loop {} over the tape: {:.3} s, one layer.",
+            li,
+            len as f64 / sr as f64
+        );
+    }
+
     // Born on the pass it was committed on, which is when it starts existing as
     // something to be heard — and so when it starts getting older.
     lp.set_layer_shape(layer, Shape { len, tail, born: lp.pass_index(closed_at, len) });
@@ -3449,6 +3622,69 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // Forward, then back. Doubles the cycle, which is the point: a
             // pendulum that fitted into one cycle would be a different effect
             // wearing the name.
+            // **Revox mode: the loop becomes a tape.**
+            //
+            // Entering flattens what is there to one layer, because a tape has
+            // no layers and a mode that only half applied would be worse than
+            // either. That is not reversible — `rvx0` stops the erasing but
+            // does not unfold what was folded — and the ack says so, because a
+            // player is entitled to know which of their presses was the one
+            // that could not be taken back.
+            "rvx" | "rvx1" | "rvx0" => {
+                let on = match rest {
+                    "rvx1" => true,
+                    "rvx0" => false,
+                    _ => !lp.revox.load(Ordering::Relaxed),
+                };
+                if lp.is_recording() {
+                    return format!("loop {} is recording; finish that first.", li);
+                }
+                let was = lp.n_layers.load(Ordering::Acquire);
+                lp.revox.store(on, Ordering::Relaxed);
+                if on {
+                    sh.flatten(li, sh.out_frames.load(Ordering::Acquire) as i64);
+                    let now = lp.n_layers.load(Ordering::Acquire);
+                    return format!(
+                        "loop {} is a tape now, {} a pass{}. Undo is gone.",
+                        li,
+                        fb_words(lp),
+                        if was > now {
+                            format!(" ({} layers folded into one)", was)
+                        } else {
+                            String::new()
+                        }
+                    );
+                }
+                return format!("loop {} records in layers again; it is still one layer.", li);
+            }
+            // What a Revox pass leaves of what was under it, in decibels. Zero
+            // is a tape that never erases and -60 is one that replaces.
+            //
+            // Its own number rather than `dec`'s: they are the same musical idea
+            // by two mechanisms, one destroying and one not, and a single value
+            // meaning "resolution here, erase head there" depending on a flag is
+            // exactly the overload this engine keeps refusing.
+            _ if rest.starts_with("fb") => {
+                let arg = rest[2..].trim();
+                if arg.is_empty() {
+                    return format!("a Revox pass on loop {} leaves {} a pass.", li, fb_words(lp));
+                }
+                match arg.parse::<f32>() {
+                    Ok(db) if db > 0.0 => {
+                        return format!(
+                            "feedback is a loss, so it wants zero or less; {} would run away.",
+                            db
+                        )
+                    }
+                    Ok(db) if db >= -60.0 => {
+                        let g = if db <= -60.0 { 0.0 } else { 10f32.powf(db / 20.0) };
+                        lp.fb.store(g.to_bits(), Ordering::Relaxed);
+                        return format!("a Revox pass on loop {} leaves {} a pass.", li, fb_words(lp));
+                    }
+                    Ok(db) => return format!("feedback wants 0 to -60 dB, not {}.", db),
+                    _ => return format!("feedback wants decibels, not `{}`.", arg),
+                }
+            }
             "pend" | "pend1" | "pend0" => {
                 let want = match rest {
                     "pend1" => true,
