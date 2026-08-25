@@ -67,6 +67,86 @@ def theirs():
     return words
 
 
+def dispatch_body():
+    """`dispatch`'s body with its comments blanked out.
+
+    **Blanked rather than removed**, so every byte keeps its offset and the arms
+    stay in the order the file has them.
+
+    Comments have to go because this file explains itself at length, and the
+    explanations quote the code. The first version of the order check reported
+    `tone` as shadowed by `t` *after* the shadowing had been fixed — it was
+    reading the comment that describes the fix, which quotes `starts_with('t')`
+    three lines above the arm it is warning about. A checker that reads prose as
+    code is its own kind of wrong answer.
+    """
+    src = ENGINE_RS.read_text()
+    start = src.index("pub fn dispatch(")
+    end = re.search(r"\n(?:pub )?fn ", src[start + 1 :])
+    body = src[start : start + 1 + end.start()] if end else src[start:]
+    return re.sub(r"//[^\n]*", lambda m: " " * len(m.group(0)), body)
+
+
+def arms_in_order():
+    """Every arm `dispatch` can land, in the order it tries them.
+
+    Order is the whole point. A `match` takes the first arm that matches, so a
+    char guard like `l if l.starts_with('t')` shadows every later arm whose word
+    begins with a t — and `theirs()` above, which works with a set, cannot see
+    it.
+    """
+    body = dispatch_body()
+    arms = []
+    for m in re.finditer(r'^\s+"[a-z0-9]+"(?:\s*\|\s*"[a-z0-9]+")*\s*=>', body, re.M):
+        for w in re.findall(r'"([a-z0-9]+)"', m.group(0)):
+            arms.append((m.start(), "exact", w))
+    for m in re.finditer(r"""starts_with\(["']([a-z]+)["']\)""", body):
+        arms.append((m.start(), "prefix", m.group(1)))
+    arms.sort(key=lambda a: a[0])
+    return arms
+
+
+def lands_on(command, arms):
+    """The arm `command` actually reaches, or None."""
+    for _pos, kind, word in arms:
+        if kind == "exact" and command == word:
+            return word
+        if kind == "prefix" and command.startswith(word):
+            return word
+    return None
+
+
+def shadowed(us, arms):
+    """App verbs that reach an arm other than their own.
+
+    **The bug this exists for.** `tone3000` has an arm, is spelled correctly and
+    never arrives: `t` is matched as a char and gets there first, so it was read
+    as "claim the last 3000 seconds" and answered with a refusal about cycles.
+    Nothing failed. The tone simply did not change.
+    """
+    out = []
+    for w in sorted(us):
+        # The bare word, and the word with an argument — a prefix guard only
+        # shadows the argued form of some verbs, and the bare form of others.
+        for probe in (w, w + "1"):
+            hit = lands_on(probe, arms)
+            if hit is not None and hit != w and not probe == hit:
+                # `g1` legitimately lands on the `g1` arm; only a *different*
+                # word winning is a shadow.
+                if not (hit.startswith(w) or w.startswith(hit) and hit == w):
+                    out.append((probe, hit))
+                elif hit != w and not hit.startswith(w):
+                    out.append((probe, hit))
+        # Deduplicate per verb: one report is enough.
+    seen, uniq = set(), []
+    for probe, hit in out:
+        if probe.rstrip("1") in seen:
+            continue
+        seen.add(probe.rstrip("1"))
+        uniq.append((probe, hit))
+    return uniq
+
+
 def main():
     us, them = ours(), theirs()
 
@@ -88,7 +168,17 @@ def main():
             print(f"         {w!r} — no match arm and no prefix guard in dispatch")
         return 1
 
+    arms = arms_in_order()
+    stolen = shadowed(us, arms)
+    if stolen:
+        print("FAIL - the app can send verbs that reach the wrong arm:")
+        for probe, hit in stolen:
+            print(f"         {probe!r} lands on {hit!r}, which is matched earlier")
+        print("         (a `match` takes the first arm that fits; move yours above it)")
+        return 1
+
     print(f"PASS - all {len(us)} verbs the app can send have an arm in dispatch")
+    print(f"       and reach it: no earlier arm shadows one of them")
 
     # Not a failure: the daemon is allowed a larger vocabulary than we drive.
     # Reported because it is the list of things the surface could grow into.

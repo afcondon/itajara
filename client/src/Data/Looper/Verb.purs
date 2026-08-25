@@ -192,6 +192,10 @@ data Verb
   | Blank Number
   -- | What a Revox pass leaves of what was under it, in decibels; 0 to -60.
   | Feedback Number
+  -- | How much top a Revox pass keeps, in hertz; 200 to 20000, and 20000 is
+  -- | off. Tape loses the high end before it loses the level, and losing only
+  -- | the level is what makes a feedback loop sound digital.
+  | Tone Number
   -- | This loop's own level, in decibels; `0.0` is unity and `-60.0` is
   -- | silence. Above unity is refused rather than clamped, like `Decay`.
   -- |
@@ -252,6 +256,7 @@ render = case _ of
   ArmLevel n -> "arm" <> show n
   Blank n -> "blank" <> show n
   Feedback n -> "fb" <> show n
+  Tone n -> "tone" <> show n
   Level n -> "vol" <> show n
   Chance n -> "ch" <> show n
 

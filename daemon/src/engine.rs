@@ -244,6 +244,15 @@ fn vol_words(lp: &Loop) -> String {
     format!("plays {:.1} dB down", -20.0 * g.max(1e-9).log10())
 }
 
+/// The tape's bandwidth as the board says it.
+fn tone_words(lp: &Loop) -> String {
+    let hz = f32::from_bits(lp.tone.load(Ordering::Relaxed));
+    if hz >= 20_000.0 {
+        return "keeps every pass exactly as bright".into();
+    }
+    format!("loses everything above {:.1} kHz each pass", hz / 1000.0)
+}
+
 /// The Revox feedback as the board says it.
 fn fb_words(lp: &Loop) -> String {
     let g = f32::from_bits(lp.fb.load(Ordering::Relaxed));
@@ -661,6 +670,33 @@ pub struct Loop {
     /// regretting. `dec` still works in Revox mode and still does what it always
     /// did.
     pub fb: AtomicU32,
+    /// How much top the tape keeps, as a corner frequency in hertz.
+    ///
+    /// **Tape loses the high end before it loses the level**, and losing only
+    /// the level is what makes a digital feedback loop sound like a digital
+    /// feedback loop: the last repeat is the first one, quieter, with every
+    /// edge still on it. A pass over a real head comes back a little duller, and
+    /// twenty passes come back as a wash.
+    ///
+    /// One pole, applied to what is already on the tape as the head goes over
+    /// it. Not a simulation of anything — no head bump, no wow, no hiss — and
+    /// that is the point: the whole of the effect is that each pass costs you a
+    /// little of the top, and each pass costs it again.
+    ///
+    /// **In Revox only, and that is a fact about the design rather than a
+    /// shortcut.** Outside it, `decay` is a *resolution* applied at playback
+    /// with nothing in the arena touched, which is what lets a faded loop come
+    /// back — a filter there would have to be a different filter per layer per
+    /// pass count, cascaded as deep as the loop is old. Here the erasing has
+    /// already happened, so darkening it is one multiply and it is permanent
+    /// for the same reason everything else in this mode is.
+    ///
+    /// At or above 20 kHz it is bypassed rather than approximated, so "off" is
+    /// off and not "very nearly".
+    pub tone: AtomicU32,
+    /// The one-pole's memory, carried across buffers and across the wrap —
+    /// which is right, because the head does not stop at the splice.
+    pub tape_lp: AtomicU32,
     /// How often a pass sounds, as a probability. `1.0` is always.
     ///
     /// A gate on the mix and nothing else — the playhead keeps turning, `origin`
@@ -720,6 +756,8 @@ impl Loop {
             threaded: AtomicBool::new(false),
             revox: AtomicBool::new(false),
             fb: AtomicU32::new(10f32.powf(-3.0 / 20.0).to_bits()),
+            tone: AtomicU32::new(6500.0f32.to_bits()),
+            tape_lp: AtomicU32::new(0.0f32.to_bits()),
             chance: AtomicU32::new(1.0f32.to_bits()),
             chance_pass: AtomicI64::new(i64::MIN),
             chance_sounds: AtomicBool::new(true),
@@ -900,6 +938,9 @@ impl Loop {
         // is in the loop.
         self.revox.store(false, Ordering::Relaxed);
         self.threaded.store(false, Ordering::Relaxed);
+        // The filter's memory is audio, not a setting: it goes with the audio.
+        // `tone` and `fb` describe how you work and stay.
+        self.tape_lp.store(0.0f32.to_bits(), Ordering::Relaxed);
         self.plainly();
         self.pan.store(64, Ordering::Relaxed);
         self.one_shot.store(false, Ordering::Relaxed);
@@ -1404,19 +1445,6 @@ impl Shared {
         let c = self.cell(li, layer, pos);
         let cur = f32::from_bits(c.load(Ordering::Relaxed));
         c.store((cur + v).to_bits(), Ordering::Relaxed)
-    }
-    /// The Revox write: what was here comes back quieter, and the input goes on
-    /// top of it.
-    ///
-    /// **The one place in this engine that destroys stored audio**, and it is
-    /// reached only from a mode you asked for. `add` sums into a fresh layer and
-    /// leaves everything underneath exactly as recorded; this reads, attenuates
-    /// and writes back to the same cell, so the pass before is gone. That is
-    /// what an erase head does and it is the whole of what makes the sound.
-    fn erase_add(&self, li: usize, layer: usize, pos: usize, v: f32, fb: f32) {
-        let c = self.cell(li, layer, pos);
-        let cur = f32::from_bits(c.load(Ordering::Relaxed));
-        c.store((cur * fb + v).to_bits(), Ordering::Relaxed)
     }
     /// The captured sample for an input frame, if the ring still holds it.
     fn ring_at(&self, in_frame: i64) -> Option<f32> {
@@ -2223,6 +2251,15 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                 let layer = lp.n_layers.load(Ordering::Acquire);
                 let revox = lp.revox.load(Ordering::Relaxed);
                 let fb = f32::from_bits(lp.fb.load(Ordering::Relaxed));
+                // The one-pole's coefficient, worked out once a buffer rather
+                // than once a frame — it only changes when the knob does.
+                let tone = f32::from_bits(lp.tone.load(Ordering::Relaxed));
+                let tone_a = if tone >= 20_000.0 {
+                    1.0
+                } else {
+                    1.0 - (-2.0 * std::f32::consts::PI * tone / sr as f32).exp()
+                };
+                let mut lp_mem = f32::from_bits(lp.tape_lp.load(Ordering::Relaxed));
                 if layer >= MAX_LAYERS && !revox {
                     sh.in_frames.store(base + frames, Ordering::Release);
                     return;
@@ -2267,7 +2304,14 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                         // into a new one — which is why `layer` is zero here and
                         // why the loop does not grow a layer per pass.
                         if revox {
-                            sh.erase_add(li, 0, pos, v, fb);
+                            // What is on the tape, dulled, quieter, with the
+                            // new sound on top of it. The filter runs along the
+                            // tape rather than along time, which is the same
+                            // thing while the head is moving and the reason the
+                            // memory survives the wrap.
+                            let cur = sh.read(li, 0, pos);
+                            lp_mem += tone_a * (cur - lp_mem);
+                            sh.write(li, 0, pos, lp_mem * fb + v);
                         } else {
                             sh.add(li, layer, pos, v);
                         }
@@ -2281,6 +2325,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                         lp.mark_rec_env(pos * ENV_BUCKETS / loop_len, v.abs());
                     }
                 }
+                lp.tape_lp.store(lp_mem.to_bits(), Ordering::Relaxed);
                 sh.in_frames.store(base + frames, Ordering::Release);
             },
             err_cb(err_sh),
@@ -3404,7 +3449,14 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                                 // onto layer 5 are different enough that a
                                 // display showing neither is the reason nobody
                                 // could tell an overdub had started.
-                                return if layer == 0 {
+                                return if lp.revox.load(Ordering::Relaxed) {
+                                    // **Not "onto layer 2".** In Revox there is
+                                    // one layer and the head is going over it;
+                                    // naming a layer that will never exist is
+                                    // how a mode gets blamed for making the
+                                    // thing it was told not to make.
+                                    format!("loop {} over the tape.", li)
+                                } else if layer == 0 {
                                     format!("loop {} recording.", li)
                                 } else {
                                     format!("loop {} overdubbing onto layer {}.", li, layer + 1)
@@ -3457,6 +3509,32 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                         lp.request.set(FIRE);
                         return format!("loop {} fires.", li);
                     }
+                }
+            }
+            // **Before the take guard, and that is load-bearing.** `t` is
+            // matched as `starts_with('t')` — a char, not a word — so every
+            // command beginning with a t reaches it first. `tone3000` was
+            // silently being read as "claim the last 3000 seconds", which
+            // answered with a refusal about cycles and left the tone unchanged:
+            // a verb that has an arm, is spelled right, and never arrives.
+            //
+            // `tools/check-verbs.py` cannot catch this. It asks whether every
+            // verb *has* an arm, not whether it reaches the one it meant, and
+            // both were true here.
+            // How much top the tape keeps, in hertz. Twenty thousand and up is
+            // off outright rather than very nearly off.
+            _ if rest.starts_with("tone") => {
+                let arg = rest[4..].trim();
+                if arg.is_empty() {
+                    return format!("loop {} {}.", li, tone_words(lp));
+                }
+                match arg.parse::<f32>() {
+                    Ok(hz) if (200.0..=20_000.0).contains(&hz) => {
+                        lp.tone.store(hz.to_bits(), Ordering::Relaxed);
+                        return format!("loop {} {}.", li, tone_words(lp));
+                    }
+                    Ok(hz) => return format!("tape tone wants 200 to 20000 Hz, not {}.", hz),
+                    _ => return format!("tape tone wants hertz, not `{}`.", arg),
                 }
             }
             l if l.starts_with('t') => {
@@ -3650,9 +3728,9 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // **One silent layer, not none.** Playback sums `0..n_layers` and
             // the layer being recorded sits *at* `n_layers`, so a loop with no
             // layers is silent even while something is being written into it.
-            // In Revox that would matter: `erase_add` writes into layer zero,
-            // which is exactly the layer that has to be playing for the tape to
-            // come round under your hands.
+            // In Revox that would matter: the erasing write goes into layer
+            // zero, which is exactly the layer that has to be playing for the
+            // tape to come round under your hands.
             //
             // Refused rather than applied when the loop has anything in it. It
             // is a way of *starting*, and quietly resizing a loop with material

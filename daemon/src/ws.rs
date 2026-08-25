@@ -208,7 +208,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                     r#""recording":{},"quant":{},"muted":{},"reverse":{},"pan":{},"#,
                     r#""speed":{:.4},"pendulum":{},"oneShot":{},"levelArm":{},"#,
                     r#""firing":{},"chance":{:.4},"skipping":{},"fadeMs":{:.1},"decayDb":{:.2},"#,
-                    r#""volDb":{:.2},"revox":{},"fbDb":{:.2},"pendingAt":{},"recEnv":[{}],"shapes":[{}]}}"#
+                    r#""volDb":{:.2},"revox":{},"fbDb":{:.2},"toneHz":{:.0},"pendingAt":{},"recEnv":[{}],"shapes":[{}]}}"#
                 ),
                 li,
                 lp.state_name(),
@@ -279,6 +279,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                     else if g <= 0.0 { -60.0 }
                     else { 20.0 * (g.max(1e-9) as f64).log10() }
                 },
+                f32::from_bits(lp.tone.load(Ordering::Relaxed)),
                 lp.pending_in(cur),
                 // **The take in hand, drawn while it is being played.** Empty
                 // whenever nothing is recording, so the display has one test

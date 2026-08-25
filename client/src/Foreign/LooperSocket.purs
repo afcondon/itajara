@@ -268,6 +268,9 @@ type LoopState =
   -- | Its own number rather than `decayDb`: the same musical idea by two
   -- | mechanisms, one destroying and one not.
   , fbDb :: Number
+  -- | How much top a Revox pass keeps, as a corner frequency in hertz. 20000
+  -- | and up is off outright rather than very nearly off.
+  , toneHz :: Number
   -- | The picture of the take **being recorded right now**, on the same scale
   -- | as a layer's `env`, and **empty whenever nothing is recording**.
   -- |
