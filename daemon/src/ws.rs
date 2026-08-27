@@ -208,7 +208,8 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                     r#""recording":{},"quant":{},"muted":{},"reverse":{},"pan":{},"#,
                     r#""speed":{:.4},"pendulum":{},"oneShot":{},"levelArm":{},"#,
                     r#""firing":{},"chance":{:.4},"skipping":{},"fadeMs":{:.1},"decayDb":{:.2},"#,
-                    r#""volDb":{:.2},"revox":{},"fbDb":{:.2},"toneHz":{:.0},"pendingAt":{},"recEnv":[{}],"shapes":[{}]}}"#
+                    r#""volDb":{:.2},"revox":{},"fbDb":{:.2},"toneHz":{:.0},"cycles":{},"#,
+                    r#""pendingAt":{},"recEnv":[{}],"shapes":[{}]}}"#
                 ),
                 li,
                 lp.state_name(),
@@ -280,6 +281,10 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                     else { 20.0 * (g.max(1e-9) as f64).log10() }
                 },
                 f32::from_bits(lp.tone.load(Ordering::Relaxed)),
+                // How many bars this loop has been told it is. Zero means never
+                // told, which reads as one everywhere — reported as stored, so
+                // the app can tell "one bar" from "nobody has said".
+                lp.cycles.load(Ordering::Acquire),
                 lp.pending_in(cur),
                 // **The take in hand, drawn while it is being played.** Empty
                 // whenever nothing is recording, so the display has one test
@@ -361,6 +366,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
             r#""audioAlive":{},"deviceLost":{},"reopens":{},"shapes":[{}],"#,
             r#""ack":"{}","ackSeq":{},"linkTempo":{:.4},"linkQuantum":{:.4},"#,
             r#""linkBarFrames":{},"linkAnchors":{},"linkRejected":{},"#,
+            r#""barFrames":{},"barOrigin":{},"launchQ":{},"#,
             r#""selected":{},"nLoops":{},"loops":[{}]}}"#
         ),
         cl.state_name(),
@@ -404,6 +410,14 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
         crate::engine::bar_frames(tempo, quantum, sr).unwrap_or(0),
         sh.link_anchors.load(Ordering::Acquire),
         sh.link_rejected.load(Ordering::Relaxed),
+        // **The bar the engine is actually using**, which is not always Link's:
+        // with no clock it is the first loop's cycle divided by however many
+        // bars that loop has been declared to be. `linkBarFrames` above is what
+        // the clock says and is zero without one; this is what lengths are
+        // counted in either way, and the app should read this one.
+        sh.grid().map(|(_, len)| len).unwrap_or(0),
+        sh.grid().map(|(o, _)| o).unwrap_or(0),
+        sh.launch_q.load(Ordering::Relaxed),
         sel,
         crate::engine::N_LOOPS,
         each.join(","),

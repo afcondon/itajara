@@ -89,11 +89,38 @@ pub fn spawn_listener(sh: Arc<Shared>, sr: u32, port: u16) {
             sh.link_beat.store(beat.to_bits(), Ordering::Relaxed);
             sh.link_tempo.store(tempo.to_bits(), Ordering::Relaxed);
             sh.link_quantum.store(quantum.to_bits(), Ordering::Relaxed);
-            // Which output frame we were on when this landed. Unused today; it
-            // is the half of the wall-clock-to-frame join that has to be
-            // captured at the moment of arrival and cannot be recovered later.
-            sh.link_frame
-                .store(sh.out_frames.load(Ordering::Acquire), Ordering::Relaxed);
+            // Which output frame we were on when this landed: the half of the
+            // wall-clock-to-frame join that has to be captured at the moment of
+            // arrival and cannot be recovered later.
+            let at = sh.out_frames.load(Ordering::Acquire);
+            sh.link_frame.store(at, Ordering::Relaxed);
+
+            // **And here is the other half, finally joined.** The engine has
+            // had the tempo since Link landed and has never been able to use
+            // it, because a tempo gives a bar's *length* and not where the bar
+            // *falls* — `Shared::grid` says so and offers another loop's cycle
+            // instead. Both numbers are in scope on this line and nowhere else,
+            // so the join is made here and stored as a phase the audio side can
+            // read without knowing anything about wall clocks.
+            //
+            // `beat` counts beats from Link's zero; a bar is `quantum` of them.
+            // So the bar containing this anchor began `beat mod quantum` beats
+            // ago, and every bar line is that frame plus a whole number of bar
+            // lengths — forwards or backwards, which is why the origin is
+            // signed and may sit before the stream started.
+            match crate::engine::bar_frames(tempo, quantum, sr) {
+                Some(bar) => {
+                    sh.link_bar_origin.store(
+                        crate::engine::bar_origin(beat, quantum, tempo, at, sr),
+                        Ordering::Relaxed,
+                    );
+                    sh.link_bar_frames.store(bar, Ordering::Relaxed);
+                }
+                // Refused rather than left stale: a bar length that no longer
+                // matches the tempo is worse than no bar at all, because
+                // everything downstream would go on trusting it.
+                None => sh.link_bar_frames.store(0, Ordering::Relaxed),
+            }
             sh.link_anchors.fetch_add(1, Ordering::Release);
 
             let changed = match announced {
@@ -172,5 +199,35 @@ mod tests {
         // 90 bpm in 3: a beat is 2/3 s, a bar is 2 s.
         assert_eq!(crate::engine::bar_frames(90.0, 3.0, 48_000), Some(96_000));
         assert_eq!(crate::engine::bar_frames(0.0, 4.0, 48_000), None);
+    }
+
+    /// **The half of the join that could not be made before.** A bar's length
+    /// came from the tempo; where the bar *falls* needed the beat position and
+    /// the frame counter in the same place, which only happens at the moment an
+    /// anchor lands.
+    #[test]
+    fn a_bar_origin_is_the_frame_the_current_bar_began_on() {
+        // 120 bpm, 4/4, 48k: a beat is 24000 frames and a bar is 96000. An
+        // anchor taken exactly on a downbeat names the frame it arrived on.
+        assert_eq!(crate::engine::bar_origin(8.0, 4.0, 120.0, 500_000, 48_000), 500_000);
+        // One beat into the bar: the bar began 24000 frames ago.
+        assert_eq!(crate::engine::bar_origin(9.0, 4.0, 120.0, 500_000, 48_000), 476_000);
+        // Three and a half beats in.
+        assert_eq!(crate::engine::bar_origin(11.5, 4.0, 120.0, 500_000, 48_000), 416_000);
+    }
+
+    /// It is a phase and not an event, so a bar line before the stream started
+    /// is a correct answer rather than an error to clamp away.
+    #[test]
+    fn a_bar_origin_may_sit_before_the_stream_started() {
+        assert!(crate::engine::bar_origin(3.0, 4.0, 120.0, 1_000, 48_000) < 0);
+    }
+
+    /// Three to the bar is three beats, not three quarters of four — the metre
+    /// is the quantum's business and the beat stays a beat.
+    #[test]
+    fn the_quantum_is_beats_to_the_bar_not_a_fraction_of_one() {
+        assert_eq!(crate::engine::bar_frames(120.0, 3.0, 48_000), Some(72_000));
+        assert_eq!(crate::engine::bar_origin(4.0, 3.0, 120.0, 100_000, 48_000), 76_000);
     }
 }

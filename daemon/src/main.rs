@@ -43,6 +43,24 @@ USAGE
         ch [p]  how often a pass sounds, 0 to 1
         xf [ms]  crossfade the loop wrap with what followed it
         dec [db]  how much a pass costs what is already there
+        len [n]  how many bars this loop is
+        s [n]  how often the newest layer sounds, in cycles
+        ph [n]  which slot of those it lands on
+        lq [n]  what a launch waits for, in beats (-1 a bar, 0 none)
+
+      `len` does one of three things and says which. On an empty loop it
+      sets the length, and the next recording closes itself there rather
+      than waiting for a second `r`. On the first loop with no clock it
+      *declares* what you played — `len4` on a four-bar phrase makes the
+      bar a quarter of it, touching no audio, which is how a clockless
+      session gets a loop shorter than its first take. On anything else
+      it resizes, and the layers keep their own lengths inside the new one.
+
+      `s` and `ph` are a pair: `s4` makes the newest layer sound once
+      every four cycles and `ph3` puts it on the third of them, so a bar
+      recorded once can be placed anywhere in a longer loop. Both are
+      absolute — `s` used to multiply what was already there, which is
+      the right shape for a footswitch and the wrong one for a knob.
 
       `one` and `lev` are per-loop modes and take `0`/`1` to set rather than
       flip: `2one1` makes loop 2 a one-shot, silent until `2f` fires it from

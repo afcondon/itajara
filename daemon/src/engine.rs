@@ -52,6 +52,17 @@ use crate::measure::{choose_input, choose_output, signed_secs, Width};
 
 pub const MAX_LAYERS: usize = 8;
 
+/// How many bars a loop may be declared, and how sparsely a layer may sound.
+///
+/// **Both are the encoder's limits rather than the engine's.** Nothing here
+/// would struggle with 64 of either; a Midifighter encoder over 64 steps is two
+/// units a step, and this hardware moves an encoder when you press it — which
+/// is a measured fact about the device, not a guess. Thirty-two gives four
+/// units a step and is already the tight end. The console can ask for more than
+/// a knob can reach, the same way it can with decay.
+pub const MAX_BARS: usize = 32;
+pub const MAX_PERIOD: usize = 32;
+
 /// Transport states, as a `u8` because the audio thread reads it every buffer.
 const IDLE: u8 = 0;
 /// Waiting for the output callback to stamp the exact frame recording begins.
@@ -355,6 +366,49 @@ pub const N_LOOPS: usize = 8;
 /// disagree about what time it is.
 pub struct Loop {
     pub loop_len: AtomicUsize,
+    /// **How many bars this loop is**, and the only place metre enters a loop.
+    ///
+    /// `loop_len` is frames and always has been; this says what those frames
+    /// mean. `loop_len == cycles * bar` is the invariant everything else leans
+    /// on, and it is what lets one loop be four bars while another is one
+    /// without either of them being "the grid".
+    ///
+    /// One thing it does that nothing else can: on the **anchor**, with no
+    /// clock, it divides the pulse. Record a phrase, say it was four bars, and
+    /// the bar becomes a quarter of it — which is the only way a clockless
+    /// session gets a loop shorter than its first take. See `Shared::loop_grid`.
+    ///
+    /// Zero means "not declared", which reads as one everywhere. Kept distinct
+    /// from one so a loop that has never been told anything can be told
+    /// something by the first thing that measures it.
+    pub cycles: AtomicUsize,
+    /// The output frame a running **first** recording should close itself at,
+    /// or `i64::MIN` for "wait for a press".
+    ///
+    /// Set only when the loop already knew its length before recording began —
+    /// which, once there is a clock or a declared bar count, is every recording
+    /// after the very first one of a clockless session. That is the whole point
+    /// of it: the second press exists because the engine did not know how long
+    /// you meant, and as soon as it does, asking for it is ceremony.
+    ///
+    /// Read by `closer`, not by the callback, because closing a recording draws
+    /// a layer and sleeps and neither belongs in an audio thread.
+    pub close_at: AtomicI64,
+    /// The length a running **first** recording was told to be, or zero for
+    /// "whatever gets captured".
+    ///
+    /// **`commit` measures, and a declared loop must not be measured.** Its
+    /// fallback is `reached` — the frames the input actually delivered — which
+    /// trails the output by `K` and by the drain `commit` sleeps for, so a loop
+    /// told it was one bar came back 26 ms short of one. Sonically nothing; on
+    /// the grid it is a loop that walks away from every other loop a pass at a
+    /// time, and the cause is invisible because the take sounds right.
+    ///
+    /// So the number that was asked for wins over the number that was counted.
+    /// Only for a length that was declared *before* a note was played — a free
+    /// take still gets exactly what it captured, because there nothing was
+    /// asked for.
+    pub rec_len: AtomicUsize,
     pub n_layers: AtomicUsize,
     /// Each layer's own length, and where in the cycle it sounds.
     ///
@@ -718,6 +772,9 @@ impl Loop {
     fn new() -> Self {
         Loop {
             loop_len: AtomicUsize::new(0),
+            cycles: AtomicUsize::new(0),
+            close_at: AtomicI64::new(i64::MIN),
+            rec_len: AtomicUsize::new(0),
             n_layers: AtomicUsize::new(0),
             l_len: (0..MAX_LAYERS).map(|_| AtomicUsize::new(0)).collect(),
             l_tail: (0..MAX_LAYERS).map(|_| AtomicUsize::new(0)).collect(),
@@ -1283,6 +1340,42 @@ pub struct Shared {
     /// The output frame the newest anchor arrived on — the half of the
     /// wall-clock-to-frame join that can only be taken at the moment it lands.
     pub link_frame: AtomicUsize,
+    /// **The join, done.** A bar's length in frames, and an output frame on
+    /// which some bar began.
+    ///
+    /// Derived in `link.rs` at the moment an anchor lands, because that is the
+    /// only place all four halves are in scope at once: the beat position, the
+    /// frame counter, the tempo and the sample rate. `grid` reads these and
+    /// nothing else, which is what lets it stay a method on `Shared` with no
+    /// arguments.
+    ///
+    /// `link_bar_origin` may be in the past or, briefly, in the future — it is
+    /// a phase, not an event, and every bar line is `origin + n * frames` for
+    /// any integer `n`. Zero frames means no usable clock.
+    ///
+    /// **How accurate this is, honestly.** The anchor's beat position belongs
+    /// to the moment link-spike sent it; the frame belongs to the moment we
+    /// received it. Between them is a UDP hop on the loopback and one trip
+    /// through the OSC decoder — well under a millisecond, and small against a
+    /// bar. It is not sample-accurate and does not claim to be. What it is
+    /// accurate enough for is deciding which side of a bar line a foot landed.
+    pub link_bar_frames: AtomicUsize,
+    pub link_bar_origin: AtomicI64,
+    /// **What a launch waits for**, in beats. Rig-wide, the way Ableton's is.
+    ///
+    /// `-1` is a bar and is the default, because that is what the grid has
+    /// always meant here and a looper with no opinion should behave the way it
+    /// did yesterday. `0` is none — nothing waits, whatever a loop's own `g`
+    /// says. Anything above zero is that many beats, so a quarter of a bar and
+    /// eight bars are the same setting at different values and neither is a
+    /// special case.
+    ///
+    /// **Separate from the bar on purpose.** The bar is what a *length* is
+    /// counted in; this is what a *start* waits for. A DAW keeps them apart and
+    /// so does this, because "close on a whole bar" and "start on the next
+    /// beat" are both things you want at once — and collapsing them would take
+    /// away free-length takes over a quantised rig.
+    pub launch_q: AtomicI64,
     /// How many anchors have been accepted, and how many were refused for
     /// having the wrong shape or an impossible value. A silent listener and an
     /// absent clock look identical from the app unless both are counted.
@@ -1303,6 +1396,22 @@ pub fn bar_frames(tempo_bpm: f64, quantum: f64, sr: u32) -> Option<usize> {
     let secs = 60.0 / tempo_bpm * quantum;
     let frames = (secs * sr as f64).round();
     if frames >= 1.0 { Some(frames as usize) } else { None }
+}
+
+/// Which output frame the bar containing an anchor began on.
+///
+/// The other half of the join `bar_frames` could not make on its own. `beat` is
+/// Link's beat position at the moment the anchor was taken and `at` is the
+/// output frame we were on when it landed; a bar is `quantum` beats, so the bar
+/// this anchor sits in began `beat mod quantum` beats ago.
+///
+/// Signed, and may be negative: an anchor arriving in the first bar of a
+/// session names a frame before the stream started, which is correct — it is a
+/// phase, not an event, and every bar line is this plus a multiple of the bar.
+pub fn bar_origin(beat: f64, quantum: f64, tempo_bpm: f64, at: usize, sr: u32) -> i64 {
+    let per_beat = 60.0 / tempo_bpm * sr as f64;
+    let into_bar = beat.rem_euclid(quantum) * per_beat;
+    at as i64 - into_bar.round() as i64
 }
 
 /// `AtomicU8` under a name that makes the intent obvious at the use sites.
@@ -1357,21 +1466,84 @@ impl Shared {
         (0..N_LOOPS).find(|&i| self.loops[i].is_armed() && self.loops[i].request.get() == 0)
     }
 
-    /// The grid quantised loops align to: the anchor's origin and cycle length.
+    /// **The bar.** Link's when there is a clock, the first loop's cycle when
+    /// there is not.
     ///
-    /// The anchor is the first loop to acquire a length, which is how a looper
-    /// has always worked — the thing you played first is the thing everything
-    /// else fits around. It is *derived* on every call rather than cached,
-    /// because a cached anchor survives the loop being cleared and would hand
-    /// out a grid belonging to audio that no longer exists.
+    /// This used to be only the second half, and said so: *tempo alone gives a
+    /// bar's length but not where the bar falls, so until the frame-to-wall-
+    /// clock join lands the grid the engine can honestly offer is another
+    /// loop's cycle.* The join landed — see `link_bar_origin` — so the honest
+    /// answer is now the better one.
     ///
-    /// Deliberately not Link. Tempo alone gives a bar's *length* but not where
-    /// the bar falls, and aligning to a boundary needs both — so until the
-    /// frame-to-wall-clock join lands, the grid the engine can honestly offer
-    /// is another loop's cycle. That is also the grid that matters most here:
-    /// the loops agreeing with each other is the point, and agreeing with
-    /// Ableton is a bonus.
+    /// The order matters and it is not arbitrary. A looper with no clock has
+    /// always worked the other way round: the thing you played first is the
+    /// thing everything else fits around. But that makes the pulse and the
+    /// first loop's *length* the same number, and then **no loop can ever be
+    /// shorter than the first one** — you cannot put a one-bar kick under a
+    /// four-bar phrase, because four bars is what "one cycle" means. With a
+    /// clock the bar is a fact about the rig rather than about loop one, and
+    /// length becomes a count of bars, which is the thing a musician was
+    /// counting anyway.
+    ///
+    /// The fallback is not a lesser mode, it is the same model with the bar
+    /// taken from the only other thing that knows one. And a first loop can be
+    /// *told* it was four bars after the fact (`len`), which divides the pulse
+    /// and gets the short loop back without a clock.
     pub fn grid(&self) -> Option<(i64, usize)> {
+        let bar = self.link_bar_frames.load(Ordering::Relaxed);
+        let played = self.loop_grid();
+        if bar > 0 {
+            // **Length from the clock, phase from the music.** Link knows how
+            // long a bar is far better than a looper can; where the *downbeat*
+            // falls it knows only as well as a UDP hop allows, and the moment
+            // anything has been recorded there is a better answer in the room.
+            //
+            // This is the priority the old comment on this function already
+            // stated — *the loops agreeing with each other is the point, and
+            // agreeing with Ableton is a bonus* — and it is what makes
+            // arm-record define the downbeat: play the first loop free and the
+            // note you played becomes bar one, with Link still supplying the
+            // tempo. Record it on the grid instead and its origin is a Link bar
+            // line already, so nothing moves.
+            let origin = match played {
+                Some((o, _)) => o,
+                None => self.link_bar_origin.load(Ordering::Relaxed),
+            };
+            return Some((origin, bar));
+        }
+        played
+    }
+
+    /// The grid a *launch* aligns to: the bar, subdivided or multiplied by
+    /// whatever `launch_q` asks for, and `None` when nothing should wait.
+    ///
+    /// Beats rather than fractions of a bar, so the setting means the same
+    /// thing in 3/4 as in 4/4 — a quantum of three does not make "one beat"
+    /// into a third of a bar, it stays a beat.
+    fn launch_grid(&self) -> Option<(i64, usize)> {
+        let (origin, bar) = self.grid()?;
+        match self.launch_q.load(Ordering::Relaxed) {
+            0 => None,
+            n if n < 0 => Some((origin, bar)),
+            n => {
+                let quantum = f64::from_bits(self.link_quantum.load(Ordering::Relaxed));
+                // With no clock there is no beat, only the bar — so a beat count
+                // is honoured as a fraction of the bar in four, which is the
+                // metre everything here assumes when nothing tells it otherwise.
+                let beats = if quantum >= 1.0 { quantum } else { 4.0 };
+                let step = ((bar as f64 / beats) * n as f64).round() as usize;
+                Some((origin, step.max(1)))
+            }
+        }
+    }
+
+    /// The grid the anchor loop offers: its origin and its **bar**, which is
+    /// its cycle divided by however many bars it has been declared to be.
+    ///
+    /// One is the ordinary case and divides by nothing. Anything else is a loop
+    /// that has been told what it was — see the `len` verb — and is how a
+    /// clockless session gets a pulse shorter than its first take.
+    fn loop_grid(&self) -> Option<(i64, usize)> {
         let a = self.anchor.load(Ordering::Acquire);
         if a >= N_LOOPS {
             return None;
@@ -1381,12 +1553,17 @@ impl Shared {
         if len == 0 {
             return None;
         }
-        Some((lp.origin.load(Ordering::Acquire), len))
+        let bars = lp.cycles.load(Ordering::Acquire).max(1);
+        Some((lp.origin.load(Ordering::Acquire), (len / bars).max(1)))
     }
 
-    /// The first output frame at or after `from` that lands on the grid.
+    /// The first output frame at or after `from` that a launch may happen on.
+    ///
+    /// The bar, unless `launch_q` says otherwise — see it for why the two are
+    /// different questions. `None` means nothing to wait for, and every caller
+    /// already treats that as "go now".
     pub fn next_boundary(&self, from: i64) -> Option<i64> {
-        let (origin, len) = self.grid()?;
+        let (origin, len) = self.launch_grid()?;
         let elapsed = from - origin;
         let cycles = elapsed.div_euclid(len as i64) + if elapsed.rem_euclid(len as i64) == 0 { 0 } else { 1 };
         Some(origin + cycles * len as i64)
@@ -1891,6 +2068,9 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         link_tempo: AtomicU64::new(0),
         link_quantum: AtomicU64::new(0),
         link_frame: AtomicUsize::new(0),
+        link_bar_frames: AtomicUsize::new(0),
+        link_bar_origin: AtomicI64::new(0),
+        launch_q: AtomicI64::new(-1),
         link_anchors: AtomicUsize::new(0),
         link_rejected: AtomicUsize::new(0),
     });
@@ -2006,18 +2186,42 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                             }
                             let n = lp.n_layers.load(Ordering::Acquire);
                             if n < MAX_LAYERS {
-                                if lp.loop_len.load(Ordering::Acquire) == 0 {
+                                // **Layers, not length.** This asked whether the
+                                // loop had a length, which was the same question
+                                // while the only way to have one was to have
+                                // recorded one. A loop can now be *sized and
+                                // empty* — told how many bars it is before
+                                // anything is played into it — and that is a
+                                // first recording with a length, not an overdub
+                                // of nothing.
+                                if n == 0 {
                                     // Only the first recording lays down the grid.
                                     // Re-stamping origin on every arm would drag the
                                     // whole loop to position zero the instant you
                                     // hit record — playback reads origin too. The
                                     // self-test cannot catch that, because both
                                     // sides move together.
+                                    //
+                                    // Safe on a sized-and-empty loop for the same
+                                    // reason it is unsafe elsewhere: there is no
+                                    // audio, so there is nothing for zero to move
+                                    // away from.
                                     lp.origin.store(stamp, Ordering::Release);
                                     lp.rec_from.store(stamp, Ordering::Release);
                                     lp.clear_rec_env();
                                     lp.threaded.store(false, Ordering::Relaxed);
                                     lp.state.set(FIRST);
+                                    // If the length was known before a note was
+                                    // played, the close is known too. Arm it here
+                                    // and let `closer` do the work — an audio
+                                    // callback must not be the thing that draws a
+                                    // layer.
+                                    let want = lp.loop_len.load(Ordering::Acquire);
+                                    lp.rec_len.store(want, Ordering::Release);
+                                    lp.close_at.store(
+                                        if want > 0 { stamp + want as i64 } else { i64::MIN },
+                                        Ordering::Release,
+                                    );
                                 } else {
                                     // An overdub is modular against the existing
                                     // grid, so it records from the same reference
@@ -2070,15 +2274,37 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                     }
                 }
 
-                // The click follows the SELECTED loop, not loop 0 and not a
-                // rig-wide grid. With six independent cycles there is no one
-                // right answer, and "the loop you are working on" is the only
-                // one that stays predictable as loops come and go. When bar
+                // **The click follows the grid, and ticks beats.**
+                //
+                // It followed the selected loop's cycle, one blip a time round,
+                // and the note beside it said what to do about that: *when bar
                 // quantisation lands, the click should follow Link instead —
-                // that will be a grid rather than a guess.
-                let click_li = sh.sel();
-                let click_len = sh.lp(click_li).loop_len.load(Ordering::Acquire);
-                let click_origin = sh.lp(click_li).origin.load(Ordering::Acquire);
+                // that will be a grid rather than a guess.* It has landed.
+                //
+                // Two things were wrong with the old one and both bit the same
+                // workflow. It needed a recorded loop to exist — `click_len > 0`
+                // — so there was **no click before the first take**, which is
+                // the one moment you need to count yourself in. And one blip a
+                // cycle is not a count-in: four are, with the first one louder.
+                //
+                // Falls back to the selected loop when there is no grid at all,
+                // which is a rig with no clock and nothing recorded — where the
+                // old behaviour was the only answer available and still is.
+                let (click_origin, click_len, click_beats) = match sh.grid() {
+                    Some((o, bar)) => {
+                        let q = f64::from_bits(sh.link_quantum.load(Ordering::Relaxed));
+                        (o, bar, if q >= 1.0 { q.round() as usize } else { 4 })
+                    }
+                    None => {
+                        let li = sh.sel();
+                        (
+                            sh.lp(li).origin.load(Ordering::Acquire),
+                            sh.lp(li).loop_len.load(Ordering::Acquire),
+                            1,
+                        )
+                    }
+                };
+                let click_beat = (click_len / click_beats.max(1)).max(1);
 
                 // Monitoring reads the freshest frames the pre-roll holds. One
                 // buffer behind the converters, so the interface's own direct
@@ -2118,8 +2344,12 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                     let mut v = 0.0f32;
                     if click_len > 0 && sh.click.load(Ordering::Relaxed) {
                         let pos = (out_frame - click_origin).rem_euclid(click_len as i64) as usize;
+                        // The downbeat is louder, which is the whole of what
+                        // makes four blips a count-in rather than a rattle.
                         if pos < 16 {
-                            v += 0.4;
+                            v += 0.5;
+                        } else if pos % click_beat < 16 {
+                            v += 0.22;
                         }
                     }
                     if monitor {
@@ -2341,6 +2571,8 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     in_stream.play()?;
     std::thread::sleep(Duration::from_millis(300));
 
+    spawn_closer(sh.clone(), sr);
+
     if let Some(port) = opts.link_port {
         crate::link::spawn_listener(sh.clone(), sr, port);
     }
@@ -2519,6 +2751,56 @@ fn supervise<F>(
 /// those milliseconds is already in the arena, and the loop simply ends
 /// earlier than the last frame recorded. Which is also why adding a double-tap
 /// to a switch stopped costing anything recorded.
+/// **The second press, made unnecessary.**
+///
+/// One thread for the whole rig, polling every five milliseconds for a first
+/// recording that has reached the length it was told to be. Five is the same
+/// interval `multiply_end` already waits at and is a fortieth of the shortest
+/// bar anyone will use; the close it produces is quantised to the loop's own
+/// length by construction, so the poll's own jitter never reaches the audio —
+/// `commit` is handed the target frame, not the frame it woke up on.
+///
+/// A thread rather than the callback because closing a recording draws a layer
+/// and sleeps. A poll rather than a scheduled wake because there are six loops
+/// and one of them might be re-armed while another is closing, and a timer per
+/// recording is a timer to cancel.
+///
+/// **It re-checks before it acts, and that is the cancellation.** A foot that
+/// closes the take early leaves the state at `PLAYING`; a clear leaves the
+/// length at zero; a new recording moves `rec_from`. Any of those and this
+/// finds the world it was told about is gone, and does nothing. There is no
+/// flag to forget to clear.
+fn spawn_closer(sh: Arc<Shared>, sr: u32) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(5));
+        let now = sh.out_frames.load(Ordering::Acquire) as i64;
+        for li in 0..N_LOOPS {
+            let lp = sh.lp(li);
+            let at = lp.close_at.load(Ordering::Acquire);
+            if at == i64::MIN || now < at {
+                continue;
+            }
+            // Taken before the check, so two ticks cannot both close one take.
+            if lp
+                .close_at
+                .compare_exchange(at, i64::MIN, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+            if lp.state.get() != FIRST {
+                continue;
+            }
+            // `late` is how far past the target we woke, so `commit` closes the
+            // loop at the length it was asked for rather than at the length the
+            // poll happened to notice.
+            let msg = commit(&sh, li, sr, now - at);
+            println!("  {}", msg);
+            sh.note_ack(&msg);
+        }
+    });
+}
+
 fn commit(sh: &Shared, li: usize, sr: u32, late: i64) -> String {
     let lp = sh.lp(li);
     let state = lp.state.get();
@@ -2587,7 +2869,12 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) -> String {
 
     if state == FIRST {
         let reached = lp.reached.load(Ordering::Acquire);
-        let mut len = quantised_len.unwrap_or_else(|| {
+        // **Asked for beats counted.** Taken rather than read, so a take that is
+        // closed by a foot instead of by `closer` cannot leave it armed for the
+        // next one.
+        let declared = lp.rec_len.swap(0, Ordering::AcqRel);
+        let mut len = quantised_len.or(if declared > 0 { Some(declared) } else { None })
+        .unwrap_or_else(|| {
             if late <= 0 {
                 return reached;
             }
@@ -2601,6 +2888,17 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) -> String {
             // and claiming further would claim silence.
             want.min(reached)
         });
+        if declared > 0 && reached < declared {
+            // Should not happen — `commit` sleeps a drain before reading
+            // `reached` precisely so the input can catch up — but if it ever
+            // does, the last few frames of the loop are silence rather than
+            // audio. Said out loud rather than quietly shortening the loop,
+            // because shortening it is the failure this is here to prevent.
+            println!(
+                "  input was {} frames behind the declared length; the tail is silent.",
+                declared - reached
+            );
+        }
         if len == 0 {
             return format!("loop {} recorded nothing.", li);
         }
@@ -3128,55 +3426,194 @@ fn multiply_end(sh: &Shared, li: usize, sr: u32) -> String {
 /// arbitrary restriction: every layer's length divides the cycle, so a cycle
 /// that is a multiple of the old one still divides evenly by all of them. Grow
 /// by anything else and some other layer gets cut off mid-phrase at the wrap.
-fn sparse(sh: &Shared, li: usize, sr: u32, n: usize) -> String {
+/// How often the newest layer sounds, **absolutely**, and nothing else.
+///
+/// Two things changed here on 2026-08-27, both because the surface grew a knob
+/// for this and a knob holds a value rather than repeating a gesture.
+///
+/// **Absolute, not multiplicative.** `s4` used to mean *sound four times less
+/// often than you already do*, so pressing it twice gave one in eight and there
+/// was no way back except `d`. That is the right shape for a footswitch and the
+/// wrong one for a knob: a knob asks "what should this be", and a control whose
+/// meaning depends on where it has been cannot be read off the engine.
+///
+/// **And it no longer changes the loop's length.** It used to do both — set the
+/// period *and* grow the loop by the same factor — which meant "how often does
+/// this sound" and "how long is this loop" were one gesture and could not be
+/// set independently. They are two knobs now: `len` says how many bars, this
+/// says how often the material lands in them. A four-bar loop whose phrase
+/// sounds every bar and a four-bar loop whose phrase sounds once are the same
+/// length and different music, and neither was reachable before.
+///
+/// The way back is `d`, which is this with `n = 1`.
+fn sparse(sh: &Shared, li: usize, _sr: u32, n: usize) -> String {
     let lp = sh.lp(li);
     let layers = lp.n_layers.load(Ordering::Acquire);
     if layers == 0 {
         return "nothing to spread — record a loop first.".into();
     }
-    let n = n.max(2);
+    if n < 1 || n > MAX_PERIOD {
+        return format!("`every` wants 1 to {}, not {}.", MAX_PERIOD, n);
+    }
     let l = layers - 1;
-    let (len, period, phase) = lp.layer_shape(l);
+    let (len, _, phase) = lp.layer_shape(l);
     if len == 0 {
         return "that layer has no length.".into();
     }
-    let loop_len = lp.loop_len.load(Ordering::Acquire);
-    let new_len = n * loop_len;
-    if new_len > sh.max_frames {
-        return format!(
-            "{} cycles would be {:.1} s, past the ceiling of {:.1} s.",
+    lp.l_period[l].store(n, Ordering::Release);
+    // A phase that is now past the end would silence the layer outright, which
+    // is not what asking for a different spacing means.
+    lp.l_phase[l].store(phase % n, Ordering::Release);
+    if n == 1 {
+        format!("layer {} sounds every time round.", l + 1)
+    } else {
+        format!(
+            "layer {} sounds once every {}, on slot {}.",
+            l + 1,
             n,
-            new_len as f64 / sr as f64,
+            (phase % n) + 1
+        )
+    }
+}
+
+/// Which slot of its period the newest layer lands on — the absolute form of
+/// `o`, for the same reason `s` became absolute.
+///
+/// **Wraps rather than refusing.** The range depends on the period, and the app
+/// deliberately does not make one knob's range depend on another's value: that
+/// would make the pure position-to-value function need the snapshot. So any
+/// slot is legal here and lands somewhere sensible, and turning past the end
+/// comes round to the start, which is what a placement control should do
+/// anyway.
+fn place_at(sh: &Shared, li: usize, n: usize) -> String {
+    let lp = sh.lp(li);
+    let layers = lp.n_layers.load(Ordering::Acquire);
+    if layers == 0 {
+        return "nothing to place.".into();
+    }
+    let l = layers - 1;
+    let (_, period, _) = lp.layer_shape(l);
+    let slot = n % period.max(1);
+    lp.l_phase[l].store(slot, Ordering::Release);
+    if period <= 1 {
+        format!(
+            "layer {} sounds every time round, so there is only one slot; \
+             `{}s<n>` first to make room.",
+            l + 1,
+            li
+        )
+    } else {
+        format!("layer {} is on slot {} of {}.", l + 1, slot + 1, period)
+    }
+}
+
+/// **How many bars this loop is.** One verb, and which of its three jobs it is
+/// doing depends on what the loop already is — said out loud in the ack every
+/// time, because the difference is the whole of it.
+///
+/// * **Empty** — sizes it. The loop gets a length and no audio, and the next
+///   recording closes itself there instead of waiting for a second press.
+/// * **The anchor, with no clock** — *declares* it. The audio is untouched and
+///   the pulse becomes a fraction of it, which is the only way a clockless
+///   session gets a loop shorter than its first take. Resizing the thing that
+///   defines the pulse would move everything that follows it, so it doesn't.
+/// * **Anything else with material in it** — resizes it. The layers keep their
+///   own lengths and wrap inside the new one, which is what `multiply_end` has
+///   always done at the end of a multiply.
+fn set_bars(sh: &Shared, li: usize, sr: u32, n: usize) -> String {
+    let lp = sh.lp(li);
+    if n < 1 || n > MAX_BARS {
+        return format!("a loop wants 1 to {} bars, not {}.", MAX_BARS, n);
+    }
+    if lp.is_recording() {
+        return format!("loop {} is recording; finish that first.", li);
+    }
+    let layers = lp.n_layers.load(Ordering::Acquire);
+    let anchor = sh.anchor.load(Ordering::Acquire);
+    let clocked = sh.link_bar_frames.load(Ordering::Relaxed) > 0;
+
+    // Declaring: the audio stays exactly as it is and the number beside it
+    // changes, which divides the pulse for everything that follows.
+    if layers > 0 && li == anchor && !clocked {
+        let len = lp.loop_len.load(Ordering::Acquire);
+        lp.cycles.store(n, Ordering::Release);
+        return format!(
+            "loop {} is {} bar{} — the bar is now {:.3} s. Nothing was moved.",
+            li,
+            n,
+            if n == 1 { "" } else { "s" },
+            (len / n.max(1)) as f64 / sr as f64
+        );
+    }
+
+    let Some((origin, bar)) = sh.grid() else {
+        return format!(
+            "no bar yet: there is no clock and no loop has a length. \
+             Record something first, or start Link."
+        );
+    };
+    let want = n * bar;
+    if want > sh.max_frames {
+        return format!(
+            "{} bars would be {:.1} s, past the ceiling of {:.1} s.",
+            n,
+            want as f64 / sr as f64,
             sh.max_frames as f64 / sr as f64
         );
     }
 
-    // Measured in the layer's own lengths, not in cycles, and multiplicative
-    // rather than absolute: "spread by n" means *sound n times less often*. So
-    // pressing it twice gives one in four, and a layer that already repeats four
-    // times inside the cycle halves its density rather than jumping to once.
-    let new_period = (period * n).max(1);
-    lp.l_period[l].store(new_period, Ordering::Release);
-    lp.l_phase[l].store(phase, Ordering::Release);
-    lp.loop_len.store(new_len, Ordering::Release);
+    if layers == 0 {
+        // Sized and empty: a length with nothing in it, which is a state the
+        // engine did not have. A threaded tape is the neighbouring idea and is
+        // not this one — that carries a silent layer so it can *play*, and it
+        // would make the next recording an overdub. This stays at zero layers
+        // so the next recording is a first recording, and closes itself.
+        let now = sh.out_frames.load(Ordering::Acquire) as i64;
+        let start = if lp.quant.load(Ordering::Relaxed) {
+            let elapsed = now - origin;
+            origin + (elapsed.div_euclid(bar as i64) + 1) * bar as i64
+        } else {
+            now
+        };
+        lp.origin.store(start, Ordering::Release);
+        lp.loop_len.store(want, Ordering::Release);
+        lp.cycles.store(n, Ordering::Release);
+        sh.claim_anchor(li);
+        return format!(
+            "loop {} is set to {} bar{} ({:.3} s); record and it closes itself.",
+            li,
+            n,
+            if n == 1 { "" } else { "s" },
+            want as f64 / sr as f64
+        );
+    }
 
+    // Resizing something with material in it. Growing is always safe; shrinking
+    // below the longest layer would cut audio, and a length control that
+    // silently trims is a length control you cannot use in a hurry.
+    let longest = (0..layers).map(|l| lp.layer_shape(l).0).max().unwrap_or(0);
+    if want < longest {
+        return format!(
+            "loop {} has a {:.3} s layer in it; {} bar{} would be {:.3} s. \
+             Undo it or clear the loop first.",
+            li,
+            longest as f64 / sr as f64,
+            n,
+            if n == 1 { "" } else { "s" },
+            want as f64 / sr as f64
+        );
+    }
+    lp.loop_len.store(want, Ordering::Release);
+    lp.cycles.store(n, Ordering::Release);
     format!(
-        "layer {} sounds once every {} of its own lengths; loop is {:.3} s.",
-        l + 1,
-        new_period,
-        new_len as f64 / sr as f64
+        "loop {} is {} bar{} ({:.3} s); its layers keep their own lengths.",
+        li,
+        n,
+        if n == 1 { "" } else { "s" },
+        want as f64 / sr as f64
     )
 }
 
-/// Move the newest layer one slot later in the cycle.
-///
-/// `B ~ ~ ~` → `~ B ~ ~` → `~ ~ B ~`. One button, and it is the cheapest way to
-/// make a loop stop announcing where its bar line is.
-///
-/// It takes effect immediately rather than at the next boundary, which can chop
-/// the layer mid-phrase if you press while it is sounding. The fix is the same
-/// pending-at-the-wrap mechanism scenes will need, so it is worth building once,
-/// for both, rather than here.
 fn rotate(sh: &Shared, li: usize) -> String {
     let lp = sh.lp(li);
     let layers = lp.n_layers.load(Ordering::Acquire);
@@ -3421,8 +3858,17 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                         // Only a FIRST recording needs a deadline. An overdub
                         // records from `origin`, so it is already on whatever
                         // grid its loop sits on and cannot be nudged off it.
+                        //
+                        // **Layers, not length** — the same correction as in the
+                        // callback, and it had the same cause: "has a length"
+                        // meant "has material" while the only way to get one was
+                        // to record one. A loop that has been *told* how many
+                        // bars it is has a length and nothing in it, and it is
+                        // exactly the loop that most needs to start on the
+                        // boundary: it will be four bars long either way, and
+                        // four bars starting off the grid is four bars wrong.
                         let boundary = if lp.quant.load(Ordering::Relaxed)
-                            && lp.loop_len.load(Ordering::Acquire) == 0
+                            && lp.n_layers.load(Ordering::Acquire) == 0
                         {
                             sh.next_boundary(sh.out_frames.load(Ordering::Acquire) as i64)
                         } else {
@@ -3598,12 +4044,27 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 lp.quant.store(on, Ordering::Relaxed);
                 return match (on, sh.grid()) {
                     (false, _) => format!("loop {} is free.", li),
-                    (true, Some((_, glen))) => format!(
-                        "loop {} follows the grid ({:.3} s from loop {}).",
-                        li,
-                        glen as f64 / sr as f64,
-                        sh.anchor.load(Ordering::Acquire)
-                    ),
+                    // **Where the bar came from, not who the anchor is.** This
+                    // named `anchor` unconditionally, which was true while the
+                    // grid was always a loop's cycle and prints "from loop 8" —
+                    // one past the last loop, the sentinel for "nobody" — the
+                    // moment Link is the one supplying it.
+                    (true, Some((_, glen))) => {
+                        let from = if sh.link_bar_frames.load(Ordering::Relaxed) > 0 {
+                            "Link".to_string()
+                        } else {
+                            match sh.anchor.load(Ordering::Acquire) {
+                                a if a < N_LOOPS => format!("loop {}", a),
+                                _ => "nowhere".to_string(),
+                            }
+                        };
+                        format!(
+                            "loop {} follows the grid ({:.3} s, from {}).",
+                            li,
+                            glen as f64 / sr as f64,
+                            from
+                        )
+                    }
                     // Worth saying plainly rather than reporting success: the
                     // setting took, but with nothing to align to it does
                     // nothing, and a loop that starts free when you asked for
@@ -3619,6 +4080,46 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             "o" => return rotate(sh, li),
             "d" => return dense(sh, li),
             "z" => return free_length(sh, li, sr),
+            // **Ahead of every prefix guard below and behind every one above.**
+            // `len` shares two letters with `lev`, which is matched exactly, and
+            // `ph` shares one with `pan` and `pend`, which are matched by their
+            // own longer prefixes — so neither can be swallowed. That is worth
+            // stating rather than trusting: a verb defined after a looser guard
+            // is a verb that silently never runs, which has happened here once
+            // already.
+            // Rig-wide, so the loop prefix is ignored — the same shape as `arm`,
+            // `k` and `m`, and said in the ack so a `3lq4` does not look like it
+            // set something on loop 3.
+            _ if rest.starts_with("lq") => {
+                return match rest[2..].trim().parse::<i64>() {
+                    Ok(n) if n >= -1 && n <= 64 => {
+                        sh.launch_q.store(n, Ordering::Relaxed);
+                        match n {
+                            -1 => "launches wait for the bar (rig-wide).".to_string(),
+                            0 => "launches do not wait (rig-wide).".to_string(),
+                            b => format!(
+                                "launches wait for the next {} beat{} (rig-wide).",
+                                b,
+                                if b == 1 { "" } else { "s" }
+                            ),
+                        }
+                    }
+                    Ok(n) => format!("launch quantise wants -1 to 64 beats, not {}.", n),
+                    Err(_) => format!("`{}` wants a number of beats.", rest),
+                };
+            }
+            _ if rest.starts_with("len") => {
+                return match rest[3..].trim().parse::<usize>() {
+                    Ok(n) => set_bars(sh, li, sr, n),
+                    Err(_) => format!("`{}` wants a number of bars.", rest),
+                };
+            }
+            _ if rest.starts_with("ph") => {
+                return match rest[2..].trim().parse::<usize>() {
+                    Ok(n) => place_at(sh, li, n.saturating_sub(1)),
+                    Err(_) => format!("`{}` wants a slot number.", rest),
+                };
+            }
             // Returned rather than printed. This is the one command whose whole
             // point is *where* it put something, and a path printed on the
             // daemon's stdout is a path the app cannot show anyone — so the
