@@ -178,6 +178,18 @@ type LooperState =
   , linkBarFrames :: Int
   , linkAnchors :: Int
   , linkRejected :: Int
+  -- | **The bar the engine is actually counting in**, which is not always
+  -- | Link's. With a clock it is Link's; without one it is the first loop's
+  -- | cycle divided by however many bars that loop has been declared to be.
+  -- | Zero when there is neither.
+  -- |
+  -- | Read this rather than `linkBarFrames` for anything about *length*.
+  -- | `linkBarFrames` is what the clock says and is zero without one; this is
+  -- | what a bar means to the engine either way.
+  , barFrames :: Int
+  , barOrigin :: Int
+  -- | What a launch waits for, in beats. `-1` is a bar, `0` is none.
+  , launchQ :: Int
   -- | All six loops, and which one the flat fields above describe.
   -- |
   -- | The duplication is deliberate and meant to be temporary. Everything above
@@ -261,6 +273,11 @@ type LoopState =
   -- |
   -- | Reported because it changes what every other control means, and a mode
   -- | you cannot see is a mode you will be surprised by.
+  -- | How many bars this loop has been **told** it is. Zero means nobody has
+  -- | said, which reads as one everywhere — reported as stored rather than
+  -- | normalised, so the app can tell a loop that was declared one bar from a
+  -- | loop that has never been measured.
+  , cycles :: Int
   , revox :: Boolean
   -- | What a Revox pass leaves of what was under it, in decibels. Zero leaves
   -- | everything, -60 replaces it.

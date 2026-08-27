@@ -55,11 +55,17 @@
 -- | but a module importing both must alias them apart.
 module Data.Looper.Verb
   ( Verb(..)
+  , addressed
   , render
   , at
   ) where
 
 import Prelude
+
+import Control.Alternative (guard)
+import Data.Int as Int
+import Data.Maybe (Maybe)
+import Data.String.CodeUnits as SCU
 
 -- | One instruction to the daemon.
 data Verb
@@ -70,14 +76,33 @@ data Verb
   -- | Multiply: extend by whole cycles while it runs, and close on the next
   -- | press. Asks "how many bars of this?".
   | Multiply
-  -- | Spread one-in-`n`: the layer keeps its length and the loop grows around
-  -- | it, so the pass sounds `n` times less often. Asks "how often?" where
-  -- | `Multiply` asks "how long?" — structural, instant and reversible, and it
-  -- | records nothing.
+  -- | How often the newest layer sounds, in cycles of its own length.
+  -- |
+  -- | **Absolute since 2026-08-27, and it no longer changes the loop's length.**
+  -- | It used to mean *sound n times less often than you already do* and grow
+  -- | the loop by the same factor — one gesture setting two things, which is the
+  -- | right shape for a footswitch and the wrong one for a knob. `Bars` says how
+  -- | long; this says how often the material lands in it. A four-bar loop whose
+  -- | phrase sounds every bar and one whose phrase sounds once are the same
+  -- | length and different music, and neither was reachable before.
   -- |
   -- | Bare `s` means two in the daemon; we always send the count, because a
   -- | default that only one caller relies on is a mode.
   | Spread Int
+  -- | Which slot of its period the newest layer lands on — one-based on the
+  -- | wire, because that is how the daemon counts them back to you.
+  -- |
+  -- | **Wraps rather than refusing.** Its range depends on the period, and
+  -- | `Data.Looper.Twister.fromKnob` is deliberately a pure function of a
+  -- | position — making one knob's range depend on another's *value* would make
+  -- | it need the snapshot. So any slot is legal and the daemon wraps it.
+  | Place' Int
+  -- | How many bars a loop is. See `Data.Looper.Banks.SetBars` for the three
+  -- | things this means depending on what the loop already is.
+  | Bars Int
+  -- | What a launch waits for, in beats. **Rig-wide**, so the loop prefix the
+  -- | wire carries is ignored — `-1` is a bar and is the default, `0` is none.
+  | LaunchQ Int
   -- | Move a spread layer one slot later in its cycle.
   | Rotate
   -- | Undo the spread: sound every time round again.
@@ -227,6 +252,9 @@ render = case _ of
   Record -> "r"
   Multiply -> "x"
   Spread n -> "s" <> show n
+  Place' n -> "ph" <> show n
+  Bars n -> "len" <> show n
+  LaunchQ n -> "lq" <> show n
   Rotate -> "o"
   Dense -> "d"
   Undo -> "u"
@@ -273,3 +301,29 @@ flag word on = word <> (if on then "1" else "0")
 -- | fall out of step with is the thing this design is trying not to have."*
 at :: Int -> Verb -> String
 at i v = show i <> render v
+
+-- | Which loop a rendered command is addressed to, and what is left of it.
+-- |
+-- | **The inverse of `at`, and proved to be one.** Reading a wire string back
+-- | is normally the thing this module exists to prevent — there is one place a
+-- | verb becomes a string and no second spelling — so this earns its place the
+-- | way `fromKnob` and `toKnob` do: the suite walks every loop and every verb
+-- | and asserts `addressed (at i v)` gives back exactly `i` and `render v`.
+-- | A drift between the two is a failing test rather than a wrong label.
+-- |
+-- | It exists because the log had a **reporting** bug of the worst kind: it
+-- | printed the wire, the wire counts loops from zero, and every surface a
+-- | human reads counts from one. So selecting Loop 2 and asking for four bars
+-- | logged `→ 1len4`, which is correct and reads as loop one. Behaviour that is
+-- | right and says it in the wrong dialect is indistinguishable from behaviour
+-- | that is wrong, and costs exactly as much to chase.
+addressed :: String -> Maybe { loop :: Int, verb :: String }
+addressed s = do
+  let digits = SCU.takeWhile isDigit s
+  guard (digits /= "")
+  n <- Int.fromString digits
+  pure { loop: n, verb: SCU.dropWhile isDigit s }
+  where
+  -- The wire's own alphabet, not Unicode's: a loop prefix is `0`-`7` and
+  -- nothing else ever appears there.
+  isDigit c = c >= '0' && c <= '9'
