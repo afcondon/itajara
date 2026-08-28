@@ -1013,6 +1013,29 @@ impl Loop {
         self.n_layers.store(0, Ordering::Release);
         self.redo_to.store(0, Ordering::Release);
         self.loop_len.store(0, Ordering::Release);
+        // **Everything that says how long this loop is, together.**
+        //
+        // `loop_len` went to zero here from the beginning and `cycles` did not,
+        // which was harmless while a bar count could only come from a recording
+        // — the two were made and destroyed at the same moment. `len<n>` broke
+        // that: it sizes an *empty* loop, so after a clear this slot said "no
+        // length" and "four bars" at the same time.
+        //
+        // What that cost is worth writing down, because it looked like an
+        // engine fault and was not. The Twister's ring is drawn from `cycles`,
+        // so a cleared loop still showed four bars — and the app writes ring
+        // positions back to the device, so the encoder physically sat at four.
+        // Turning it "to 4" was then impossible: it was already there, no CC
+        // moved, no `len4` was sent, and the next take recorded open-ended. The
+        // second run of a recipe failed while the first one worked, which is the
+        // signature of state that outlives the thing it describes.
+        //
+        // The same argument reaches `close_at` and `rec_len`: both describe a
+        // recording that is no longer going to happen, and a stale `close_at`
+        // is a timer pointed at a take nobody has played yet.
+        self.cycles.store(0, Ordering::Release);
+        self.close_at.store(i64::MIN, Ordering::Release);
+        self.rec_len.store(0, Ordering::Release);
     }
 
     /// Ask for a speed and pendulum. Applied by the callback, at its own frame.
@@ -5112,6 +5135,58 @@ mod tests {
         let lp = Loop::new();
         lp.origin.store(0, Ordering::Relaxed);
         lp
+    }
+
+    /// **A cleared loop must not remember how long it was.**
+    ///
+    /// The failure this pins was invisible from inside the engine: a slot with
+    /// `loop_len == 0` and `cycles == 4` behaves correctly at every call site —
+    /// `loop_grid` checks the length first and bails — so nothing here went
+    /// wrong. What went wrong was on the surface. The Twister draws the bars
+    /// ring from `cycles` and writes ring positions *back* to the device, so
+    /// the encoder physically sat at four bars on a loop that had none, and
+    /// turning it to four moved nothing and sent nothing. The next take
+    /// recorded open-ended, and it did so only on the second run of a recipe.
+    ///
+    /// So the assertion is not about behaviour, it is about **agreement**: two
+    /// fields describe one fact and they have to be cleared together. That is
+    /// the class of bug this project keeps finding — see `sized-but-empty`, the
+    /// same pair read the other way round.
+    #[test]
+    fn clearing_forgets_the_length_and_the_bar_count_together() {
+        let lp = Loop::new();
+        // Sized and empty, as `len<n>` leaves it: four bars of a two-second bar.
+        lp.loop_len.store(4 * 96_000, Ordering::Release);
+        lp.cycles.store(4, Ordering::Release);
+        lp.rec_len.store(4 * 96_000, Ordering::Release);
+        lp.close_at.store(1_234_567, Ordering::Release);
+
+        lp.cleared();
+
+        assert_eq!(lp.loop_len.load(Ordering::Acquire), 0, "kept its length");
+        assert_eq!(
+            lp.cycles.load(Ordering::Acquire),
+            0,
+            "kept its bar count, so the encoder still reads four bars on an \
+             empty loop and cannot be turned to four"
+        );
+        assert_eq!(lp.rec_len.load(Ordering::Acquire), 0, "kept an asked-for length");
+        assert_eq!(
+            lp.close_at.load(Ordering::Acquire),
+            i64::MIN,
+            "kept a timer pointed at a take nobody has played"
+        );
+        // And is indistinguishable from one that was never touched, on every
+        // field that describes a length.
+        let fresh = Loop::new();
+        assert_eq!(
+            lp.loop_len.load(Ordering::Acquire),
+            fresh.loop_len.load(Ordering::Acquire)
+        );
+        assert_eq!(
+            lp.cycles.load(Ordering::Acquire),
+            fresh.cycles.load(Ordering::Acquire)
+        );
     }
 
     #[test]
