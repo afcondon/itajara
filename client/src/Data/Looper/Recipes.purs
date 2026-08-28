@@ -109,6 +109,29 @@ recipes =
                  \Nothing is aligned to Ableton after this and everything is \
                  \aligned to what you played."
     }
+  , { name: "The click comes to you, not the other way round"
+    , why: "For a take that is right except that it ran a little long or a \
+           \little short against the click. Nothing is stretched — the session \
+           \tempo is re-derived from what you played, which is the floor-looper \
+           \move rather than the DAW one."
+    , steps:
+        [ step "Page 1" "press Loop 1, leave bars/Grid unlit"
+        , says "Page 1" "press Arm, then play four bars"
+               "loop 0 committed: 8.129 s, 1 layer playing."
+        , says "" "look at bars/Grid — it already reads 4"
+               "a free take counts its own bars against the clock, so there is \
+               \nothing to declare and nothing to trim"
+        , says "Page 2" "press Tempo"
+               "tempo taken from loop 0: 8.129 s over 4 bars is 118.09 bpm."
+        ]
+    , note: Just "It takes the **average** over the bars, not your timing \
+                 \within them: play four bars slightly slow and the click comes \
+                 \to you, play them unevenly and they stay uneven. That is the \
+                 \point. It also moves Ableton and anything else on the Link \
+                 \session — if other loops are already down they keep their \
+                 \audio and stop agreeing with the click, and the ack counts \
+                 \them so you find out now rather than later."
+    }
   , { name: "A one-bar second loop against it"
     , why: "The kick after the song. A loop SHORTER than the first one, which \
            \is the thing the old model could not express at all — the pulse was \
@@ -143,13 +166,22 @@ recipes =
     , why: "For when you do not know how many bars yet. You count with bars and \
            \you play with this; both are worth having."
     , steps:
-        [ step "Page 3" "press Multiply"
-        , says "" "the write head opens"
-               "loop 0 multiplying from the start of this cycle — play across as \
-               \many cycles as you want, then x again."
+        -- **The precondition, stated.** This recipe used to begin at the
+        -- Multiply press, which worked whenever the rig happened to have a loop
+        -- left over from the recipe before it and refused outright when it did
+        -- not — "loop 0 has nothing to multiply — record a loop first". A test
+        -- script whose first step depends on the state the last one left is not
+        -- a test script. Recipe four says its precondition; this one now does
+        -- too.
+        [ step "" "record a loop as in any recipe above — Multiply extends \
+                  \something, it does not start one"
+        , says "Page 3" "press Multiply"
+               "loop 0 multiplying from the start of this cycle (0.25 s \
+               \recovered from the pre-roll) — play across as many cycles as \
+               \you want, then x again."
         , step "" "play across as many cycles as you like"
         , says "Page 3" "press Multiply again"
-               "rounds to whole cycles, waiting for the boundary if it rounded up"
+               "loop 0 x1: now 4.535 s (1 cycles of 4.535 s) — 2 layers playing."
         ]
     , note: Just "It feels like an overdub because it **is** one — an overdub \
                  \that also lengthens the loop. Refused unless the loop is \

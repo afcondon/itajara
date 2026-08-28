@@ -114,6 +114,16 @@ data Verb
   | Redo
   -- | Let go of the length that `Undo` kept.
   | ForgetLength
+  -- | **Take the session tempo from this loop**, which is the one verb here
+  -- | whose effect leaves the rig: link-spike passes it to Link and every peer
+  -- | follows — Ableton, purerl-tidal, the modular's tempo-relative rates.
+  -- |
+  -- | It moves no audio. `loop_len` is frames and loops stay phase-locked to
+  -- | each other whatever a bar is; what a tempo reaches is the click, the
+  -- | quantised launches and closes, and everything downstream of Link. The
+  -- | principle is the bar model's own, at rig scale: move the grid to the
+  -- | audio, never the audio to the grid.
+  | TakeTempo
   -- | Clear the loop: layers and length together.
   | Clear
   -- | Fire a one-shot: one pass, rather than turning for ever.
@@ -260,6 +270,7 @@ render = case _ of
   Undo -> "u"
   Redo -> "y"
   ForgetLength -> "z"
+  TakeTempo -> "bpm"
   Clear -> "c"
   Fire -> "f"
   ClaimPast -> "t"
