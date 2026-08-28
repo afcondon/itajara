@@ -2983,7 +2983,27 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) -> String {
             }
             let got = fill_from_ring(sh, li, layer, new_origin, pre, 0, false);
             lp.origin.store(new_origin, Ordering::Release);
-            len += pre;
+            // **A declared length is a promise about length; the pre-roll is
+            // about where the loop starts.**
+            //
+            // Growing `len` here is right for a take whose length came from
+            // what was played — you keep everything, plus the attack that was
+            // clipped off the front. It is wrong for a take that was *told* how
+            // long to be. Recipe 2 asks for four bars, arms, and plays: the
+            // close fires at exactly four bars, and then this line added the
+            // hundred milliseconds of recovered attack on top, so an 8.000 s
+            // loop committed at 8.1 and sat beside the 8.000 s loop it was
+            // supposed to match. Andrew saw it as two slots reading 8.0 and 8.1.
+            //
+            // Not by closing earlier, which was the other candidate: that would
+            // spend the pre-roll out of the take instead of off the end, and
+            // leave nothing past the loop point for the wrap crossfade to reach
+            // into. Keeping the length shifts the last `pre` frames past the
+            // end, where `tail` picks them up and `sample_at` uses them — the
+            // material is not discarded, it becomes the continuation.
+            if declared == 0 {
+                len += pre;
+            }
             println!(
                 "  pre-roll: {:.0} ms recovered from before the tap ({} of {} frames).",
                 pre as f64 / sr as f64 * 1000.0,
@@ -2992,6 +3012,28 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) -> String {
             );
         }
         lp.loop_len.store(len, Ordering::Release);
+        // **And how many bars that is**, where anything knows what a bar is.
+        //
+        // `commit` set a length and never a bar count, which was invisible
+        // while the count only mattered to loops that had been *told* one:
+        // `cycles` is zero for a freely recorded loop and zero reads as one
+        // everywhere. So an eight-second take showed "1 bar" on the encoder,
+        // and `bpm` on it would have offered a tempo four times too slow.
+        //
+        // Rounded to the nearest, and at least one. A take aimed at four bars
+        // misses in both directions and the nearest is what was meant; a take
+        // shorter than a bar is one bar, because zero is the value that means
+        // "nobody has said" and this is somebody saying.
+        //
+        // Only with a clock. Without one the first loop *is* the pulse and its
+        // whole length is one cycle — the clockless behaviour `loop_grid`
+        // depends on — so writing a count here would be inventing a metre from
+        // nothing.
+        let bar = sh.link_bar_frames.load(Ordering::Relaxed);
+        if bar > 0 && len > 0 {
+            let bars = ((len as f64 / bar as f64).round() as usize).max(1);
+            lp.cycles.store(bars, Ordering::Release);
+        }
         // What was recorded past the end, kept rather than trimmed. A first
         // recording writes linearly, so the continuation is already sitting
         // there and costs nothing to keep — it only had to not be thrown away.
@@ -3637,6 +3679,144 @@ fn set_bars(sh: &Shared, li: usize, sr: u32, n: usize) -> String {
     )
 }
 
+/// **Take the session tempo from this loop.**
+///
+/// The other half of `set_bars`. That verb has three jobs — size an empty loop,
+/// declare the bar count of a clockless anchor, resize something with material
+/// in it — and *declaring* was reachable only with no clock, because with one
+/// there was nothing to tell. There is now: link-spike answers
+/// `/link/set-tempo`, and a tempo sent there reaches every peer on the session.
+///
+/// So this is declaring, with a clock. The loop says "I am `cycles` bars long
+/// and `loop_len` frames", and those two numbers are a tempo.
+///
+/// ## Why this is not warping
+///
+/// **No audio moves.** `loop_len` is frames; loops play at frame rate and stay
+/// phase-locked to each other whatever the bar is. What a bar length reaches is
+/// the click, quantised launches and closes, `set_bars` arithmetic — and the
+/// rest of the Link session. The principle is the one the whole bar model runs
+/// on, at rig scale: *move the grid to the audio, never the audio to the grid.*
+///
+/// It also takes the tempo from the loop's **average** over its bars, not from
+/// the timing within them. Play four bars a little long and the click comes to
+/// you; play them unevenly and they stay uneven. That is the floor-looper
+/// behaviour and it is the point.
+///
+/// ## What it costs when other loops exist
+///
+/// Nothing to them — they are frames and do not move, and they stay in
+/// relation to each other. What moves is the click and everything downstream of
+/// Link, so loops recorded against the old click are now out with the click and
+/// still in with each other. Sometimes that is exactly the intent and sometimes
+/// it is a disaster, so the ack counts them and says so rather than deciding.
+fn take_tempo(sh: &Shared, li: usize, sr: u32) -> String {
+    let lp = sh.lp(li);
+    if lp.is_recording() || lp.is_armed() {
+        return format!("loop {} is still being written; finish that first.", li);
+    }
+    let len = lp.loop_len.load(Ordering::Acquire);
+    if len == 0 {
+        return format!(
+            "loop {} has no length, so there is no tempo in it. Record it, or \
+             `{}len<n>` first.",
+            li, li
+        );
+    }
+    // **A loop nobody has counted may not set the tempo**, and this guard was
+    // bought at the cost of putting the whole rig on 29.56 bpm.
+    //
+    // `cycles` is zero for "nobody has said" and reads as one everywhere else,
+    // which is harmless where a wrong count means a wrong ring. Here it meant an
+    // eight-second take offering 29.56 bpm — inside Link's 20..999, so the
+    // range check passed, so it went out to Ableton and the modular. A
+    // plausible wrong answer is the failure mode this whole rig is built to
+    // avoid, and the range check cannot catch it: for a four-bar take at any
+    // ordinary tempo, one quarter of the truth is still an ordinary tempo.
+    //
+    // With a clock `commit` now counts the bars of every take, so this only
+    // ever refuses a loop that genuinely has no count — which is the clockless
+    // case, where there is no session to tell anyway.
+    let bars = lp.cycles.load(Ordering::Acquire);
+    if bars == 0 {
+        return format!(
+            "nobody has said how many bars loop {} is, and a tempo taken from a \
+             guess would be wrong by exactly that guess. `{}len<n>` first.",
+            li, li
+        );
+    }
+    let secs = len as f64 / sr as f64;
+    let quantum = f64::from_bits(sh.link_quantum.load(Ordering::Relaxed));
+    let bpm = tempo_of(len, bars, sr, quantum);
+
+    // **Refused rather than clamped.** link-spike clamps to Link's documented
+    // 20..999, and a clamp here would be a lie: a tempo outside that range does
+    // not mean the loop is strange, it means the bar count is wrong — four bars
+    // read as one, or a two-second loop declared as thirty-two. Saying which
+    // number to look at is worth more than a tempo nobody asked for.
+    if !(20.0..=999.0).contains(&bpm) {
+        return format!(
+            "loop {} is {:.3} s over {} bar{}, which is {:.1} bpm — outside 20 to 999. \
+             The bar count is the number to look at.",
+            li,
+            secs,
+            bars,
+            if bars == 1 { "" } else { "s" },
+            bpm
+        );
+    }
+
+    if let Err(e) = crate::link::set_tempo(bpm, crate::link::DEFAULT_TEMPO_PORT) {
+        return format!("could not set the tempo: {}", e);
+    }
+
+    // Everything that would now disagree with the click, counted. Not a
+    // refusal — re-deciding the tempo around the loop that came out well is a
+    // real move — but it is never something to discover afterwards.
+    let others = (0..N_LOOPS)
+        .filter(|&o| o != li && sh.lp(o).n_layers.load(Ordering::Acquire) > 0)
+        .count();
+    let heard = sh.link_anchors.load(Ordering::Relaxed) > 0;
+
+    format!(
+        "tempo taken from loop {}: {:.3} s over {} bar{} is {:.2} bpm.{}{}",
+        li,
+        secs,
+        bars,
+        if bars == 1 { "" } else { "s" },
+        bpm,
+        if others > 0 {
+            format!(
+                " {} other loop{} keep their audio but no longer agree with the click.",
+                others,
+                if others == 1 { " does and it" } else { "s do and they" }
+            )
+        } else {
+            String::new()
+        },
+        if heard {
+            ""
+        } else {
+            " No anchor has ever arrived, so nothing here can confirm link-spike took it."
+        }
+    )
+}
+
+/// The tempo a loop implies: its bars over its seconds, in beats.
+///
+/// Split out so it can be tested without a socket or a `Shared` — the rest of
+/// `take_tempo` is guards and a UDP send, and this is the only part that can be
+/// arithmetically wrong.
+///
+/// Beats to the bar come from Link where it is known and are four where it is
+/// not, which is the same assumption `launch_grid` makes: a quantum of zero
+/// means "nobody has said", not "no beats".
+fn tempo_of(len: usize, bars: usize, sr: u32, quantum: f64) -> f64 {
+    let secs = len as f64 / sr as f64;
+    let beats_per_bar = if quantum >= 1.0 { quantum } else { 4.0 };
+    60.0 * beats_per_bar * bars.max(1) as f64 / secs
+}
+
 fn rotate(sh: &Shared, li: usize) -> String {
     let lp = sh.lp(li);
     let layers = lp.n_layers.load(Ordering::Acquire);
@@ -4101,6 +4281,10 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 };
             }
             "o" => return rotate(sh, li),
+            // Exact match, and it has to be: `b` would collide with `blank`,
+            // and this file has been bitten twice by a prefix guard eating a
+            // longer verb — see the note above `tone`.
+            "bpm" => return take_tempo(sh, li, sr),
             "d" => return dense(sh, li),
             "z" => return free_length(sh, li, sr),
             // **Ahead of every prefix guard below and behind every one above.**
@@ -5152,6 +5336,37 @@ mod tests {
     /// fields describe one fact and they have to be cleared together. That is
     /// the class of bug this project keeps finding — see `sized-but-empty`, the
     /// same pair read the other way round.
+    /// The whole of what `bpm` computes, and the case it was asked for.
+    #[test]
+    fn a_loop_that_ran_long_gives_back_a_slower_tempo() {
+        let sr = 48_000;
+        // Four bars at 120 in four: 2 s a bar, 8 s the loop.
+        assert!((tempo_of(8 * sr as usize, 4, sr, 4.0) - 120.0).abs() < 1e-9);
+
+        // The case this exists for. You played four bars against a 120 click
+        // and took 8.15 s over them; the click comes to you rather than the
+        // audio being stretched to it.
+        let long = (8.15 * sr as f64) as usize;
+        let bpm = tempo_of(long, 4, sr, 4.0);
+        assert!(bpm < 120.0, "running long must give a slower tempo, got {}", bpm);
+        assert!((bpm - 117.79).abs() < 0.01, "got {}", bpm);
+
+        // Metre comes from Link, so the same audio in three is a faster tempo —
+        // three beats to fill the same bar. A hard-coded four would be right in
+        // 4/4 and quietly wrong everywhere else.
+        assert!((tempo_of(8 * sr as usize, 4, sr, 3.0) - 90.0).abs() < 1e-9);
+        // A quantum nobody has sent reads as four rather than as none.
+        assert_eq!(tempo_of(8 * sr as usize, 4, sr, 0.0), tempo_of(8 * sr as usize, 4, sr, 4.0));
+
+        // Bars, not cycles: the same audio called one bar is a quarter of the
+        // tempo of the same audio called four.
+        assert!(
+            (tempo_of(8 * sr as usize, 1, sr, 4.0) * 4.0 - tempo_of(8 * sr as usize, 4, sr, 4.0))
+                .abs()
+                < 1e-9
+        );
+    }
+
     #[test]
     fn clearing_forgets_the_length_and_the_bar_count_together() {
         let lp = Loop::new();

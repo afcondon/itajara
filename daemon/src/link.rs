@@ -34,6 +34,48 @@ use crate::engine::Shared;
 /// es9-daemon (57123).
 pub const DEFAULT_ANCHOR_PORT: u16 = 57125;
 
+/// link-spike's inbound OSC socket — the same one the MIDI dispatch verbs go
+/// to, and where `/link/set-tempo` is answered.
+///
+/// **The one place this daemon talks outward.** Everywhere else it listens:
+/// anchors in, commands in over the WebSocket, audio in and out. Setting the
+/// tempo is different in kind, because Link is a *session* — the number reaches
+/// Ableton, purerl-tidal and es9-daemon's tempo-relative rates, not just this
+/// looper. That is a reason to be deliberate about it, not a reason to avoid
+/// it: the alternative is a click you cannot bring into line with what you
+/// played.
+pub const DEFAULT_TEMPO_PORT: u16 = 57122;
+
+/// Ask Link for a tempo, through link-spike.
+///
+/// **Fire and forget, and honest about it.** There is no reply to this — the
+/// evidence that it worked is the next `/link/anchor`, arriving about a tenth
+/// of a second later with the new tempo in it. So this reports only whether the
+/// bytes left the machine, and the caller says the rest.
+///
+/// `OscType::Double` rather than `Float`: link-spike accepts either, and a
+/// tempo derived from a frame count has more significant digits than an f32
+/// keeps. Rounding it to a float here would put the click a fraction of a
+/// percent off the loop it was taken from, which over a few minutes is exactly
+/// the drift this is meant to end.
+pub fn set_tempo(bpm: f64, port: u16) -> Result<(), String> {
+    let msg = rosc::OscMessage {
+        addr: "/link/set-tempo".into(),
+        args: vec![OscType::Double(bpm)],
+    };
+    let bytes = rosc::encoder::encode(&OscPacket::Message(msg))
+        .map_err(|e| format!("could not encode the tempo message: {}", e))?;
+    // A fresh ephemeral socket per call rather than one held open. This happens
+    // once in a while at human speed, never from the audio callback, and a
+    // socket held for months is a socket that can go stale without anything
+    // saying so.
+    let sock = UdpSocket::bind(("127.0.0.1", 0))
+        .map_err(|e| format!("could not open a socket to send it on: {}", e))?;
+    sock.send_to(&bytes, ("127.0.0.1", port))
+        .map_err(|e| format!("could not reach link-spike on {}: {}", port, e))?;
+    Ok(())
+}
+
 /// Listen for `/link/anchor` and keep the newest one.
 ///
 /// Binding failure is reported and then tolerated: no Link means no bar, which
