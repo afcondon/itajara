@@ -77,8 +77,8 @@ recipes =
         , step "Page 2" "press Click"
         , says "" "it ticks four to the bar, downbeat louder"
                "a click before anything is recorded — that is the point of it"
-        , step "Page 4" "press Grid so it lights"
-        , says "Page 4" "turn bars to 4"
+        , step "Page 1" "press bars/Grid so it lights"
+        , says "Page 1" "turn bars/Grid to 4"
                "loop 0 is set to 4 bars (8.000 s); record and it closes itself."
         , says "Page 1" "press Record, count yourself in"
                "loop 0 starts on the grid in 0.88 s"
@@ -88,15 +88,17 @@ recipes =
     , note: Just "**Arm is a trap here with Grid on.** It waits for a sound and \
                  \then for the next bar line, so playing just after a line costs \
                  \almost a whole bar and the attack with it. Record and count in \
-                 \— that is what the click is for."
+                 \— that is what the click is for. **Running it a second time?** \
+                 \Clear forgets the grid flag AND the bar count, so both of \
+                 \those steps are needed every time round, not only the first."
     }
   , { name: "A four-bar first loop, where your note is the downbeat"
     , why: "The same length, started by playing rather than by counting. Use it \
            \when Link is giving you a tempo rather than a performance."
     , steps:
         [ step "Page 1" "press Loop 1"
-        , step "Page 4" "leave Grid OFF"
-        , says "Page 4" "turn bars to 4"
+        , step "Page 1" "leave bars/Grid unlit"
+        , says "Page 1" "turn bars/Grid to 4"
                "loop 0 is set to 4 bars (8.000 s); record and it closes itself."
         , step "Page 1" "press Arm"
         , says "" "play — the take starts on your note"
@@ -113,8 +115,8 @@ recipes =
            \loop one's length, so one cycle meant four bars."
     , steps:
         [ step "Page 1" "press Loop 2"
-        , step "Page 4" "press Grid — it is per loop, so loop 2 needs its own"
-        , says "Page 4" "turn bars to 1"
+        , step "Page 1" "press bars/Grid — the grid is per loop, so loop 2 needs its own"
+        , says "Page 1" "turn bars/Grid to 1"
                "loop 1 is set to 1 bar (2.000 s); record and it closes itself."
         , says "Page 1" "press Record"
                "loop 1 committed: 2.000 s, 1 layer playing."
@@ -126,11 +128,11 @@ recipes =
            \The layer keeps its own length throughout — only where it lands moves."
     , steps:
         [ step "" "record a one-bar loop as above"
-        , says "Page 4" "turn bars to 4"
+        , says "Page 1" "turn bars/Grid to 4"
                "loop 1 is 4 bars (8.000 s); its layers keep their own lengths."
-        , says "Page 4" "turn every to 4"
+        , says "Page 3" "turn every to 4"
                "layer 1 sounds once every 4, on slot 1."
-        , says "Page 4" "turn on to 3"
+        , says "Page 3" "turn slot to 3"
                "layer 1 is on slot 3 of 4."
         ]
     , note: Just "Watch the waveform rather than the words: the bar moves to the \
@@ -159,7 +161,7 @@ recipes =
     , steps:
         [ says "Page 1" "press Record, play, press Record again"
                "the one place a closing press still survives"
-        , says "Page 4" "turn bars to 4"
+        , says "Page 1" "turn bars/Grid to 4"
                "loop 0 is 4 bars — the bar is now 2.000 s. Nothing was moved."
         ]
     , note: Just "No audio changed. The pulse is a quarter of what you played, \
