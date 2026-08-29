@@ -24,14 +24,47 @@
 /// listing, which is why the count comes from the caller rather than from an
 /// assumption here.
 pub fn wav_bytes(samples: &[f32], sample_rate: u32, channels: u16) -> Vec<u8> {
+    wav_bytes_acid(samples, sample_rate, channels, None)
+}
+
+/// What a receiver needs in order to know a file is a *loop* rather than a
+/// sound: how many beats long it is, and at what tempo.
+///
+/// This is the `acid` chunk, and it is the difference between a take that drops
+/// into Ableton already warped and one that has to be told its own length by
+/// hand, eight times. Loopy Pro and most samplers read it too.
+pub struct Acid {
+    /// Beats in the whole file. Not bars — the chunk counts beats.
+    pub beats: u32,
+    pub tempo: f32,
+    /// The numerator: beats to a bar, which here is Link's quantum.
+    pub beats_per_bar: u16,
+}
+
+/// As `wav_bytes`, and optionally saying what loop this is.
+///
+/// **`None` is not a lesser file, it is an honest one.** A take played back at
+/// half speed, or swinging on a pendulum, has no whole number of beats to
+/// declare; a wrong `acid` chunk would make Ableton warp it confidently to the
+/// wrong grid, which is worse than making it ask. So the caller passes `Some`
+/// only when the loop is doing the plain thing at a known bar count.
+pub fn wav_bytes_acid(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+    acid: Option<Acid>,
+) -> Vec<u8> {
     const FMT_LEN: u32 = 18;
     const FLOAT_FORMAT: u16 = 3;
     const BYTES_PER_SAMPLE: u16 = 4;
+    // Four flags, two shorts, a float, a long, two shorts and a float.
+    const ACID_LEN: u32 = 24;
     let channels = channels.max(1);
 
     let data_len = (samples.len() * BYTES_PER_SAMPLE as usize) as u32;
-    // "WAVE", then fmt, fact and data chunks each with their 8-byte header.
-    let riff_len = 4 + (8 + FMT_LEN) + (8 + 4) + 8 + data_len;
+    let acid_len = if acid.is_some() { 8 + ACID_LEN } else { 0 };
+    // "WAVE", then fmt, fact, maybe acid, and data, each with its 8-byte header.
+    let riff_len = 4 + (8 + FMT_LEN) + (8 + 4) + acid_len + 8 + data_len;
 
     let mut b = Vec::with_capacity(riff_len as usize + 8);
     b.extend_from_slice(b"RIFF");
@@ -60,6 +93,26 @@ pub fn wav_bytes(samples: &[f32], sample_rate: u32, channels: u16) -> Vec<u8> {
     // a stereo file that declared twice as many would tell a reader the take is
     // twice as long as it is.
     b.extend_from_slice(&((samples.len() / channels as usize) as u32).to_le_bytes());
+
+    // Between `fact` and `data`, which is where every writer puts it and where
+    // a reader that does not know the chunk will skip it by its declared size.
+    if let Some(a) = acid {
+        b.extend_from_slice(b"acid");
+        b.extend_from_slice(&ACID_LEN.to_le_bytes());
+        // Flags. Bit 0 set would mean *one shot*, which is the one thing this
+        // must not say — everything written here is a loop. No root note is
+        // declared either: these are not pitched samples for a keyboard.
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&60u16.to_le_bytes()); // root note, unread with the flag clear
+        b.extend_from_slice(&0x8000u16.to_le_bytes()); // the constant every writer emits
+        b.extend_from_slice(&0.0f32.to_le_bytes());
+        b.extend_from_slice(&a.beats.to_le_bytes());
+        // Denominator first. The order is the wrong way round and is the
+        // format's, not a slip here.
+        b.extend_from_slice(&4u16.to_le_bytes());
+        b.extend_from_slice(&a.beats_per_bar.max(1).to_le_bytes());
+        b.extend_from_slice(&a.tempo.to_le_bytes());
+    }
 
     b.extend_from_slice(b"data");
     b.extend_from_slice(&data_len.to_le_bytes());
@@ -112,6 +165,33 @@ mod tests {
         // layer that has been overdubbed into several times will hold values
         // like these.
         assert_eq!(got, samples);
+    }
+
+    #[test]
+    fn an_acid_chunk_leaves_the_riff_length_honest() {
+        let samples = vec![0.0f32; 8];
+        let plain = wav_bytes(&samples, 48_000, 2);
+        let looped = wav_bytes_acid(
+            &samples,
+            48_000,
+            2,
+            Some(Acid { beats: 16, tempo: 120.0, beats_per_bar: 4 }),
+        );
+        // The whole risk of adding a chunk is getting the size field wrong, so
+        // this is the assertion that matters: both files must still declare
+        // exactly the bytes they contain, and the loop one must be 32 longer.
+        assert_eq!(u32_at(&plain, 4) as usize, plain.len() - 8);
+        assert_eq!(u32_at(&looped, 4) as usize, looped.len() - 8);
+        assert_eq!(looped.len(), plain.len() + 32);
+
+        let at = looped.windows(4).position(|w| w == b"acid").expect("acid chunk");
+        assert_eq!(u32_at(&looped, at + 4), 24);
+        // Bit zero clear: this is a loop, not a one-shot. A file that claimed
+        // otherwise would land in Ableton unwarped and look like our bug.
+        assert_eq!(u32_at(&looped, at + 8) & 1, 0);
+        assert_eq!(u32_at(&looped, at + 8 + 12), 16);
+        // And the audio still follows it.
+        assert_eq!(&looped[looped.len() - 40..looped.len() - 36], b"data");
     }
 
     /// Writes a real file so it can be checked against a decoder that is not

@@ -1133,7 +1133,7 @@ impl Loop {
     /// as a hard-panned one — which linear panning would not give, and which
     /// matters when six loops are being placed against each other.
     pub fn pan_gains(&self) -> (f32, f32) {
-        let p = self.pan.load(Ordering::Relaxed).min(127) as f32 / 127.0;
+        let p = self.pan_position();
         let theta = p * std::f32::consts::FRAC_PI_2;
         (theta.cos(), theta.sin())
     }
@@ -1152,8 +1152,29 @@ impl Loop {
     /// a balanced loop can never be louder than the loop that was recorded, and
     /// there is no headroom to lose.
     pub fn balance_gains(&self) -> (f32, f32) {
-        let p = self.pan.load(Ordering::Relaxed).min(127) as f32 / 127.0;
+        let p = self.pan_position();
         ((2.0 * (1.0 - p)).min(1.0), (2.0 * p).min(1.0))
+    }
+
+    /// The knob's travel as a fraction, with **the detent at exactly a half**.
+    ///
+    /// It was `v / 127.0`, which cannot put centre in the middle: 127 is odd,
+    /// so 64 lands on 0.5039 and a centred loop came out 0.07 dB down on the
+    /// left. Inaudible, and it stayed unnoticed for exactly that reason — but
+    /// export writes these gains *into the file*, and a stereo take whose
+    /// centre is not centred is the sort of tilt that gets chased later in
+    /// somebody else's mixer.
+    ///
+    /// So the two halves of the travel are scaled separately, which costs a
+    /// slope change of one part in 128 at the detent and buys an exact middle,
+    /// an exact hard left and an exact hard right.
+    fn pan_position(&self) -> f32 {
+        let v = self.pan.load(Ordering::Relaxed).min(127) as f32;
+        if v <= 64.0 {
+            v / 128.0
+        } else {
+            0.5 + (v - 64.0) / 126.0
+        }
     }
 
     pub fn state_name(&self) -> &'static str {
@@ -1963,7 +1984,22 @@ impl Shared {
     /// Pulled out of the callback because six loops made it a nested loop worth
     /// naming, and because the self-test now has to be able to ask the same
     /// question of a specific loop.
-    fn loop_at(&self, li: usize, out_frame: i64, rng: &mut SmallRng) -> [f32; CHANNELS] {
+    ///
+    /// ## `live`, and the line it draws
+    ///
+    /// Three of the things below do not shape the audio, they decide whether
+    /// you hear it *this time round*: chance rolls per pass, a one-shot is
+    /// silent between fires, and mute is a hand on the fader. Everything else
+    /// here — layer gain, decay, speed, direction, the pendulum, where a sparse
+    /// layer lands — is the sound itself.
+    ///
+    /// The output callback wants both and passes `true`. **Export wants only
+    /// the first kind and passes `false`**, because a rendered file that had
+    /// baked in one roll of the dice would be a performance rather than a loop,
+    /// and every receiver that file is going to — Ableton, Loopy, Morphagene,
+    /// Lubadh — can do chance and one-shot itself. What we do not render, we
+    /// record in the manifest instead.
+    fn loop_at(&self, li: usize, out_frame: i64, rng: &mut SmallRng, live: bool) -> [f32; CHANNELS] {
         let lp = self.lp(li);
         let len = lp.loop_len.load(Ordering::Acquire);
         if len == 0 {
@@ -1971,14 +2007,14 @@ impl Shared {
         }
         // Silenced but not stopped: `pos` below is still computed from `origin`
         // on every frame, so nothing drifts while a loop is quiet.
-        if lp.muted.load(Ordering::Relaxed) {
+        if live && lp.muted.load(Ordering::Relaxed) {
             return [0.0; CHANNELS];
         }
         // A one-shot sounds only inside a pass. Before the first fire `shot_end`
         // is `i64::MIN`, so turning the mode on silences the loop at once — which
         // is right, and is why the ack says so: a one-shot that kept playing
         // until its next fire would be a loop in two minds.
-        if lp.one_shot.load(Ordering::Relaxed) && !lp.firing(out_frame) {
+        if live && lp.one_shot.load(Ordering::Relaxed) && !lp.firing(out_frame) {
             return [0.0; CHANNELS];
         }
         let n = lp.n_layers.load(Ordering::Acquire);
@@ -1992,7 +2028,7 @@ impl Shared {
         // cycle boundary rather than within a buffer of one. Remembering which
         // pass it was for is what keeps a one-in-four loop from flickering at
         // sample rate.
-        if lp.chance_applies() {
+        if live && lp.chance_applies() {
             let p = lp.chance_of();
             let pass = lp.pass_index(out_frame, len);
             if lp.chance_pass.load(Ordering::Relaxed) != pass {
@@ -2048,6 +2084,83 @@ impl Shared {
             }
         }
         v
+    }
+
+    /// One loop, rendered offline exactly as it sounds — layers flattened,
+    /// placed and levelled — and nothing else.
+    ///
+    /// ## Why the engine has to be the one to do this
+    ///
+    /// `save_take` writes the arena raw, which is right for a session and wrong
+    /// for everybody else: a layer file carries no gain, no decay, no speed, no
+    /// slot and no placement, so nothing downstream can reconstruct what was
+    /// played without reimplementing this file. Rendering is not a mixing-desk
+    /// job that could live in another tool — it is the one question only the
+    /// engine can answer.
+    ///
+    /// And it is nearly free, because the renderer already exists and runs
+    /// forty-eight thousand times a second. This is the same call in a plain
+    /// loop with the clock taken away.
+    ///
+    /// ## How long a rendered loop is
+    ///
+    /// **One cycle**, and the sparse layers are already inside it: `layer_pos`
+    /// finds a slot with `(pos / layer_len) % period`, so a bar that sounds on
+    /// the third of every four *is* a four-bar loop holding a one-bar layer,
+    /// and those four bars are `loop_len`. There is no longer period hiding
+    /// behind the loop's own, which is worth stating because there obviously
+    /// could have been and the arithmetic to find one was written before this
+    /// was read properly.
+    ///
+    /// Speed and the pendulum do change it, because they change how many
+    /// *output* frames one trip through the audio takes: half speed is twice
+    /// the file, and a pendulum is there and back.
+    pub fn render_loop(&self, li: usize) -> Option<Vec<f32>> {
+        let lp = self.lp(li);
+        let len = lp.loop_len.load(Ordering::Acquire);
+        if len == 0 || lp.n_layers.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let rate = lp.speed();
+        if !rate.is_finite() || rate == 0.0 {
+            return None;
+        }
+        let span = if lp.pendulum.load(Ordering::Relaxed) { 2 * len } else { len } as f64;
+        let frames = (span / rate.abs()).round() as usize;
+        if frames == 0 || frames > crate::wav::MAX_FRAMES {
+            return None;
+        }
+        // Where the playhead reads zero. `raw_pos` is `warp + (f - origin) *
+        // rate`, so this is that solved for `f` — and with the ordinary warp of
+        // nothing it is `origin` exactly. Starting anywhere else would export a
+        // loop that begins halfway through itself, which loops perfectly well
+        // and is not the take.
+        let warp = f64::from_bits(lp.warp.load(Ordering::Relaxed));
+        let f0 = lp.origin.load(Ordering::Acquire) - (warp / rate).round() as i64;
+
+        let fold = lp.mono.load(Ordering::Relaxed);
+        let (gl, gr) = if fold { lp.pan_gains() } else { lp.balance_gains() };
+        let v = f32::from_bits(lp.vol.load(Ordering::Relaxed));
+
+        // Never consulted — `live` is false, so nothing below rolls — but
+        // `loop_at` takes one, and a seeded one says so.
+        let mut rng = SmallRng::seed_from_u64(0);
+        let mut out = Vec::with_capacity(frames * CHANNELS);
+        for f in 0..frames {
+            let s = self.loop_at(li, f0 + f as i64, &mut rng, false);
+            // The same two branches as the output callback, and they have to be:
+            // a fold is an average through an equal-power pan, everything else
+            // is two channels through a balance. See `balance_gains`.
+            if fold {
+                let m = (s[0] + s[1]) * 0.5;
+                out.push(m * gl * v);
+                out.push(m * gr * v);
+            } else {
+                out.push(s[0] * gl * v);
+                out.push(s[1] * gr * v);
+            }
+        }
+        Some(out)
     }
 }
 
@@ -2561,7 +2674,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                     let mut vr = 0.0f32;
 
                     for li in 0..N_LOOPS {
-                        let s = sh.loop_at(li, out_frame, &mut rng);
+                        let s = sh.loop_at(li, out_frame, &mut rng, true);
                         if folds[li] {
                             // Averaged rather than summed: two channels of the
                             // same performance are correlated, so adding them
@@ -4661,6 +4774,12 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // daemon's stdout is a path the app cannot show anyone — so the
             // message goes back as the ack and both callers display it
             // themselves. Printing here as well got it shown twice.
+            // Rig-wide, so the loop prefix is ignored — said in the ack for
+            // the same reason `arm` and `m` say it. Matched on two characters
+            // rather than on `e`, because this file has been bitten twice by a
+            // one-character guard silently eating a longer verb defined below
+            // it, and `ex` costs nothing to be careful with.
+            l if l.starts_with("ex") => return export_set(sh, sr, &l[2..]),
             l if l.starts_with('w') => return save_take(sh, li, sr, &l[1..]),
             // Take back an undo. Free, now that undo does not destroy what it
             // removes: the layer is still there with its shape intact, so this
@@ -5386,6 +5505,148 @@ fn not_plain(lp: &Loop, li: usize) -> Option<String> {
 /// Everything outside a small safe set becomes a dash rather than being
 /// rejected, so a name typed with a slash in it still saves somewhere sensible
 /// instead of failing at the one moment the user is trying not to lose a take.
+/// Every loop that holds something, rendered and written as one WAV each.
+///
+/// ## Export is not save
+///
+/// `save_take` writes one loop's *layers*, raw. That is the session: itajara's
+/// own format, lossless, engine-shaped, the thing you reload to keep
+/// overdubbing tomorrow. This writes *loops*, flattened and rendered, which is
+/// what everything outside this daemon means by the word. Two artefacts for two
+/// readers, and neither is a better version of the other — which is why both
+/// verbs exist and why neither replaced the other.
+///
+/// ## What is deliberately not in the audio
+///
+/// Chance, one-shot and mute — see `loop_at` for the line. They are written
+/// into the manifest as numbers instead, so a receiver that wants them can have
+/// them, and every receiver these files are going to can: Ableton follows a
+/// clip, Loopy has one-shots, a Morphagene or a Lubadh does chance with a knob.
+/// **What we do not render, we record.**
+///
+/// ## And what is deliberately not here at all
+///
+/// No reel, no splice markers, no module-shaped anything. `msm` already knows
+/// what a Morphagene wants and what an Arbhar wants, and it should stay the one
+/// place that does. What only this daemon can supply is honest audio with its
+/// bar count attached, so that is all it supplies.
+fn export_set(sh: &Shared, sr: u32, name: &str) -> String {
+    // Checked across every loop before anything is written, rather than per
+    // loop as it goes: a half-written folder that stopped at loop 5 because
+    // loop 5 was recording is worse than one that never started.
+    for li in 0..N_LOOPS {
+        let lp = sh.lp(li);
+        if lp.is_recording() || lp.is_armed() {
+            return format!(
+                "loop {} is still recording — finish it before exporting the set.",
+                li
+            );
+        }
+    }
+
+    let name = safe_name(name);
+    let dir = sh.takes_dir.join(&name);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return format!("could not make {}: {}", dir.display(), e);
+    }
+
+    let quantum = f64::from_bits(sh.link_quantum.load(Ordering::Relaxed));
+    let beats_per_bar = if quantum >= 1.0 { quantum } else { 4.0 };
+
+    let mut entries: Vec<String> = Vec::new();
+    let mut wrote: Vec<String> = Vec::new();
+    for li in 0..N_LOOPS {
+        let lp = sh.lp(li);
+        let Some(samples) = sh.render_loop(li) else {
+            continue;
+        };
+        let frames = samples.len() / CHANNELS;
+        let bars = lp.cycles.load(Ordering::Acquire);
+
+        // **Numbered from one, unlike everything else on this wire.** The rule
+        // in here is that the daemon counts from zero and the surfaces count
+        // from one, and a filename is a surface: it is read by a person in
+        // Finder, by Ableton's browser and by msm, and none of them have the
+        // ack beside them to explain a `loop-0.wav`. The ack below says the
+        // mapping out loud so the seam is visible where it happens.
+        let file = format!("loop-{}.wav", li + 1);
+
+        // Only when the loop is doing the plain thing. At half speed or on a
+        // pendulum there is no whole number of beats to declare, and a wrong
+        // `acid` chunk warps confidently to the wrong grid — which would look
+        // like our bug in someone else's application.
+        let acid = if bars > 0 && lp.plain() {
+            Some(crate::wav::Acid {
+                beats: (bars as f64 * beats_per_bar).round() as u32,
+                tempo: tempo_of(len_of(lp), bars, sr, quantum) as f32,
+                beats_per_bar: beats_per_bar.round() as u16,
+            })
+        } else {
+            None
+        };
+        let tempo_field = match &acid {
+            Some(a) => format!("{:.4}", a.tempo),
+            None => "null".to_string(),
+        };
+
+        if let Err(e) = std::fs::write(
+            dir.join(&file),
+            crate::wav::wav_bytes_acid(&samples, sr, CHANNELS as u16, acid),
+        ) {
+            return format!("could not write {}: {}", file, e);
+        }
+        entries.push(format!(
+            concat!(
+                r#"{{"file":"{}","loop":{},"frames":{},"secs":{:.6},"bars":{},"tempo":{},"#,
+                r#""chance":{:.4},"oneShot":{},"muted":{}}}"#
+            ),
+            file,
+            li + 1,
+            frames,
+            frames as f64 / sr as f64,
+            bars,
+            tempo_field,
+            lp.chance_of(),
+            lp.one_shot.load(Ordering::Relaxed),
+            lp.muted.load(Ordering::Relaxed),
+        ));
+        wrote.push(file);
+    }
+
+    if entries.is_empty() {
+        return "nothing to export — no loop has anything in it.".into();
+    }
+
+    // No timestamp, for the same reason `save_take` has none: these are bound
+    // for amphora, which keys an artefact by the hash of its content.
+    let manifest = format!(
+        concat!(
+            "{{\n  \"version\": 1,\n  \"kind\": \"export\",\n  \"sampleRate\": {},\n",
+            "  \"beatsPerBar\": {},\n  \"loops\": [\n    {}\n  ]\n}}\n"
+        ),
+        sr,
+        beats_per_bar,
+        entries.join(",\n    ")
+    );
+    if let Err(e) = std::fs::write(dir.join("export.json"), manifest) {
+        return format!("wrote the audio but not the manifest: {}", e);
+    }
+
+    format!(
+        "exported {} loop{} to {}: {} — numbered as the board labels them, so \
+         loop 0 is loop-1.wav.",
+        wrote.len(),
+        if wrote.len() == 1 { "" } else { "s" },
+        dir.display(),
+        wrote.join(", ")
+    )
+}
+
+/// A loop's own length, named so the `acid` arithmetic above reads as arithmetic.
+fn len_of(lp: &Loop) -> usize {
+    lp.loop_len.load(Ordering::Acquire)
+}
+
 fn safe_name(raw: &str) -> String {
     let cleaned: String = raw
         .trim()
@@ -5653,6 +5914,150 @@ mod tests {
 
     const LEN: usize = 1000;
 
+    /// A `Shared` small enough to build in a test, so the renderer can be
+    /// asked what it actually produces.
+    ///
+    /// **Duplicated from the literal in `start`, on purpose.** The alternative
+    /// was a constructor taking thirty arguments so that one caller could pass
+    /// zeros. Adding a field to `Shared` breaks this at compile time, which is
+    /// the only kind of drift worth defending against here.
+    fn rig(max_frames: usize) -> Shared {
+        Shared {
+            arena: (0..N_LOOPS * MAX_LAYERS * max_frames * CHANNELS)
+                .map(|_| AtomicU32::new(0))
+                .collect(),
+            max_frames,
+            ring: (0..CHANNELS).map(|_| AtomicU32::new(0)).collect(),
+            ring_len: 1,
+            in_peak: vec![AtomicU32::new(0)],
+            sources: vec![Source::mono("test", 0)],
+            loops: (0..N_LOOPS).map(|_| Loop::new()).collect(),
+            selected: AtomicUsize::new(0),
+            anchor: AtomicUsize::new(N_LOOPS),
+            out_frames: AtomicUsize::new(0),
+            in_frames: AtomicUsize::new(0),
+            k: AtomicI64::new(0),
+            k_set: AtomicBool::new(false),
+            p0: Mutex::new(None),
+            buffer_frames: AtomicU32::new(0),
+            click: AtomicBool::new(false),
+            preroll: AtomicUsize::new(0),
+            arm_thresh: AtomicU32::new(0.01f32.to_bits()),
+            arm_reach: AtomicUsize::new(0),
+            max_fade: 0,
+            monitor: AtomicBool::new(false),
+            out_peak: AtomicU32::new(0),
+            p0_needed: AtomicBool::new(false),
+            p0_frame: AtomicUsize::new(0),
+            device_lost: AtomicBool::new(false),
+            reopens: AtomicUsize::new(0),
+            takes_dir: std::env::temp_dir().join("itajara-test-takes"),
+            ack: Mutex::new(String::new()),
+            ack_seq: AtomicUsize::new(0),
+            link_micros: AtomicI64::new(0),
+            link_beat: AtomicU64::new(0),
+            link_tempo: AtomicU64::new(0),
+            link_quantum: AtomicU64::new(0),
+            link_frame: AtomicUsize::new(0),
+            link_bar_frames: AtomicUsize::new(0),
+            link_bar_origin: AtomicI64::new(0),
+            launch_q: AtomicI64::new(-1),
+            link_anchors: AtomicUsize::new(0),
+            link_rejected: AtomicUsize::new(0),
+        }
+    }
+
+    /// Fill one layer with a constant, and declare its shape.
+    fn lay(sh: &Shared, li: usize, layer: usize, len: usize, v: f32) {
+        for p in 0..len {
+            for ch in 0..CHANNELS {
+                sh.cell(li, layer, p, ch).store(v.to_bits(), Ordering::Relaxed);
+            }
+        }
+        let lp = sh.lp(li);
+        lp.l_len[layer].store(len, Ordering::Release);
+        lp.l_period[layer].store(1, Ordering::Release);
+        lp.l_phase[layer].store(0, Ordering::Release);
+        lp.l_tail[layer].store(0, Ordering::Release);
+        lp.l_gain[layer].store(1.0f32.to_bits(), Ordering::Release);
+        lp.n_layers.store(layer + 1, Ordering::Release);
+    }
+
+    /// A loop of `len` holding one layer, at the origin, ready to render.
+    fn one_layer_loop(sh: &Shared, li: usize, len: usize, v: f32) {
+        lay(sh, li, 0, len, v);
+        let lp = sh.lp(li);
+        lp.loop_len.store(len, Ordering::Release);
+        lp.origin.store(0, Ordering::Relaxed);
+    }
+
+    /// **A rendered loop is one cycle, and the placement is inside it.**
+    ///
+    /// The bar-on-the-third-of-four case, which is the one that made me reach
+    /// for an LCM that turns out not to exist: `layer_pos` slots by
+    /// `(pos / layer_len) % period`, so the four bars are already `loop_len`
+    /// and a cycle is the whole of it. If that ever stops being true this test
+    /// goes quiet in exactly the wrong way — silent thirds and a fourth that
+    /// sounds — so it asserts each quarter separately.
+    #[test]
+    fn a_sparse_layer_renders_where_it_lands() {
+        let sh = rig(LEN);
+        let bar = 100;
+        one_layer_loop(&sh, 0, bar, 0.5);
+        let lp = sh.lp(0);
+        lp.loop_len.store(4 * bar, Ordering::Release);
+        lp.l_period[0].store(4, Ordering::Release);
+        lp.l_phase[0].store(2, Ordering::Release); // the third of four
+        let out = sh.render_loop(0).expect("renders");
+        assert_eq!(out.len(), 4 * bar * CHANNELS, "one cycle, not more");
+        let quarter = |q: usize| out[q * bar * CHANNELS];
+        assert_eq!(quarter(0), 0.0);
+        assert_eq!(quarter(1), 0.0);
+        assert_eq!(quarter(2), 0.5, "the third quarter is where it was placed");
+        assert_eq!(quarter(3), 0.0);
+    }
+
+    /// **Chance, one-shot and mute are not baked in.**
+    ///
+    /// The rule the export rests on: those three decide whether you hear a loop
+    /// this time round, and every receiver these files go to can decide that
+    /// for itself. A render that honoured them would hand Ableton one roll of
+    /// the dice and call it the loop — and worse, a muted loop would export as
+    /// a folder of silence with nothing to say why.
+    #[test]
+    fn the_render_ignores_what_only_decides_whether_you_hear_it() {
+        let sh = rig(LEN);
+        one_layer_loop(&sh, 0, 100, 0.5);
+        let lp = sh.lp(0);
+        lp.chance.store(0.0f32.to_bits(), Ordering::Relaxed);
+        lp.one_shot.store(true, Ordering::Relaxed);
+        lp.muted.store(true, Ordering::Relaxed);
+        let out = sh.render_loop(0).expect("renders anyway");
+        assert!(out.iter().any(|&v| v != 0.0), "silence would be the bug");
+
+        // And the live path still honours all three, which is the other half of
+        // the claim: this is a second mode, not a change of behaviour.
+        let mut rng = SmallRng::seed_from_u64(1);
+        assert_eq!(sh.loop_at(0, 0, &mut rng, true), [0.0; CHANNELS]);
+    }
+
+    /// Speed is audio, so it *is* rendered — and it changes the file's length.
+    #[test]
+    fn half_speed_renders_twice_the_file() {
+        let sh = rig(LEN);
+        one_layer_loop(&sh, 0, 100, 0.5);
+        sh.lp(0).speed.store(0.5f64.to_bits(), Ordering::Relaxed);
+        let out = sh.render_loop(0).expect("renders");
+        assert_eq!(out.len(), 200 * CHANNELS);
+    }
+
+    /// An empty loop is skipped rather than exported as silence.
+    #[test]
+    fn nothing_recorded_renders_to_nothing() {
+        let sh = rig(LEN);
+        assert!(sh.render_loop(0).is_none());
+    }
+
     /// A loop with its position zero at output frame zero.
     fn at_origin() -> Loop {
         let lp = Loop::new();
@@ -5721,7 +6126,10 @@ mod tests {
         // because it is spending the difference on placing a mono signal.
         lp.pan.store(64, Ordering::Relaxed);
         let (bl, br) = lp.balance_gains();
-        assert!((bl - 1.0).abs() < 0.02 && (br - 1.0).abs() < 0.02, "{} {}", bl, br);
+        // **Exactly**, not nearly. See `pan_position`: dividing the whole
+        // travel by 127 put centre at 0.5039 and left every centred loop 0.07 dB
+        // down on one side, which export would now write into the file.
+        assert_eq!((bl, br), (1.0, 1.0));
         let (pl, pr) = lp.pan_gains();
         assert!((pl - 0.707).abs() < 0.02 && (pr - 0.707).abs() < 0.02, "{} {}", pl, pr);
 

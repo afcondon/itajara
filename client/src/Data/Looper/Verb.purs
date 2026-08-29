@@ -162,6 +162,21 @@ data Verb
   -- | one because this is the one it actually happened to.
   | SaveTake String
 
+  -- | Render every loop that holds something to its own WAV, and a manifest
+  -- | beside them.
+  -- |
+  -- | **Send this bare, unlike `SaveTake`.** It is a `sh.` command rather than
+  -- | an `lp.` one — it is about the set, not a loop — so a leading digit would
+  -- | be noise, in the same family as `Click` and `Monitor`.
+  -- |
+  -- | And it is a different artefact from Save, not a better one. Save writes
+  -- | one loop's *layers*, raw: itajara's own format, the thing you reload to
+  -- | keep overdubbing. This writes *loops*, flattened and rendered, which is
+  -- | what Ableton, Loopy and msm mean by the word. What the render leaves out
+  -- | — chance, one-shot, mute — the manifest records, because every one of
+  -- | those receivers can do them itself.
+  | ExportSet String
+
 
   -- | Audible, or silenced but still turning. `Sounding false` is `h0`.
   -- |
@@ -283,6 +298,7 @@ render = case _ of
   Fire -> "f"
   ClaimPast -> "t"
   SaveTake name -> "w" <> name
+  ExportSet name -> "ex" <> name
 
   Sounding on -> flag "h" on
   OnGrid on -> flag "g" on
