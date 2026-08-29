@@ -209,7 +209,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                     r#""speed":{:.4},"pendulum":{},"oneShot":{},"levelArm":{},"#,
                     r#""firing":{},"chance":{:.4},"skipping":{},"fadeMs":{:.1},"decayDb":{:.2},"#,
                     r#""volDb":{:.2},"revox":{},"fbDb":{:.2},"toneHz":{:.0},"cycles":{},"#,
-                    r#""pendingAt":{},"recEnv":[{}],"shapes":[{}]}}"#
+                    r#""src":{},"mono":{},"pendingAt":{},"recEnv":[{}],"shapes":[{}]}}"#
                 ),
                 li,
                 lp.state_name(),
@@ -285,6 +285,11 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                 // told, which reads as one everywhere — reported as stored, so
                 // the app can tell "one bar" from "nobody has said".
                 lp.cycles.load(Ordering::Acquire),
+                // **One-based, because it is an index into a list a person
+                // reads.** The wire counts loops from zero and that is a debt
+                // being carried; a field added today should not add to it.
+                sh.src_of(li) + 1,
+                lp.mono.load(Ordering::Relaxed),
                 lp.pending_in(cur),
                 // **The take in hand, drawn while it is being played.** Empty
                 // whenever nothing is recording, so the display has one test
@@ -313,7 +318,14 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
     // Peaks are swapped out, so each reader gets the peak since the last read
     // rather than a decaying maximum. With one client that is exactly right;
     // with two they share, which is a meter problem and not a correctness one.
-    let in_peak = f32::from_bits(sh.in_peak.swap(0, Ordering::Relaxed));
+    // The loudest of every source. One number for a strip that has one meter;
+    // per-source metering is a display question and this is the honest summary
+    // until there is somewhere to put four of them.
+    let in_peak = sh
+        .in_peak
+        .iter()
+        .map(|p| f32::from_bits(p.swap(0, Ordering::Relaxed)))
+        .fold(0.0f32, f32::max);
     let out_peak = f32::from_bits(sh.out_peak.swap(0, Ordering::Relaxed));
 
     // Each layer's own length and where it sounds. Without this the app can draw
@@ -367,7 +379,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
             r#""ack":"{}","ackSeq":{},"linkTempo":{:.4},"linkQuantum":{:.4},"#,
             r#""linkBarFrames":{},"linkAnchors":{},"linkRejected":{},"#,
             r#""barFrames":{},"barOrigin":{},"launchQ":{},"#,
-            r#""selected":{},"nLoops":{},"loops":[{}]}}"#
+            r#""selected":{},"nLoops":{},"sources":[{}],"loops":[{}]}}"#
         ),
         cl.state_name(),
         cl.n_layers.load(Ordering::Acquire),
@@ -420,6 +432,14 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
         sh.launch_q.load(Ordering::Relaxed),
         sel,
         crate::engine::N_LOOPS,
+        // **The sources, named, in the order a `src<n>` counts them.** Without
+        // this the app would have a number and no way to say what it meant, and
+        // "input 2" on an encoder is the numbering problem all over again.
+        sh.sources
+            .iter()
+            .map(|s| format!(r#"{{"name":"{}","mono":{}}}"#, escape(&s.name), s.is_mono()))
+            .collect::<Vec<_>>()
+            .join(","),
         each.join(","),
     )
 }

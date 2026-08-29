@@ -144,9 +144,46 @@ const ENV_FLOOR_DB: f32 = -60.0;
 /// its own name rather than by winding this one up.
 const MAX_FADE_MS: f64 = 500.0;
 
+/// **One thing you can record from**: a name, and the input channels it lives
+/// on.
+///
+/// The rig grew past one input. A stereo pedalboard is a pair of jacks; a bare
+/// DI on its way out to MIDI Guitar is a third; the iPad returning over USB is
+/// a fourth. `--in-ch` could name exactly one of them, and the loop had no say.
+///
+/// **Named, not numbered.** "Input 3" means nothing with a guitar in your
+/// hands, and the name is what the ack and the encoder say back.
+///
+/// A mono jack is a source whose two channels are the same index. That is not
+/// a special case anywhere downstream: it records the same samples twice and a
+/// loop set to `mono` folds them back to one, which is what it already does
+/// for a stereo source with nothing different in it.
+#[derive(Clone, Debug)]
+pub struct Source {
+    pub name: String,
+    pub ch: [usize; CHANNELS],
+}
+
+impl Source {
+    pub fn mono(name: &str, ch: usize) -> Self {
+        Source { name: name.to_string(), ch: [ch, ch] }
+    }
+    pub fn is_mono(&self) -> bool { self.ch[0] == self.ch[1] }
+    pub fn describe(&self) -> String {
+        if self.is_mono() {
+            format!("{} (in {})", self.name, self.ch[0] + 1)
+        } else {
+            format!("{} (in {}+{})", self.name, self.ch[0] + 1, self.ch[1] + 1)
+        }
+    }
+}
+
 pub struct Opts {
     pub device: String,
     pub in_ch: usize,
+    /// What a loop can record from. Empty means "just `--in-ch`, as before",
+    /// which is what an existing command line gets.
+    pub sources: Vec<Source>,
     pub out_ch: usize,
     pub residual: f64,
     /// Whether `--residual` was actually given, as against left at its default.
@@ -192,6 +229,7 @@ impl Default for Opts {
         Opts {
             device: String::new(),
             in_ch: 0,
+            sources: Vec::new(),
             out_ch: 0,
             residual: 252.0,
             residual_given: false,
@@ -355,6 +393,25 @@ pub fn default_takes_dir() -> PathBuf {
 /// allocated once and never touched by the allocator again.
 pub const N_LOOPS: usize = 8;
 
+/// **Two, everywhere.** The arena, the pre-roll rings and every layer are
+/// stereo as of 2026-08-29.
+///
+/// The engine was mono end to end: `--in-ch` named one channel and the others
+/// were discarded — not summed, *dropped* — and `pan_gains` placed that one
+/// signal in the field. Which is right for a guitar into a jack and wrong for
+/// most of what this rig makes: a stereo pedalboard, a ping-pong delay, a wide
+/// reverb, a drum machine. Half of each was never reaching the machine at all.
+///
+/// The cost is linear and paid at startup: the arena doubles, to 702 MiB at the
+/// default eight loops, eight layers, thirty seconds and 48 kHz. `--max-secs`
+/// is the dial if that is too much.
+///
+/// **Mono stopped being a storage decision and became a playback one.** A loop
+/// whose channels carry nothing different can be folded at the mix — see
+/// `Loop::mono` — which makes it instantly reversible, and means nothing is
+/// thrown away by a choice you had to get right before the take.
+pub const CHANNELS: usize = 2;
+
 /// One loop: its layers, its cycle, and where it stands in it.
 ///
 /// Split out of `Shared` when the engine went from one loop to six. What lives
@@ -515,6 +572,29 @@ pub struct Loop {
     /// happens — which is why it is here rather than on the list of things
     /// waiting for engine work.
     pub pendulum: AtomicBool,
+    /// **Which input this loop records from.** An index into `Shared::sources`.
+    ///
+    /// Per loop rather than per rig, because `ClaimPast` decides *afterwards*
+    /// which loop a moment belongs to — so the moment has to have been captured
+    /// on every source, and the loop says which one it wants when it takes it.
+    ///
+    /// Survives a clear, like the other things that describe how you work
+    /// rather than what is in the loop. Clearing a slot you had pointed at the
+    /// drum machine and finding it back on the guitar would be a surprise in
+    /// the middle of the one gesture that is supposed to be a fresh start.
+    pub src: AtomicUsize,
+    /// **Fold this loop's two channels together at playback.**
+    ///
+    /// A playback decision and deliberately not a capture one: the audio is
+    /// always kept in stereo, so this is instantly reversible and costs nothing
+    /// to try. On, the two channels are summed and `pan` is a true pan — which
+    /// is what you want for a source with no meaningful stereo content and a
+    /// place you want it to sit. Off, they pass through and `pan` is a balance.
+    ///
+    /// Andrew asked for this as a capture-time option; at playback it is
+    /// strictly better, because nothing is thrown away by a choice made before
+    /// the take.
+    pub mono: AtomicBool,
     /// Where the playhead sits at `origin`, in loop frames.
     ///
     /// Zero until something changes speed. Playback is `warp + (frame -
@@ -787,6 +867,8 @@ impl Loop {
             muted: AtomicBool::new(false),
             speed: AtomicU64::new(1.0f64.to_bits()),
             pendulum: AtomicBool::new(false),
+            src: AtomicUsize::new(0),
+            mono: AtomicBool::new(false),
             warp: AtomicU64::new(0.0f64.to_bits()),
             cfg_speed: AtomicU64::new(1.0f64.to_bits()),
             cfg_pend: AtomicBool::new(false),
@@ -1056,6 +1138,24 @@ impl Loop {
         (theta.cos(), theta.sin())
     }
 
+    /// The same knob, read as a **balance** — for a loop that is already two
+    /// channels and is not being folded.
+    ///
+    /// Equal-power panning is for *placing a signal*. Applied to a stereo pair
+    /// it does two wrong things at once: at centre it takes 3 dB off both sides
+    /// for no reason, and turning it collapses a field that was recorded rather
+    /// than inventing one. What the knob should mean there is what it means on
+    /// a mixer: leave one side alone and take the other down.
+    ///
+    /// So: unity both sides at centre, and one side falling linearly to silence
+    /// at the end of the travel. Attenuating only — no side is ever boosted, so
+    /// a balanced loop can never be louder than the loop that was recorded, and
+    /// there is no headroom to lose.
+    pub fn balance_gains(&self) -> (f32, f32) {
+        let p = self.pan.load(Ordering::Relaxed).min(127) as f32 / 127.0;
+        ((2.0 * (1.0 - p)).min(1.0), (2.0 * p).min(1.0))
+    }
+
     pub fn state_name(&self) -> &'static str {
         match self.state.get() {
             ARMED => "armed",
@@ -1275,8 +1375,22 @@ pub struct Shared {
     /// One ring for every loop, because there is one input. Which loop a
     /// retroactive take lands in is a decision made when `t` is pressed, not
     /// something the capture has to anticipate.
+    /// **One ring per source, and every one of them always filling.**
+    ///
+    /// It was a single ring, because there was a single input. Now there is a
+    /// source per thing you can record from, and each keeps its own last
+    /// `ring_secs` — which is what `ClaimPast` needs to stay honest. The ring
+    /// exists so that you need not decide in advance; a *global* input selector
+    /// would put that decision straight back in front of you, and the one time
+    /// it mattered would be the time you were on the wrong input.
+    ///
+    /// Indexed `(src * ring_len + frame % ring_len) * CHANNELS + ch`. The cost
+    /// is 11.5 MB a source a channel at the default sixty seconds, against an
+    /// arena of hundreds — which is why "all of them, always" is affordable.
     ring: Vec<AtomicU32>,
     ring_len: usize,
+    /// What each source is called and which input channels it reads.
+    pub sources: Vec<Source>,
     pub loops: Vec<Loop>,
     /// Which loop bare commands address.
     ///
@@ -1312,7 +1426,11 @@ pub struct Shared {
     max_fade: usize,
     pub monitor: AtomicBool,
     pub out_peak: AtomicU32,
-    pub in_peak: AtomicU32,
+    /// The loudest thing each source has heard since the last poll. Per source,
+    /// because the arm threshold is answered from the loop's *own* input — a
+    /// drum loop should wait for a drum and a guitar loop for a guitar, and one
+    /// shared peak would have each of them starting on the other.
+    pub in_peak: Vec<AtomicU32>,
     /// Latched by cpal's stream error callback. Unplugging the USB bus kills
     /// both streams, and until this existed the daemon carried on serving a
     /// confident socket from a dead engine: `r` set the request, no output
@@ -1632,23 +1750,27 @@ impl Shared {
     /// rather than six Vecs: it keeps the "allocated once, never touched by the
     /// allocator again" property that lets the callbacks be allocation-free, and
     /// a loop's layers stay contiguous, which is the order the mix walks them in.
-    fn cell(&self, li: usize, layer: usize, pos: usize) -> &AtomicU32 {
-        &self.arena[(li * MAX_LAYERS + layer) * self.max_frames + pos]
+    /// **Interleaved, not planar.** The two channels of a frame sit next to
+    /// each other because that is how the mix reads them — one `loop_at` wants
+    /// both — so a stereo frame is one cache line's work rather than two walks
+    /// a `max_frames` apart.
+    fn cell(&self, li: usize, layer: usize, pos: usize, ch: usize) -> &AtomicU32 {
+        &self.arena[((li * MAX_LAYERS + layer) * self.max_frames + pos) * CHANNELS + ch]
     }
-    fn read(&self, li: usize, layer: usize, pos: usize) -> f32 {
-        f32::from_bits(self.cell(li, layer, pos).load(Ordering::Relaxed))
+    fn read(&self, li: usize, layer: usize, pos: usize, ch: usize) -> f32 {
+        f32::from_bits(self.cell(li, layer, pos, ch).load(Ordering::Relaxed))
     }
-    fn write(&self, li: usize, layer: usize, pos: usize, v: f32) {
-        self.cell(li, layer, pos).store(v.to_bits(), Ordering::Relaxed)
+    fn write(&self, li: usize, layer: usize, pos: usize, ch: usize, v: f32) {
+        self.cell(li, layer, pos, ch).store(v.to_bits(), Ordering::Relaxed)
     }
-    fn add(&self, li: usize, layer: usize, pos: usize, v: f32) {
-        let c = self.cell(li, layer, pos);
+    fn add(&self, li: usize, layer: usize, pos: usize, ch: usize, v: f32) {
+        let c = self.cell(li, layer, pos, ch);
         let cur = f32::from_bits(c.load(Ordering::Relaxed));
         c.store((cur + v).to_bits(), Ordering::Relaxed)
     }
     /// The captured sample for an input frame, if the ring still holds it.
-    fn ring_at(&self, in_frame: i64) -> Option<f32> {
-        if in_frame < 0 {
+    fn ring_at(&self, src: usize, in_frame: i64, ch: usize) -> Option<f32> {
+        if in_frame < 0 || src >= self.sources.len() {
             return None;
         }
         let newest = self.in_frames.load(Ordering::Acquire) as i64;
@@ -1658,8 +1780,18 @@ impl Shared {
         if in_frame < oldest || in_frame >= newest {
             return None;
         }
-        let i = (in_frame as usize) % self.ring_len;
+        let i = (src * self.ring_len + (in_frame as usize) % self.ring_len) * CHANNELS + ch;
         Some(f32::from_bits(self.ring[i].load(Ordering::Relaxed)))
+    }
+
+    /// Which source a loop records from, clamped to one that exists.
+    ///
+    /// Clamped rather than trusted: a `src<n>` for a source nobody configured
+    /// would otherwise index a ring that is not there, and silently recording
+    /// nothing is the failure this engine spends most of its comments avoiding.
+    pub fn src_of(&self, li: usize) -> usize {
+        let n = self.sources.len().max(1);
+        self.lp(li).src.load(Ordering::Relaxed).min(n - 1)
     }
 
 
@@ -1706,12 +1838,12 @@ impl Shared {
     /// A **tiled** layer is skipped outright. Its blocks are separated by
     /// silence, so there is no step to smooth, and blending the continuation in
     /// there would insert audio at a moment nothing was playing.
-    fn sample_at(&self, li: usize, layer: usize, pos: usize) -> f32 {
+    fn sample_at(&self, li: usize, layer: usize, pos: usize, ch: usize) -> f32 {
         let lp = self.lp(li);
         let Some(p) = lp.layer_pos(layer, pos) else {
             return 0.0;
         };
-        let v = self.read(li, layer, p);
+        let v = self.read(li, layer, p, ch);
         let xf = lp.fade.load(Ordering::Relaxed);
         // The ordinary case, and the first test is the cheap one: away from a
         // wrap this is the single read it has always been.
@@ -1728,12 +1860,14 @@ impl Shared {
         if p >= n {
             return v;
         }
-        wrap_mix(v, self.read(li, layer, len + p), p, n)
+        wrap_mix(v, self.read(li, layer, len + p, ch), p, n)
     }
 
     fn zero_layer(&self, li: usize, layer: usize) {
         for i in 0..self.max_frames {
-            self.cell(li, layer, i).store(0, Ordering::Relaxed);
+            for ch in 0..CHANNELS {
+                self.cell(li, layer, i, ch).store(0, Ordering::Relaxed);
+            }
         }
     }
 
@@ -1759,7 +1893,13 @@ impl Shared {
                 let to = (((b + 1) * len) / ENV_BUCKETS).max(from + 1).min(len);
                 let mut peak = 0.0f32;
                 for p in from..to {
-                    peak = peak.max(self.read(li, layer, p).abs());
+                    // **One picture for both channels**, and the louder of the
+                    // two. A waveform is read to answer "is there anything
+                    // there and where does it stop", and two overlaid traces
+                    // answer it worse than one.
+                    for ch in 0..CHANNELS {
+                        peak = peak.max(self.read(li, layer, p, ch).abs());
+                    }
                 }
                 out.push(to_byte(peak));
             }
@@ -1790,11 +1930,13 @@ impl Shared {
         }
         if n > 1 {
             for p in 0..len {
-                let mut v = 0.0f32;
-                for l in 0..n {
-                    v += self.read(li, l, p) * lp.layer_gain(l);
+                for ch in 0..CHANNELS {
+                    let mut v = 0.0f32;
+                    for l in 0..n {
+                        v += self.read(li, l, p, ch) * lp.layer_gain(l);
+                    }
+                    self.write(li, 0, p, ch, v);
                 }
-                self.write(li, 0, p, v);
             }
             for l in 1..n {
                 self.zero_layer(li, l);
@@ -1821,27 +1963,27 @@ impl Shared {
     /// Pulled out of the callback because six loops made it a nested loop worth
     /// naming, and because the self-test now has to be able to ask the same
     /// question of a specific loop.
-    fn loop_at(&self, li: usize, out_frame: i64, rng: &mut SmallRng) -> f32 {
+    fn loop_at(&self, li: usize, out_frame: i64, rng: &mut SmallRng) -> [f32; CHANNELS] {
         let lp = self.lp(li);
         let len = lp.loop_len.load(Ordering::Acquire);
         if len == 0 {
-            return 0.0;
+            return [0.0; CHANNELS];
         }
         // Silenced but not stopped: `pos` below is still computed from `origin`
         // on every frame, so nothing drifts while a loop is quiet.
         if lp.muted.load(Ordering::Relaxed) {
-            return 0.0;
+            return [0.0; CHANNELS];
         }
         // A one-shot sounds only inside a pass. Before the first fire `shot_end`
         // is `i64::MIN`, so turning the mode on silences the loop at once — which
         // is right, and is why the ack says so: a one-shot that kept playing
         // until its next fire would be a loop in two minds.
         if lp.one_shot.load(Ordering::Relaxed) && !lp.firing(out_frame) {
-            return 0.0;
+            return [0.0; CHANNELS];
         }
         let n = lp.n_layers.load(Ordering::Acquire);
         if n == 0 {
-            return 0.0;
+            return [0.0; CHANNELS];
         }
         // Chance: one roll per pass, held for the whole pass.
         //
@@ -1858,7 +2000,7 @@ impl Shared {
                 lp.chance_sounds.store(rng.gen::<f32>() < p, Ordering::Relaxed);
             }
             if !lp.chance_sounds.load(Ordering::Relaxed) {
-                return 0.0;
+                return [0.0; CHANNELS];
             }
         }
         // Speed is applied to the *loop's* position rather than to each layer's,
@@ -1877,7 +2019,13 @@ impl Shared {
         }
         let p1 = (p0 + 1) % len;
         let f = frac as f32;
-        self.mix_at(li, n, p0) * (1.0 - f) + self.mix_at(li, n, p1) * f
+        let a = self.mix_at(li, n, p0);
+        let b = self.mix_at(li, n, p1);
+        let mut out = [0.0f32; CHANNELS];
+        for ch in 0..CHANNELS {
+            out[ch] = a[ch] * (1.0 - f) + b[ch] * f;
+        }
+        out
     }
 
     /// Every layer of one loop, summed at one integer loop position.
@@ -1885,16 +2033,18 @@ impl Shared {
     /// Split out because interpolation needs the same question asked at two
     /// neighbouring positions, and summing the layers first is the same number
     /// as interpolating each layer and summing after — for half the reads.
-    fn mix_at(&self, li: usize, n: usize, pos: usize) -> f32 {
+    fn mix_at(&self, li: usize, n: usize, pos: usize) -> [f32; CHANNELS] {
         let lp = self.lp(li);
-        let mut v = 0.0f32;
+        let mut v = [0.0f32; CHANNELS];
         for l in 0..n {
             let g = lp.layer_gain(l);
             // Eighty decibels down is not quiet, it is gone — and skipping it
             // saves the arena read and the wrap fade's second read with it. The
             // audio is still there; only the reading of it stops.
             if g > 1.0e-4 {
-                v += self.sample_at(li, l, pos) * g;
+                for ch in 0..CHANNELS {
+                    v[ch] += self.sample_at(li, l, pos, ch) * g;
+                }
             }
         }
         v
@@ -2038,28 +2188,61 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     let max_frames = (opts.max_secs * sr_f).round() as usize;
     let ring_len = (opts.ring_secs * sr_f).round() as usize;
 
+    // **`--in-ch` becomes a source when nobody named any**, so an existing
+    // command line keeps working and gets one mono source called "in".
+    let sources: Vec<Source> = if opts.sources.is_empty() {
+        vec![Source::mono("in", opts.in_ch)]
+    } else {
+        opts.sources.clone()
+    };
+
+    // A source naming a channel the device does not have would record silence
+    // and say nothing, which is the shape of failure this engine exists to
+    // refuse. Said at startup, where it can still be fixed.
+    for s in &sources {
+        for c in s.ch {
+            if c >= in_channels {
+                return Err(format!(
+                    "source `{}` wants input channel {}, and {} has {}.",
+                    s.name, c + 1, candidate.name, in_channels
+                )
+                .into());
+            }
+        }
+    }
+
     println!("Device: {}", candidate.name);
     println!(
-        "Recording input {}, playing output {}, at {} Hz.",
-        opts.in_ch, opts.out_ch, sr
+        "Playing output {}, at {} Hz. Sources: {}",
+        opts.out_ch,
+        sr,
+        sources.iter().map(|s| s.describe()).collect::<Vec<_>>().join(", ")
     );
     println!(
-        "Arena: {} loops x {} layers x {:.0} s = {} MB.   Pre-roll: {:.0} s = {} MB.\n",
+        "Arena: {} loops x {} layers x {:.0} s x {} ch = {} MB.   \
+         Pre-roll: {:.0} s x {} src x {} ch = {} MB.\n",
         N_LOOPS,
         MAX_LAYERS,
         opts.max_secs,
-        N_LOOPS * MAX_LAYERS * max_frames * 4 / 1_048_576,
+        CHANNELS,
+        N_LOOPS * MAX_LAYERS * max_frames * CHANNELS * 4 / 1_048_576,
         opts.ring_secs,
-        ring_len * 4 / 1_048_576
+        sources.len(),
+        CHANNELS,
+        ring_len * sources.len() * CHANNELS * 4 / 1_048_576
     );
 
     let sh = Arc::new(Shared {
-        arena: (0..N_LOOPS * MAX_LAYERS * max_frames)
+        arena: (0..N_LOOPS * MAX_LAYERS * max_frames * CHANNELS)
             .map(|_| AtomicU32::new(0))
             .collect(),
         max_frames,
-        ring: (0..ring_len).map(|_| AtomicU32::new(0)).collect(),
+        ring: (0..ring_len * sources.len() * CHANNELS)
+            .map(|_| AtomicU32::new(0))
+            .collect(),
         ring_len,
+        in_peak: (0..sources.len()).map(|_| AtomicU32::new(0)).collect(),
+        sources,
         loops: (0..N_LOOPS).map(|_| Loop::new()).collect(),
         selected: AtomicUsize::new(0),
         anchor: AtomicUsize::new(N_LOOPS),
@@ -2078,7 +2261,6 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         max_fade: (MAX_FADE_MS / 1000.0 * sr_f).round() as usize,
         monitor: AtomicBool::new(opts.monitor),
         out_peak: AtomicU32::new(0),
-        in_peak: AtomicU32::new(0),
         p0_needed: AtomicBool::new(true),
         p0_frame: AtomicUsize::new(0),
         device_lost: AtomicBool::new(false),
@@ -2335,19 +2517,41 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                 // else in the room.
                 let monitor = sh.monitor.load(Ordering::Relaxed);
                 let mon_from = sh.in_frames.load(Ordering::Acquire) as i64 - frames as i64;
+                // **Monitor whatever is about to be written to.** Monitoring
+                // exists to hear yourself while you play, and what you are
+                // playing into is the loop that is armed or recording. Falls
+                // back to the first source when nothing is, which is what a rig
+                // with one source has always done.
+                let mon_src = (0..N_LOOPS)
+                    .find(|&li| {
+                        let lp = sh.lp(li);
+                        lp.is_armed() || lp.is_recording()
+                    })
+                    .map(|li| sh.src_of(li))
+                    .unwrap_or(0);
 
                 let mut peak = 0.0f32;
                 // Once per buffer, not once per frame: six loops times two
                 // trig calls is free here and wasteful inside the frame loop.
                 let mut gains = [(0.0f32, 0.0f32); N_LOOPS];
+                let mut folds = [false; N_LOOPS];
                 for li in 0..N_LOOPS {
                     let lp = sh.lp(li);
-                    // Level folded into the pan gains rather than applied in
-                    // the frame loop: it is a per-buffer constant like the pan
-                    // itself, and one multiply here is eight thousand fewer
+                    // Level folded into the placement gains rather than applied
+                    // in the frame loop: it is a per-buffer constant like the
+                    // pan itself, and one multiply here is eight thousand fewer
                     // down there.
                     let v = f32::from_bits(lp.vol.load(Ordering::Relaxed));
-                    let (l, r) = lp.pan_gains();
+                    // **Two different controls wearing one knob.** A loop that
+                    // is folded to mono is a single signal being *placed*, so
+                    // the equal-power pan is right. A loop that is not is two
+                    // signals already in a field, and panning them would
+                    // collapse it — what that knob means there is *balance*,
+                    // which attenuates one side and leaves the other alone.
+                    // See `Loop::mono` and `balance_gains`.
+                    let fold = lp.mono.load(Ordering::Relaxed);
+                    let (l, r) = if fold { lp.pan_gains() } else { lp.balance_gains() };
+                    folds[li] = fold;
                     gains[li] = (l * v, r * v);
                 }
 
@@ -2358,12 +2562,21 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
 
                     for li in 0..N_LOOPS {
                         let s = sh.loop_at(li, out_frame, &mut rng);
-                        vl += s * gains[li].0;
-                        vr += s * gains[li].1;
+                        if folds[li] {
+                            // Averaged rather than summed: two channels of the
+                            // same performance are correlated, so adding them
+                            // would be 6 dB louder than either and a fold would
+                            // change the level as well as the width.
+                            let m = (s[0] + s[1]) * 0.5;
+                            vl += m * gains[li].0;
+                            vr += m * gains[li].1;
+                        } else {
+                            vl += s[0] * gains[li].0;
+                            vr += s[1] * gains[li].1;
+                        }
                     }
-                    // The click and the input monitor sit in the middle. They
-                    // are references, not material, and a reference that moves
-                    // is not one.
+                    // The click sits in the middle. It is a reference, not
+                    // material, and a reference that moves is not one.
                     let mut v = 0.0f32;
                     if click_len > 0 && sh.click.load(Ordering::Relaxed) {
                         let pos = (out_frame - click_origin).rem_euclid(click_len as i64) as usize;
@@ -2375,14 +2588,21 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                             v += 0.22;
                         }
                     }
-                    if monitor {
-                        if let Some(m) = sh.ring_at(mon_from + f as i64) {
-                            v += m;
-                        }
-                    }
-
                     vl += v;
                     vr += v;
+
+                    // **The monitor keeps its sides**, where the click does not:
+                    // it is the thing you are about to record, so hearing it
+                    // collapsed would be hearing something other than what
+                    // lands in the loop.
+                    if monitor {
+                        if let Some(m) = sh.ring_at(mon_src, mon_from + f as i64, 0) {
+                            vl += m;
+                        }
+                        if let Some(m) = sh.ring_at(mon_src, mon_from + f as i64, 1) {
+                            vr += m;
+                        }
+                    }
                     peak = peak.max(vl.abs()).max(vr.abs());
                     data[f * out_channels + ch] = vl;
                     if dual && ch + 1 < out_channels {
@@ -2401,7 +2621,6 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         // Cloned before the shadowing below moves `sh` into the callback.
         let err_sh = sh.clone();
         let sh = sh.clone();
-        let ch = opts.in_ch;
         let residual = residual.samples;
         device.build_input_stream(
             &in_cfg,
@@ -2432,16 +2651,23 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                     sh.k_set.store(true, Ordering::Release);
                 }
 
-                // Always, regardless of transport state. This is what makes
-                // the past claimable.
-                let mut peak = 0.0f32;
-                for f in 0..frames {
-                    let v = data[f * in_channels + ch];
-                    peak = peak.max(v.abs());
-                    let i = (base + f) % sh.ring_len;
-                    sh.ring[i].store(v.to_bits(), Ordering::Relaxed);
+                // **Every source, always, regardless of transport state.**
+                // This is what makes the past claimable — and it is why the
+                // source is a per-loop choice rather than a rig-wide one. A
+                // moment you did not know you wanted has to have been captured
+                // on whichever input it happened on.
+                for (si, src) in sh.sources.iter().enumerate() {
+                    let mut peak = 0.0f32;
+                    for f in 0..frames {
+                        let i = (si * sh.ring_len + (base + f) % sh.ring_len) * CHANNELS;
+                        for ch in 0..CHANNELS {
+                            let v = data[f * in_channels + src.ch[ch]];
+                            peak = peak.max(v.abs());
+                            sh.ring[i + ch].store(v.to_bits(), Ordering::Relaxed);
+                        }
+                    }
+                    sh.in_peak[si].fetch_max(peak.to_bits(), Ordering::Relaxed);
                 }
-                sh.in_peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
 
                 // A level-armed loop is *listening*, not recording — it is not
                 // `recording_loop()` and nothing below will write for it. What it
@@ -2456,9 +2682,18 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                 // has been running since the daemon started.
                 if let Some(li) = sh.armed_loop() {
                     let thresh = f32::from_bits(sh.arm_thresh.load(Ordering::Relaxed));
-                    if peak >= thresh {
-                        if let Some(f) = (0..frames)
-                            .find(|&f| data[f * in_channels + ch].abs() >= thresh)
+                    // **The armed loop's own input, not the rig's.** Arm a drum
+                    // loop and it should wait for a drum; arm a guitar loop and
+                    // it should wait for a guitar. One shared peak would have
+                    // each of them starting on the other, which is the sort of
+                    // thing you would blame on the threshold for an hour.
+                    let asrc = &sh.sources[sh.src_of(li)];
+                    let apeak = f32::from_bits(sh.in_peak[sh.src_of(li)].load(Ordering::Relaxed));
+                    if apeak >= thresh {
+                        if let Some(f) = (0..frames).find(|&f| {
+                            (0..CHANNELS)
+                                .any(|c| data[f * in_channels + asrc.ch[c]].abs() >= thresh)
+                        })
                         {
                             let lp = sh.lp(li);
                             let k = sh.k.load(Ordering::Acquire);
@@ -2512,7 +2747,12 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                 } else {
                     1.0 - (-2.0 * std::f32::consts::PI * tone / sr as f32).exp()
                 };
-                let mut lp_mem = f32::from_bits(lp.tape_lp.load(Ordering::Relaxed));
+                // The recording loop's own input, and its own tape memory per
+                // channel. Revox's one-pole runs along the tape, so the two
+                // sides need separate memories or the filter would cross-feed
+                // them and the stereo would collapse a little on every pass.
+                let rec_src = &sh.sources[sh.src_of(li)];
+                let mut lp_mem = [f32::from_bits(lp.tape_lp.load(Ordering::Relaxed)); CHANNELS];
                 if layer >= MAX_LAYERS && !revox {
                     sh.in_frames.store(base + frames, Ordering::Release);
                     return;
@@ -2524,8 +2764,6 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                     if rel < 0 {
                         continue;
                     }
-                    let v = data[f * in_channels + ch];
-
                     if state == FIRST || state == MULTIPLY {
                         // Linear. Its length becomes the cycle, so it must not
                         // wrap — and it stops rather than overwriting.
@@ -2534,7 +2772,12 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                             lp.overflowed.store(true, Ordering::Relaxed);
                             continue;
                         }
-                        sh.write(li, layer, pos, v);
+                        let mut loudest = 0.0f32;
+                        for ch in 0..CHANNELS {
+                            let v = data[f * in_channels + rec_src.ch[ch]];
+                            sh.write(li, layer, pos, ch, v);
+                            loudest = loudest.max(v.abs());
+                        }
                         lp.reached.fetch_max(pos + 1, Ordering::Relaxed);
                         lp.rec_reached.fetch_max(out_frame + 1, Ordering::Relaxed);
                         // **A first take has no length yet**, so its picture
@@ -2543,7 +2786,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                         // closes — which is what a tape counter does, and it
                         // means the bar fills left to right as you play rather
                         // than sitting empty until you stop.
-                        lp.mark_rec_env(pos * ENV_BUCKETS / sh.max_frames, v.abs());
+                        lp.mark_rec_env(pos * ENV_BUCKETS / sh.max_frames, loudest);
                     } else {
                         // Modular: an overdub may go round as many times as it
                         // likes, summing into the same cycle.
@@ -2556,17 +2799,20 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                         // construction and the overdub goes into *that*, not
                         // into a new one — which is why `layer` is zero here and
                         // why the loop does not grow a layer per pass.
-                        if revox {
-                            // What is on the tape, dulled, quieter, with the
-                            // new sound on top of it. The filter runs along the
-                            // tape rather than along time, which is the same
-                            // thing while the head is moving and the reason the
-                            // memory survives the wrap.
-                            let cur = sh.read(li, 0, pos);
-                            lp_mem += tone_a * (cur - lp_mem);
-                            sh.write(li, 0, pos, lp_mem * fb + v);
-                        } else {
-                            sh.add(li, layer, pos, v);
+                        for ch in 0..CHANNELS {
+                            let v = data[f * in_channels + rec_src.ch[ch]];
+                            if revox {
+                                // What is on the tape, dulled, quieter, with the
+                                // new sound on top of it. The filter runs along
+                                // the tape rather than along time, which is the
+                                // same thing while the head is moving and the
+                                // reason the memory survives the wrap.
+                                let cur = sh.read(li, 0, pos, ch);
+                                lp_mem[ch] += tone_a * (cur - lp_mem[ch]);
+                                sh.write(li, 0, pos, ch, lp_mem[ch] * fb + v);
+                            } else {
+                                sh.add(li, layer, pos, ch, v);
+                            }
                         }
                         lp.reached.fetch_max(loop_len, Ordering::Relaxed);
                         lp.rec_reached.fetch_max(out_frame + 1, Ordering::Relaxed);
@@ -2575,10 +2821,16 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                         // wherever the playhead is — including on the second and
                         // third time round, which is why this is a peak and not
                         // a store.
-                        lp.mark_rec_env(pos * ENV_BUCKETS / loop_len, v.abs());
+                        let loudest = (0..CHANNELS)
+                            .map(|ch| data[f * in_channels + rec_src.ch[ch]].abs())
+                            .fold(0.0f32, f32::max);
+                        lp.mark_rec_env(pos * ENV_BUCKETS / loop_len, loudest);
                     }
                 }
-                lp.tape_lp.store(lp_mem.to_bits(), Ordering::Relaxed);
+                // One stored memory for two, which is a small lie that costs
+                // nothing: it is the seed for the next buffer's filter and the
+                // two sides are within a sample of each other by construction.
+                lp.tape_lp.store(lp_mem[0].to_bits(), Ordering::Relaxed);
                 sh.in_frames.store(base + frames, Ordering::Release);
             },
             err_cb(err_sh),
@@ -2975,11 +3227,15 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) -> String {
             // material. They are never sounded, so nothing would have said so.
             let moved = reached.max(len).min(sh.max_frames - pre);
             for pos in (0..moved).rev() {
-                let v = sh.read(li, layer, pos);
-                sh.write(li, layer, pos + pre, v);
+                for ch in 0..CHANNELS {
+                    let v = sh.read(li, layer, pos, ch);
+                    sh.write(li, layer, pos + pre, ch, v);
+                }
             }
             for pos in 0..pre {
-                sh.write(li, layer, pos, 0.0);
+                for ch in 0..CHANNELS {
+                    sh.write(li, layer, pos, ch, 0.0);
+                }
             }
             let got = fill_from_ring(sh, li, layer, new_origin, pre, 0, false);
             lp.origin.store(new_origin, Ordering::Release);
@@ -3074,15 +3330,25 @@ fn commit(sh: &Shared, li: usize, sr: u32, late: i64) -> String {
         let last = lp.rec_reached.load(Ordering::Acquire);
         let mut undone = 0usize;
         let mut kept = 0usize;
+        let src = sh.src_of(li);
         if len > 0 {
             for f in closed_at..last {
-                let Some(v) = sh.ring_at(f - k) else { continue };
+                let Some(v0) = sh.ring_at(src, f - k, 0) else { continue };
                 let pos = (f - rec_from).rem_euclid(len as i64) as usize;
-                sh.add(li, layer, pos, -v);
-                undone += 1;
                 let at = len + (f - closed_at) as usize;
+                for ch in 0..CHANNELS {
+                    let v = if ch == 0 {
+                        v0
+                    } else {
+                        sh.ring_at(src, f - k, ch).unwrap_or(0.0)
+                    };
+                    sh.add(li, layer, pos, ch, -v);
+                    if at < sh.max_frames {
+                        sh.write(li, layer, at, ch, v);
+                    }
+                }
+                undone += 1;
                 if at < sh.max_frames {
-                    sh.write(li, layer, at, v);
                     kept += 1;
                 }
             }
@@ -3153,7 +3419,9 @@ fn draw_layer(sh: &Shared, li: usize, layer: usize, len: usize, sr: u32) {
     let mut sum = 0.0f64;
     let mut bins = [0.0f32; COLS];
     for i in 0..len {
-        let v = sh.read(li, layer, i).abs();
+        let v = (0..CHANNELS)
+            .map(|ch| sh.read(li, layer, i, ch).abs())
+            .fold(0.0f32, f32::max);
         peak = peak.max(v);
         sum += (v * v) as f64;
         let b = i * COLS / len;
@@ -3204,15 +3472,24 @@ fn fill_from_ring(
     additive: bool,
 ) -> usize {
     let k = sh.k.load(Ordering::Acquire);
+    // The loop's own source. A retroactive take lands wherever the press said,
+    // and it takes the past of the input that loop is pointed at — which is the
+    // whole reason every source keeps a ring of its own.
+    let src = sh.src_of(li);
     let mut got = 0;
     for pos in 0..len {
-        let Some(v) = sh.ring_at(from_out + pos as i64 - k) else {
+        let Some(v0) = sh.ring_at(src, from_out + pos as i64 - k, 0) else {
             continue;
         };
-        if additive {
-            sh.add(li, layer, at + pos, v);
-        } else {
-            sh.write(li, layer, at + pos, v);
+        for ch in 0..CHANNELS {
+            let v = if ch == 0 { v0 } else {
+                sh.ring_at(src, from_out + pos as i64 - k, ch).unwrap_or(0.0)
+            };
+            if additive {
+                sh.add(li, layer, at + pos, ch, v);
+            } else {
+                sh.write(li, layer, at + pos, ch, v);
+            }
         }
         got += 1;
     }
@@ -4190,6 +4467,58 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 let secs = l[1..].trim().parse::<f64>().unwrap_or(8.0);
                 return take(sh, li, sr, secs, late);
             }
+            // **Above `s`, which prefix-matches**, and above the `t` guard for
+            // the same reason `tone` is: both are char-matched and would eat a
+            // longer verb whole. This file has been bitten twice that way.
+            _ if rest.starts_with("src") => {
+                let arg = rest[3..].trim();
+                if arg.is_empty() {
+                    let i = sh.src_of(li);
+                    return format!("loop {} records from {}.", li, sh.sources[i].describe());
+                }
+                match arg.parse::<usize>() {
+                    Ok(n) if n >= 1 && n <= sh.sources.len() => {
+                        if lp.is_recording() || lp.is_armed() {
+                            return format!(
+                                "loop {} is listening or writing; changing its input \
+                                 mid-take would splice two different rooms together.",
+                                li
+                            );
+                        }
+                        lp.src.store(n - 1, Ordering::Release);
+                        return format!("loop {} records from {}.", li, sh.sources[n - 1].describe());
+                    }
+                    Ok(n) => {
+                        return format!(
+                            "there are {} sources ({}), not {}.",
+                            sh.sources.len(),
+                            sh.sources
+                                .iter()
+                                .enumerate()
+                                .map(|(i, s)| format!("{} {}", i + 1, s.name))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            n
+                        )
+                    }
+                    _ => return format!("`{}` is not a source number.", arg),
+                }
+            }
+
+            // Fold to mono at playback. Not a capture decision — the audio
+            // stays stereo — so this is free to try and free to undo.
+            "mono" | "mono1" => {
+                lp.mono.store(true, Ordering::Relaxed);
+                return format!(
+                    "loop {} folds to mono; pan places it rather than balancing it.",
+                    li
+                );
+            }
+            "mono0" => {
+                lp.mono.store(false, Ordering::Relaxed);
+                return format!("loop {} keeps its two channels; pan is a balance.", li);
+            }
+
             // **Above `s`, which prefix-matches.** `s` is sparse-multiply and
             // takes anything beginning with an s, so `sp0.5` read as "sparse,
             // could not parse the count, use 2" and quietly did a multiply. It
@@ -4866,7 +5195,11 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 );
             }
             "l" => {
-                let inp = f32::from_bits(sh.in_peak.swap(0, Ordering::Relaxed));
+                let inp = sh
+                    .in_peak
+                    .iter()
+                    .map(|p| f32::from_bits(p.swap(0, Ordering::Relaxed)))
+                    .fold(0.0f32, f32::max);
                 let out = f32::from_bits(sh.out_peak.swap(0, Ordering::Relaxed));
                 println!(
                     "  in {:>7.1} dBFS   out {:>7.1} dBFS   (peak since last check)",
@@ -4955,7 +5288,13 @@ fn save_take(sh: &Shared, li: usize, sr: u32, name: &str) -> String {
         }
         // Nothing is writing the arena here — saving is refused while
         // recording — so a plain read is a consistent read.
-        let samples: Vec<f32> = (0..len).map(|p| sh.read(li, l, p)).collect();
+        // **Interleaved stereo out.** The arena holds two channels and the WAV
+        // takes them both; a take saved as its left half would be the mono bug
+        // reappearing at the one point where it cannot be undone.
+        let samples: Vec<f32> = (0..len)
+            .flat_map(|p| (0..CHANNELS).map(move |ch| (p, ch)))
+            .map(|(p, ch)| sh.read(li, l, p, ch))
+            .collect();
         // Zero-padded because these become a SuperDirt sample bank, and its
         // loader sorts the folder lexicographically to assign `n` indices.
         // Unpadded, a tenth layer would sort between the first and the second
@@ -4963,12 +5302,12 @@ fn save_take(sh: &Shared, li: usize, sr: u32, name: &str) -> String {
         // nothing downstream can tell a misordered bank from an intended one.
         // `MAX_LAYERS` is 8 today, so this is insurance bought while it is free.
         let file = format!("layer-{:02}.wav", l);
-        if let Err(e) = std::fs::write(dir.join(&file), crate::wav::wav_bytes(&samples, sr)) {
+        if let Err(e) = std::fs::write(dir.join(&file), crate::wav::wav_bytes(&samples, sr, CHANNELS as u16)) {
             return format!("could not write {}: {}", file, e);
         }
         entries.push(format!(
-            r#"{{"file":"{}","len":{},"period":{},"phase":{}}}"#,
-            file, len, period, phase
+            r#"{{"file":"{}","len":{},"channels":{},"period":{},"phase":{}}}"#,
+            file, len, CHANNELS, period, phase
         ));
         written += 1;
     }
@@ -5166,10 +5505,10 @@ fn selftest(sh: &Shared, sr: u32, secs: f64) -> Result<(), Box<dyn Error>> {
     let click_at = |c: usize| -> f32 {
         let mut best = 0f32;
         for d in 0..64usize {
-            best = best.max(sh.sample_at(li, 0, (c * len + d) % new_len).abs());
+            best = best.max(sh.sample_at(li, 0, (c * len + d) % new_len, 0).abs());
             if c * len + len > d {
                 let back = (c * len + new_len - d - 1) % new_len;
-                best = best.max(sh.sample_at(li, 0, back).abs());
+                best = best.max(sh.sample_at(li, 0, back, 0).abs());
             }
         }
         best
@@ -5279,7 +5618,7 @@ fn onset_of(sh: &Shared, li: usize, layer: usize, len: usize) -> Option<(i64, f3
     let mut peak = 0f32;
     let mut peak_at = 0usize;
     for i in 0..len {
-        let v = sh.read(li, layer, i).abs();
+        let v = (0..CHANNELS).map(|c| sh.read(li, layer, i, c).abs()).fold(0.0f32, f32::max);
         if v > peak {
             peak = v;
             peak_at = i;
@@ -5291,7 +5630,7 @@ fn onset_of(sh: &Shared, li: usize, layer: usize, len: usize) -> Option<(i64, f3
     let mut onset = peak_at;
     for _ in 0..len {
         let prev = (onset + len - 1) % len;
-        if sh.read(li, layer, prev).abs() <= 0.01 {
+        if (0..CHANNELS).map(|c| sh.read(li, layer, prev, c).abs()).fold(0.0f32, f32::max) <= 0.01 {
             break;
         }
         onset = prev;
@@ -5365,6 +5704,58 @@ mod tests {
                 .abs()
                 < 1e-9
         );
+    }
+
+    /// **Balance is not pan, and the difference is what a centred loop sounds
+    /// like.**
+    ///
+    /// The knob was equal-power throughout, which is right for placing one
+    /// signal and wrong for two that are already in a field: at centre it takes
+    /// 3 dB off both sides for nothing, and turning it collapses a width that
+    /// was recorded rather than inventing one.
+    #[test]
+    fn a_stereo_loop_is_balanced_and_a_folded_one_is_panned() {
+        let lp = Loop::new();
+
+        // Centre. A balance leaves both sides alone; a pan is 3 dB down on each
+        // because it is spending the difference on placing a mono signal.
+        lp.pan.store(64, Ordering::Relaxed);
+        let (bl, br) = lp.balance_gains();
+        assert!((bl - 1.0).abs() < 0.02 && (br - 1.0).abs() < 0.02, "{} {}", bl, br);
+        let (pl, pr) = lp.pan_gains();
+        assert!((pl - 0.707).abs() < 0.02 && (pr - 0.707).abs() < 0.02, "{} {}", pl, pr);
+
+        // Hard over: silence on the far side, unity on the near one.
+        lp.pan.store(0, Ordering::Relaxed);
+        let (bl, br) = lp.balance_gains();
+        assert!((bl - 1.0).abs() < 1e-6 && br.abs() < 1e-6);
+        lp.pan.store(127, Ordering::Relaxed);
+        let (bl, br) = lp.balance_gains();
+        assert!(bl.abs() < 1e-6 && (br - 1.0).abs() < 1e-6);
+
+        // **Attenuating only, at every position.** A balance that boosted would
+        // make a loop louder than it was recorded and there is no headroom to
+        // spend on that.
+        for v in 0..=127u8 {
+            lp.pan.store(v as usize, Ordering::Relaxed);
+            let (l, r) = lp.balance_gains();
+            assert!(l <= 1.0 + 1e-6 && r <= 1.0 + 1e-6, "at {}: {} {}", v, l, r);
+            assert!(l >= 0.0 && r >= 0.0);
+        }
+    }
+
+    /// A mono jack is a source whose two channels are the same input, and
+    /// nothing downstream needs a special case for it.
+    #[test]
+    fn a_one_channel_source_reads_the_same_input_twice() {
+        let s = Source::mono("di", 2);
+        assert_eq!(s.ch, [2, 2]);
+        assert!(s.is_mono());
+        assert_eq!(s.describe(), "di (in 3)");
+
+        let board = Source { name: "board".into(), ch: [0, 1] };
+        assert!(!board.is_mono());
+        assert_eq!(board.describe(), "board (in 1+2)");
     }
 
     #[test]

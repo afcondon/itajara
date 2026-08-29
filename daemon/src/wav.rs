@@ -16,11 +16,18 @@
 //! SuperCollider) and CoreAudio, and the strict form costs twenty bytes.
 
 /// Bytes of a mono 32-bit-float WAV holding `samples`.
-pub fn wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
+/// **`channels` is a parameter now, and interleaved samples are expected.**
+///
+/// It was a constant 1, because the engine was mono. A stereo take written with
+/// a mono header would play at double speed with the channels alternating — a
+/// failure that is obvious the first time and impossible to spot in a file
+/// listing, which is why the count comes from the caller rather than from an
+/// assumption here.
+pub fn wav_bytes(samples: &[f32], sample_rate: u32, channels: u16) -> Vec<u8> {
     const FMT_LEN: u32 = 18;
     const FLOAT_FORMAT: u16 = 3;
-    const CHANNELS: u16 = 1;
     const BYTES_PER_SAMPLE: u16 = 4;
+    let channels = channels.max(1);
 
     let data_len = (samples.len() * BYTES_PER_SAMPLE as usize) as u32;
     // "WAVE", then fmt, fact and data chunks each with their 8-byte header.
@@ -34,10 +41,14 @@ pub fn wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     b.extend_from_slice(b"fmt ");
     b.extend_from_slice(&FMT_LEN.to_le_bytes());
     b.extend_from_slice(&FLOAT_FORMAT.to_le_bytes());
-    b.extend_from_slice(&CHANNELS.to_le_bytes());
+    b.extend_from_slice(&channels.to_le_bytes());
     b.extend_from_slice(&sample_rate.to_le_bytes());
-    b.extend_from_slice(&(sample_rate * BYTES_PER_SAMPLE as u32).to_le_bytes());
-    b.extend_from_slice(&BYTES_PER_SAMPLE.to_le_bytes());
+    // Byte rate and block align both carry the channel count. Getting either
+    // wrong makes a file that opens and plays at the wrong speed.
+    b.extend_from_slice(
+        &(sample_rate * BYTES_PER_SAMPLE as u32 * channels as u32).to_le_bytes(),
+    );
+    b.extend_from_slice(&(BYTES_PER_SAMPLE * channels).to_le_bytes());
     b.extend_from_slice(&32u16.to_le_bytes());
     b.extend_from_slice(&0u16.to_le_bytes());
 
@@ -45,7 +56,10 @@ pub fn wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     // than derive from the data length.
     b.extend_from_slice(b"fact");
     b.extend_from_slice(&4u32.to_le_bytes());
-    b.extend_from_slice(&(samples.len() as u32).to_le_bytes());
+    // **Frames, not samples.** `fact` counts sample *frames* per channel, and
+    // a stereo file that declared twice as many would tell a reader the take is
+    // twice as long as it is.
+    b.extend_from_slice(&((samples.len() / channels as usize) as u32).to_le_bytes());
 
     b.extend_from_slice(b"data");
     b.extend_from_slice(&data_len.to_le_bytes());
@@ -75,7 +89,7 @@ mod tests {
     #[test]
     fn header_declares_the_lengths_it_actually_wrote() {
         let samples = vec![0.0f32, 1.0, -1.0, 2.5];
-        let b = wav_bytes(&samples, 48_000);
+        let b = wav_bytes(&samples, 48_000, 1);
 
         assert_eq!(&b[0..4], b"RIFF");
         assert_eq!(&b[8..12], b"WAVE");
@@ -88,7 +102,7 @@ mod tests {
     #[test]
     fn samples_survive_the_round_trip_including_above_unity() {
         let samples = vec![0.0f32, 0.5, -0.5, 2.5, -3.25];
-        let b = wav_bytes(&samples, 48_000);
+        let b = wav_bytes(&samples, 48_000, 1);
         let data = &b[b.len() - samples.len() * 4..];
         let got: Vec<f32> = data
             .chunks_exact(4)
@@ -110,7 +124,7 @@ mod tests {
             .map(|i| (i as f32 / sr as f32 * 440.0 * std::f32::consts::TAU).sin() * 0.5)
             .collect();
         let path = std::env::temp_dir().join("itajara-wav-selftest.wav");
-        std::fs::write(&path, wav_bytes(&samples, sr)).expect("write");
+        std::fs::write(&path, wav_bytes(&samples, sr, 1)).expect("write");
         eprintln!("wrote {} — check with: afinfo {}", path.display(), path.display());
     }
 }

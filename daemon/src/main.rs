@@ -99,6 +99,10 @@ USAGE
       --takes-dir <p>   where `w` saves takes         (default ~/.itajara/takes)
       --link            take the bar from link-spike's /link/anchor, on 57125
       --link-port <n>   ...on a different port
+      --source <n=c[,c]> a named input, repeatable: `--source board=1,2`
+                        `--source di=3`. Channels count from 1. One channel is
+                        a mono jack. Without any, `--in-ch` becomes one source
+                        called `in`. A loop chooses with `<n>src<i>`.
       --preroll-ms <n>  how far before the tap the first loop actually
                         starts, pulled from the pre-roll           (default 0)
       --arm-db <n>      dBFS a sound must reach to start a level-armed
@@ -271,6 +275,46 @@ fn main() -> ExitCode {
     }
 }
 
+/// `name=l` or `name=l,r` — a source's name and the input channels it reads.
+///
+/// One-based on the command line and zero-based inside, because the jacks on
+/// the interface are numbered from one and nothing about the engine's indexing
+/// is the operator's problem.
+fn parse_source(v: &str) -> Result<engine::Source, String> {
+    let (name, chans) = v
+        .split_once('=')
+        .ok_or_else(|| format!("--source wants name=channel, not `{}`", v))?;
+    if name.is_empty() {
+        return Err(format!("--source `{}` has no name", v));
+    }
+    let mut ch = [0usize; engine::CHANNELS];
+    let parts: Vec<&str> = chans.split(',').collect();
+    if parts.is_empty() || parts.len() > engine::CHANNELS {
+        return Err(format!(
+            "--source {} wants one or {} channels, not {}",
+            name,
+            engine::CHANNELS,
+            parts.len()
+        ));
+    }
+    for (i, part) in parts.iter().enumerate() {
+        let n: usize = part
+            .trim()
+            .parse()
+            .map_err(|_| format!("--source {}: `{}` is not a channel number", name, part))?;
+        if n == 0 {
+            return Err(format!("--source {}: channels count from 1", name));
+        }
+        ch[i] = n - 1;
+    }
+    // A single channel is a mono jack: the same input on both sides, so
+    // nothing downstream needs a special case for it.
+    if parts.len() == 1 {
+        ch[1] = ch[0];
+    }
+    Ok(engine::Source { name: name.to_string(), ch })
+}
+
 fn parse_loop(args: &[String]) -> Result<engine::Opts, String> {
     let mut opts = engine::Opts::default();
     let mut i = 0;
@@ -308,6 +352,11 @@ fn parse_loop(args: &[String]) -> Result<engine::Opts, String> {
         match flag {
             "--device" => opts.device = value,
             "--in-ch" => opts.in_ch = value.parse().map_err(|_| "--in-ch wants an integer")?,
+            // `--source name=l[,r]`, repeatable. A name because "input 3" means
+            // nothing with a guitar in your hands, and a pair because a stereo
+            // pedalboard is two jacks. One channel means a mono jack, which is
+            // recorded to both sides and folded back by a loop set to `mono`.
+            "--source" => opts.sources.push(parse_source(&value)?),
             "--out-ch" => opts.out_ch = value.parse().map_err(|_| "--out-ch wants an integer")?,
             "--residual" => {
                 opts.residual = value.parse().map_err(|_| "--residual wants a number")?;
