@@ -124,6 +124,12 @@ data Verb
   -- | principle is the bar model's own, at rig scale: move the grid to the
   -- | audio, never the audio to the grid.
   | TakeTempo
+  -- | **Which input a loop records from**, one-based. Named on the wire by
+  -- | number and by name in every ack, because the daemon owns the table.
+  | Source Int
+  -- | Fold a loop's two channels together at playback. Reversible by
+  -- | construction: the audio is always kept in stereo.
+  | Mono Boolean
   -- | Clear the loop: layers and length together.
   | Clear
   -- | Fire a one-shot: one pass, rather than turning for ever.
@@ -271,6 +277,8 @@ render = case _ of
   Redo -> "y"
   ForgetLength -> "z"
   TakeTempo -> "bpm"
+  Source n -> "src" <> show n
+  Mono on -> flag "mono" on
   Clear -> "c"
   Fire -> "f"
   ClaimPast -> "t"

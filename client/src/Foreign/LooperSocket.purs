@@ -190,6 +190,10 @@ type LooperState =
   , barOrigin :: Int
   -- | What a launch waits for, in beats. `-1` is a bar, `0` is none.
   , launchQ :: Int
+  -- | What a loop can record from, in the order `src` counts them. Named
+  -- | rather than numbered, because "input 2" on an encoder is the loop
+  -- | numbering problem all over again.
+  , sources :: Array { name :: String, mono :: Boolean }
   -- | All six loops, and which one the flat fields above describe.
   -- |
   -- | The duplication is deliberate and meant to be temporary. Everything above
@@ -278,6 +282,18 @@ type LoopState =
   -- | normalised, so the app can tell a loop that was declared one bar from a
   -- | loop that has never been measured.
   , cycles :: Int
+  -- | **Which input this loop records from**, one-based, indexing `sources`.
+  -- |
+  -- | Per loop rather than per rig, because `ClaimPast` decides afterwards
+  -- | which loop a moment belongs to — so every source keeps its own pre-roll
+  -- | and the loop says which one it wants when it claims it.
+  , src :: Int
+  -- | Whether this loop's two channels are folded together at playback.
+  -- |
+  -- | A playback decision, not a capture one: the audio is always kept in
+  -- | stereo. On, the channels are summed and `pan` is a true pan; off, they
+  -- | pass through and `pan` is a balance.
+  , mono :: Boolean
   , revox :: Boolean
   -- | What a Revox pass leaves of what was under it, in decibels. Zero leaves
   -- | everything, -60 replaces it.
