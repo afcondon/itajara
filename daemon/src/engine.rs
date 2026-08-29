@@ -50,7 +50,15 @@ use rand::{Rng, SeedableRng};
 
 use crate::measure::{choose_input, choose_output, signed_secs, Width};
 
-pub const MAX_LAYERS: usize = 8;
+/// How deep a loop can be stacked.
+///
+/// **Four, down from eight on 2026-08-29**, because the arena is
+/// `loops × layers × frames × channels` and layers were the cheapest of those
+/// to give back: eight were never used, and halving them buys twice the loop
+/// length for the same footprint. Undo and redo still walk the whole stack, so
+/// the ceiling is a ceiling and not a discipline — `t` and `r` both refuse at
+/// it, and say so.
+pub const MAX_LAYERS: usize = 4;
 
 /// How many bars a loop may be declared, and how sparsely a layer may sound.
 ///
@@ -192,6 +200,17 @@ pub struct Opts {
     /// the engine cannot tell an operator who measured 252 from one who never
     /// looked, and cannot say which it is doing.
     pub residual_given: bool,
+    /// The longest a single loop may become, and so the stride of every layer
+    /// slot in the arena.
+    ///
+    /// **Five minutes, up from thirty seconds.** Thirty was 15 bars at 120, so
+    /// the bars knob's top half was a refusal and "grab 16 bars" was not a
+    /// gesture the engine could perform — the pre-roll remembered the audio and
+    /// there was nowhere to put it. The arena is reserved rather than resident:
+    /// measured 2026-08-29, a 703 MiB arena sat at 69 MiB RSS, because a page
+    /// nobody has recorded into is never touched. So the cost of the ceiling is
+    /// address space, and the cost of *using* it is paid a layer at a time by
+    /// whoever uses it.
     pub max_secs: f64,
     pub sample_rate: u32,
     pub buffer: Option<u32>,
@@ -233,7 +252,7 @@ impl Default for Opts {
             out_ch: 0,
             residual: 252.0,
             residual_given: false,
-            max_secs: 30.0,
+            max_secs: 300.0,
             sample_rate: 48_000,
             buffer: None,
             click: false,
@@ -5487,7 +5506,7 @@ fn save_take(sh: &Shared, li: usize, sr: u32, name: &str) -> String {
         // Unpadded, a tenth layer would sort between the first and the second
         // and every index past it would name the wrong audio — silently, since
         // nothing downstream can tell a misordered bank from an intended one.
-        // `MAX_LAYERS` is 8 today, so this is insurance bought while it is free.
+        // `MAX_LAYERS` is 4 today, so this is insurance bought while it is free.
         let file = format!("layer-{:02}.wav", l);
         if let Err(e) = std::fs::write(dir.join(&file), crate::wav::wav_bytes(&samples, sr, CHANNELS as u16)) {
             return format!("could not write {}: {}", file, e);
