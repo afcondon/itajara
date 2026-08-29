@@ -4207,6 +4207,70 @@ fn tempo_of(len: usize, bars: usize, sr: u32, quantum: f64) -> f64 {
     60.0 * beats_per_bar * bars.max(1) as f64 / secs
 }
 
+/// Every loop that holds something, from the top, together.
+///
+/// **Not eight unmutes.** `h1` restores audibility and leaves each loop wherever
+/// its own phase had got to, so a set of a four-bar, a three-bar and a one-bar
+/// loop came back in whatever relationship they happened to be in — and since
+/// the lengths differ, "where they happened to be" is not a musical fact about
+/// anything. Starting the set means *starting* it, which means one origin for
+/// all of them.
+///
+/// It reuses the request the fire switch sends, because `FIRE` already is this:
+/// stamp the origin, put the playhead at the top (at the end, going backwards),
+/// unmute. The only thing it adds is a `shot_end`, and that is read only
+/// through `firing()`, which tests `one_shot` first — so on a loop that is not
+/// a one-shot it is a number nothing consults.
+///
+/// **One deadline for all of them, computed once here.** That is the whole
+/// point: eight loops each asking `next_boundary` at eight slightly different
+/// moments is eight answers, and the set would land ragged in exactly the way
+/// this exists to prevent. It is `next_boundary` rather than the bar outright,
+/// so Start All lands on whatever `launch quantise` is already set to and does
+/// not become a second opinion about when a launch happens.
+fn start_all(sh: &Shared, sr: u32) -> String {
+    let now = sh.out_frames.load(Ordering::Acquire) as i64;
+    let at = sh.next_boundary(now);
+    let mut n = 0usize;
+    let mut busy = 0usize;
+    for li in 0..N_LOOPS {
+        let lp = sh.lp(li);
+        if lp.loop_len.load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        // A take in progress is not part of the set yet, and restarting the loop
+        // being written into would move the origin out from under the recording.
+        if lp.is_recording() || lp.is_armed() {
+            busy += 1;
+            continue;
+        }
+        lp.request_at.store(at.unwrap_or(i64::MIN), Ordering::Release);
+        lp.request.set(FIRE);
+        n += 1;
+    }
+    if n == 0 {
+        return if busy > 0 {
+            "nothing to start — everything with audio in it is still recording.".into()
+        } else {
+            "nothing to start — no loop has anything in it.".into()
+        };
+    }
+    format!(
+        "{} loop{} start from the top together{}.{}",
+        n,
+        if n == 1 { "" } else { "s" },
+        match at {
+            Some(t) => format!(" on the grid in {:.2} s", (t - now).max(0) as f64 / sr as f64),
+            None => String::new(),
+        },
+        if busy > 0 {
+            format!(" {} still recording, left alone.", busy)
+        } else {
+            String::new()
+        }
+    )
+}
+
 fn rotate(sh: &Shared, li: usize) -> String {
     let lp = sh.lp(li);
     let layers = lp.n_layers.load(Ordering::Acquire);
@@ -4727,6 +4791,10 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // and this file has been bitten twice by a prefix guard eating a
             // longer verb — see the note above `tone`.
             "bpm" => return take_tempo(sh, li, sr),
+            // Rig-wide, and exact-matched for the reason `bpm` above it is:
+            // `g` is already a verb (grid), so a prefix guard here would be a
+            // collision rather than a convenience.
+            "go" => return start_all(sh, sr),
             "d" => return dense(sh, li),
             "z" => return free_length(sh, li, sr),
             // **Ahead of every prefix guard below and behind every one above.**

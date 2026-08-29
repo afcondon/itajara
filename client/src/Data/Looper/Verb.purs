@@ -177,6 +177,20 @@ data Verb
   -- | those receivers can do them itself.
   | ExportSet String
 
+  -- | Every loop that holds something, from the top, **together**.
+  -- |
+  -- | This was eight `Sounding true`s, and eight unmutes is not a start: mute
+  -- | never moved a playhead, so the set came back in whatever phase
+  -- | relationship it happened to be in — which, when the loops are four bars,
+  -- | three and one, is not a musical fact about anything.
+  -- |
+  -- | Bare and rig-wide, and the deadline is computed once inside the daemon:
+  -- | eight commands asking for the next boundary at eight slightly different
+  -- | moments would get eight answers and land ragged, which is the thing this
+  -- | exists to prevent. It lands on whatever `launch quantise` says, so it is
+  -- | not a second opinion about when a launch happens.
+  | StartAll
+
 
   -- | Audible, or silenced but still turning. `Sounding false` is `h0`.
   -- |
@@ -299,6 +313,7 @@ render = case _ of
   ClaimPast -> "t"
   SaveTake name -> "w" <> name
   ExportSet name -> "ex" <> name
+  StartAll -> "go"
 
   Sounding on -> flag "h" on
   OnGrid on -> flag "g" on
