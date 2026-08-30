@@ -73,9 +73,11 @@ recipes =
     , why: "The way in when the piece starts with a drum machine rather than \
            \with you. Get to the Grab bank with a hold on G — the same switch \
            \Arm is on — and have Patterning (or anything with Start/Stop Sync \
-           \ticked) loaded and stopped."
+           \ticked) loaded and stopped. Choosing the loop sets it up: on the \
+           \grid, listening to the iPad. There is no input to go and find."
     , steps:
-        [ step "Grab bank" "press Loop 4, or Loop 8 for the other one"
+        [ says "Grab bank" "press Loop 4, or Loop 8 for the other one"
+               "loop 3 records from ipad (in 5+6)."
         , says "Grab bank" "press 4 bars"
                "loop 3 starts on the grid in 1.94 s."
         , says "" "the iPad comes in on the downbeat and four bars go by"
@@ -90,12 +92,18 @@ recipes =
                  \starts the session, sets the grid, declares the length and \
                  \records — and the recording waits for the downbeat rather \
                  \than for your foot, which is why nothing here needs counting \
-                 \in. **Layering is the same press again**: a second grab onto \
-                 \a loop that already holds one is an overdub, so a hat over a \
-                 \kick is `4 bars` twice with the pattern changed in between. \
-                 \A double on the loop switch undoes the last one. And Halt \
-                 \stops the Link *session*, so it stops Ableton too — that is \
-                 \what a session transport is, not a leak."
+                 \in. **Two machines go in the two loops, not in one loop \
+                 \twice.** Both grab loops open on the grid always, so their \
+                 \bar lines are the same bar lines and the two beats agree \
+                 \about where one is. Layering a second grab into the *same* \
+                 \loop is an overdub, and an overdub starts at the play head \
+                 \rather than on a bar line — measured — so the iPad's own \
+                 \downbeat lands wherever the loop happens to be, and a \
+                 \pattern longer than a bar can come back rotated. Layer by \
+                 \hand, into two loops by foot. A double on the loop switch \
+                 \undoes the last one. And Halt stops the Link *session*, so \
+                 \it stops Ableton too — that is what a session transport is, \
+                 \not a leak."
     }
   , { name: "A four-bar first loop, in time"
     , why: "The ordinary way in when Link is running and you want to sit on \
