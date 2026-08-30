@@ -2870,6 +2870,12 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                 let loop_len = lp.loop_len.load(Ordering::Acquire);
                 let layer = lp.n_layers.load(Ordering::Acquire);
                 let revox = lp.revox.load(Ordering::Relaxed);
+                // Whether the playhead is anywhere other than where a linear
+                // write would put it. Once a buffer, because it is a property of
+                // the loop and not of a frame — and `plain` is the same question
+                // every writer in this file has always asked, so the two cannot
+                // come to disagree about what unity means.
+                let moving = !lp.plain();
                 let fb = f32::from_bits(lp.fb.load(Ordering::Relaxed));
                 // The one-pole's coefficient, worked out once a buffer rather
                 // than once a frame — it only changes when the knob does.
@@ -2923,6 +2929,72 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                         // Modular: an overdub may go round as many times as it
                         // likes, summing into the same cycle.
                         if loop_len == 0 {
+                            continue;
+                        }
+                        // **The write head follows the PLAY head.**
+                        //
+                        // At unity the two are the same ramp, and this is the
+                        // fast branch that has always been here: one input
+                        // frame, one slot. At any other rate they are not, and
+                        // a linear write would put what you played somewhere
+                        // you never heard it — which is why recording into a
+                        // loop at speed used to be refused outright rather than
+                        // done wrongly.
+                        //
+                        // The moving branch below spans instead of picking. One
+                        // input frame covers an interval of the loop, and it is
+                        // added to every slot that interval touches, weighted by
+                        // how much of that slot it covers. That one rule gives
+                        // all three cases without a case for any of them:
+                        //
+                        //   - **backwards** walks the interval down, one slot to
+                        //     one frame, exactly and with no resampling at all;
+                        //   - **half speed** has two input frames sharing a slot
+                        //     at half weight each, which is their average — so
+                        //     what comes back is what you played, not twice as
+                        //     loud;
+                        //   - **double speed** has one input frame filling two
+                        //     slots at full weight, a zero-order hold.
+                        //
+                        // And at unity the interval is exactly one slot at
+                        // weight one, which is the branch above — so the common
+                        // path keeps its single write and this cannot change
+                        // what it does.
+                        if moving {
+                            let a = lp.raw_pos(out_frame);
+                            let b = lp.raw_pos(out_frame + 1);
+                            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                            let mut slot = lo.floor() as i64;
+                            let mut first = true;
+                            // A stopped loop has `hi == lo` and writes nothing,
+                            // which is right: there is nowhere for it to go.
+                            while (slot as f64) < hi {
+                                let cover = (((slot + 1) as f64).min(hi)
+                                    - (slot as f64).max(lo))
+                                    .max(0.0) as f32;
+                                if cover > 0.0 {
+                                    let p = slot.rem_euclid(loop_len as i64) as usize;
+                                    for ch in 0..CHANNELS {
+                                        let v = data[f * in_channels + rec_src.ch[ch]];
+                                        sh.add(li, layer, p, ch, v * cover);
+                                    }
+                                    if first {
+                                        let loudest = (0..CHANNELS)
+                                            .map(|ch| {
+                                                data[f * in_channels + rec_src.ch[ch]].abs()
+                                            })
+                                            .fold(0.0f32, f32::max);
+                                        lp.mark_rec_env(
+                                            p * ENV_BUCKETS / loop_len,
+                                            loudest,
+                                        );
+                                        first = false;
+                                    }
+                                }
+                                slot += 1;
+                            }
+                            lp.reached.fetch_max(loop_len, Ordering::Relaxed);
+                            lp.rec_reached.fetch_max(out_frame + 1, Ordering::Relaxed);
                             continue;
                         }
                         let pos = (rel % loop_len as i64) as usize;
@@ -4487,7 +4559,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     if let Some(other) = busy_elsewhere(sh, li) {
                         return other;
                     }
-                    if let Some(no) = not_plain(lp, li) {
+                    if let Some(no) = not_writable(lp, li) {
                         return no;
                     }
                     let layer = lp.n_layers.load(Ordering::Acquire);
@@ -5568,6 +5640,50 @@ fn busy_elsewhere(sh: &Shared, li: usize) -> Option<String> {
 /// grid is moving under it, so there is no honest place to put the samples —
 /// and the answer that would look like it worked (resample the input, or quietly
 /// snap back to rate one) is the answer this project keeps refusing.
+/// Whether this loop can be written into *now*, which is a narrower question
+/// than whether it is playing plainly.
+///
+/// **Speed and direction stopped being refusals on 2026-08-30.** The write head
+/// follows the play head now (see the input callback), so a loop running
+/// backwards or at half speed takes an overdub and gives back what you played.
+/// That was the whole of the old refusal and it is gone.
+///
+/// What is left is two things the span-write cannot answer for:
+///
+///   - **A pendulum** reflects rather than wrapping, so `raw_pos` is not the
+///     position — the fold happens after it. A write head reading raw would run
+///     off the end and come back through the audio it just laid down.
+///   - **A tape at speed.** Revox reads, filters and writes one slot per frame;
+///     it is a physical model of a head passing over oxide, and a head that
+///     covers two slots or half of one is a different machine. Threading a tape
+///     is a deliberate act, so being told to put the speed back is fair.
+///
+/// And a *first* take still wants unity, because an empty loop has no play head
+/// to follow: the linear write is all there is, and the speed it would be
+/// played back at is not a thing the recording can compensate for.
+fn not_writable(lp: &Loop, li: usize) -> Option<String> {
+    if lp.pendulum.load(Ordering::Relaxed) {
+        return Some(format!(
+            "loop {} is swinging, and a write head cannot follow a playhead that \
+             turns round mid-pass; `{}pend0` to record into it.",
+            li, li
+        ));
+    }
+    if lp.revox.load(Ordering::Relaxed) && !lp.plain() {
+        return Some(format!(
+            "loop {} is a tape running at x{}; a tape head passes over the oxide \
+             once per frame, so put the speed back with `{}sp1` to record onto it.",
+            li,
+            lp.speed().abs(),
+            li
+        ));
+    }
+    if lp.loop_len.load(Ordering::Acquire) == 0 {
+        return not_plain(lp, li);
+    }
+    None
+}
+
 fn not_plain(lp: &Loop, li: usize) -> Option<String> {
     if lp.plain() {
         return None;
@@ -6136,6 +6252,72 @@ mod tests {
         sh.lp(0).speed.store(0.5f64.to_bits(), Ordering::Relaxed);
         let out = sh.render_loop(0).expect("renders");
         assert_eq!(out.len(), 200 * CHANNELS);
+    }
+
+    /// **The span write puts one input frame's worth into the loop, whatever
+    /// the rate.**
+    ///
+    /// The law the overdub-at-speed branch rests on, checked as arithmetic
+    /// rather than through the audio callback — which needs a device. For one
+    /// input frame the head covers `[a, b)`, and the weights it hands out are
+    /// each slot's share of that interval. Two properties matter and both are
+    /// here: the weights sum to the span, so half speed averages its two frames
+    /// into one slot instead of doubling them; and at unity there is exactly one
+    /// slot at weight one, so the fast path and the moving path agree at the
+    /// only rate where both run.
+    fn spans(a: f64, b: f64) -> Vec<(i64, f32)> {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let mut out = Vec::new();
+        let mut slot = lo.floor() as i64;
+        while (slot as f64) < hi {
+            let cover =
+                (((slot + 1) as f64).min(hi) - (slot as f64).max(lo)).max(0.0) as f32;
+            if cover > 0.0 {
+                out.push((slot, cover));
+            }
+            slot += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn one_input_frame_lands_once_however_fast_the_head_is_moving() {
+        // Unity: one slot, full weight. The same answer the linear branch gives,
+        // which is why that branch can stay and be trusted.
+        assert_eq!(spans(10.0, 11.0), vec![(10, 1.0)]);
+
+        // Backwards at unity: one slot, full weight, walking down. No
+        // resampling at all — this is the case that is exact.
+        assert_eq!(spans(11.0, 10.0), vec![(10, 1.0)]);
+
+        // Half speed: two consecutive input frames share a slot at half each,
+        // which is their average and not their sum. Getting this wrong is a
+        // loop that comes back 6 dB hot and only when it is slowed down.
+        let first = spans(10.0, 10.5);
+        let second = spans(10.5, 11.0);
+        assert_eq!(first, vec![(10, 0.5)]);
+        assert_eq!(second, vec![(10, 0.5)]);
+        let total: f32 = first.iter().chain(second.iter()).map(|(_, w)| w).sum();
+        assert!((total - 1.0).abs() < 1e-6, "two frames, one slot's worth");
+
+        // Double speed: one frame fills two slots outright — a zero-order hold,
+        // which is the honest thing to do with samples that were never taken.
+        assert_eq!(spans(10.0, 12.0), vec![(10, 1.0), (11, 1.0)]);
+
+        // A stopped loop writes nowhere. There is no position for it to go to,
+        // and picking one would smear a note into a single slot for as long as
+        // a foot stayed down.
+        assert!(spans(10.0, 10.0).is_empty());
+
+        // Every weight is a share of a slot, so none can exceed one — the
+        // property that keeps a rate the arena has never seen from writing
+        // something louder than was played.
+        for (num, den) in [(1, 3), (2, 3), (7, 4), (13, 5)] {
+            let step = num as f64 / den as f64;
+            for (_, w) in spans(3.25, 3.25 + step) {
+                assert!(w <= 1.0 + 1e-6, "weight {} over span {}", w, step);
+            }
+        }
     }
 
     /// An empty loop is skipped rather than exported as silence.
