@@ -69,7 +69,35 @@ says at act expect = { at, act, expect: Just expect }
 
 recipes :: Array Recipe
 recipes =
-  [ { name: "A four-bar first loop, in time"
+  [ { name: "A beat off the iPad, four bars of it"
+    , why: "The way in when the piece starts with a drum machine rather than \
+           \with you. Get to the Grab bank with a hold on G — the same switch \
+           \Arm is on — and have Patterning (or anything with Start/Stop Sync \
+           \ticked) loaded and stopped."
+    , steps:
+        [ step "Grab bank" "press Loop 4, or Loop 8 for the other one"
+        , says "Grab bank" "press 4 bars"
+               "loop 3 starts on the grid in 1.94 s."
+        , says "" "the iPad comes in on the downbeat and four bars go by"
+               "loop 3 committed: 8.000 s, 1 layer playing."
+        , says "Grab bank" "press Halt — the iPad is still playing otherwise"
+               "asked Link to stop — peers with start/stop sync follow."
+        , step "Grab bank" "press < Loops, and make guitar loops against it"
+        ]
+    , note: Just "**One press does four things**, and it has to: the iPad will \
+                 \not play until Link's transport starts, and the take has to \
+                 \open on the same bar line the transport does. So `4 bars` \
+                 \starts the session, sets the grid, declares the length and \
+                 \records — and the recording waits for the downbeat rather \
+                 \than for your foot, which is why nothing here needs counting \
+                 \in. **Layering is the same press again**: a second grab onto \
+                 \a loop that already holds one is an overdub, so a hat over a \
+                 \kick is `4 bars` twice with the pattern changed in between. \
+                 \A double on the loop switch undoes the last one. And Halt \
+                 \stops the Link *session*, so it stops Ableton too — that is \
+                 \what a session transport is, not a leak."
+    }
+  , { name: "A four-bar first loop, in time"
     , why: "The ordinary way in when Link is running and you want to sit on \
            \Ableton's grid. Check the legend reads a tempo before you start."
     , steps:

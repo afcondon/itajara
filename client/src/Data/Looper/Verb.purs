@@ -190,6 +190,23 @@ data Verb
   -- | exists to prevent. It lands on whatever `launch quantise` says, so it is
   -- | not a second opinion about when a launch happens.
   | StartAll
+  -- | The Link session's transport, started or stopped.
+  -- |
+  -- | **The one verb in this module that touches no audio.** It leaves the
+  -- | daemon again immediately as OSC to link-spike, which owns the Link
+  -- | session; itajara is only the pipe, because the app is a browser and a
+  -- | browser cannot send a UDP packet.
+  -- |
+  -- | It is here because the drum machine is on the iPad, and an iPad app
+  -- | follows Link's Start/Stop Sync and nothing else this rig can send. So
+  -- | "play the beat" is not a message to Patterning; it is a message to the
+  -- | session, which Patterning is already listening to.
+  -- |
+  -- | A start is scheduled by link-spike for the **next bar line**, without
+  -- | moving the beat grid — so this and a grid-quantised `Record` are waiting
+  -- | for the same downbeat and land together. That is the whole of why a grab
+  -- | is two commands and not a new one in the daemon.
+  | Playing Boolean
 
 
   -- | Audible, or silenced but still turning. `Sounding false` is `h0`.
@@ -314,6 +331,7 @@ render = case _ of
   SaveTake name -> "w" <> name
   ExportSet name -> "ex" <> name
   StartAll -> "go"
+  Playing on -> flag "play" on
 
   Sounding on -> flag "h" on
   OnGrid on -> flag "g" on

@@ -4886,6 +4886,34 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // `g` is already a verb (grid), so a prefix guard here would be a
             // collision rather than a convenience.
             "go" => return start_all(sh, sr),
+            // The session transport, rig-wide, exact-matched for the same
+            // reason `bpm` and `go` are: `p` is a verb already and `pan`,
+            // `pend` and `ph` all start with it, so a prefix guard here would
+            // be a collision dressed as a convenience.
+            //
+            // **This is the only verb in the engine that does nothing to
+            // audio.** It exists because the drum machine is on the iPad and
+            // the iPad follows Link's Start/Stop Sync and nothing else — so
+            // "play the beat and record four bars of it" is two commands from
+            // the app, and this is the first one. The second is an ordinary
+            // grid-quantised `r`, which is waiting for the same bar line
+            // link-spike is scheduling the start on.
+            //
+            // The ack is deliberately conditional. There is no reply from
+            // link-spike, so success here means the bytes left the machine and
+            // nothing more; saying "transport started" would be claiming to
+            // know something this daemon cannot see.
+            "play1" | "play0" => {
+                let on = rest.ends_with('1');
+                return match crate::link::set_playing(on, crate::link::DEFAULT_TEMPO_PORT) {
+                    Ok(()) => format!(
+                        "asked Link to {} — peers with start/stop sync follow{}.",
+                        if on { "start on the next bar" } else { "stop" },
+                        if on { " on the downbeat" } else { "" }
+                    ),
+                    Err(e) => format!("could not reach the transport: {}", e),
+                };
+            }
             "d" => return dense(sh, li),
             "z" => return free_length(sh, li, sr),
             // **Ahead of every prefix guard below and behind every one above.**

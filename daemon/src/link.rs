@@ -76,6 +76,35 @@ pub fn set_tempo(bpm: f64, port: u16) -> Result<(), String> {
     Ok(())
 }
 
+/// Start or stop the Link session's transport, through link-spike.
+///
+/// **The verb the iPad answers to.** Patterning, AUM and Ableton all follow
+/// Link's Start/Stop Sync; none of them follow anything else this rig sends.
+/// So the way to make a drum machine play on cue is not to reach for its own
+/// transport at all — it is to start the session, and let every peer that
+/// cares come in on the downbeat together.
+///
+/// Fire and forget, like `set_tempo`, and for the same reason: link-spike is
+/// the only thing that can see the session and there is no reply channel back.
+/// What confirms it is hearing the drums.
+///
+/// link-spike schedules a start for the **next bar line** without moving the
+/// beat grid, which is why a grab and a `g`-quantised recording land together
+/// — both are waiting for the same downbeat, derived from the same anchor.
+pub fn set_playing(on: bool, port: u16) -> Result<(), String> {
+    let msg = rosc::OscMessage {
+        addr: "/link/play".into(),
+        args: vec![OscType::Int(if on { 1 } else { 0 })],
+    };
+    let bytes = rosc::encoder::encode(&OscPacket::Message(msg))
+        .map_err(|e| format!("could not encode the transport message: {}", e))?;
+    let sock = UdpSocket::bind(("127.0.0.1", 0))
+        .map_err(|e| format!("could not open a socket to send it on: {}", e))?;
+    sock.send_to(&bytes, ("127.0.0.1", port))
+        .map_err(|e| format!("could not reach link-spike on {}: {}", port, e))?;
+    Ok(())
+}
+
 /// Listen for `/link/anchor` and keep the newest one.
 ///
 /// Binding failure is reported and then tolerated: no Link means no bar, which
