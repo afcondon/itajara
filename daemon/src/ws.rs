@@ -297,9 +297,11 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                 // told, which reads as one everywhere — reported as stored, so
                 // the app can tell "one bar" from "nobody has said".
                 lp.cycles.load(Ordering::Acquire),
-                lp.window().map(|w| w.0).unwrap_or(0),
-                lp.window().map(|w| w.1).unwrap_or(0),
-                lp.rot.load(Ordering::Relaxed),
+                // As the hand has set them — pending while an edit waits to
+                // be applied — so the page shows what was asked, not the past.
+                lp.edit_view().0,
+                lp.edit_view().1,
+                lp.edit_view().2,
                 // **One-based, because it is an index into a list a person
                 // reads.** The wire counts loops from zero and that is a debt
                 // being carried; a field added today should not add to it.

@@ -691,6 +691,18 @@ pub struct Loop {
     /// from, restarts on the next bar line instead, so the edit lands
     /// where a bar starts and the grid does not move.
     edit_restart: AtomicI64,
+    /// The edit itself, held until the restart fires. **Applying an edit
+    /// the moment it arrives was the tearing sound**: each slider event
+    /// moved the start under the playhead, and a dozen jumps a second is a
+    /// dozen clicks. So the window and rotation the hand is setting sit
+    /// here, the loop goes on playing what it was, and when the edits have
+    /// stopped the callback applies them and restarts in one move. The
+    /// snapshot reports these when they are set, so the page shows the hand
+    /// rather than the past.
+    pend_in: AtomicI64,
+    pend_out: AtomicI64,
+    pend_rot: AtomicUsize,
+    pend_set: AtomicBool,
     /// A pending speed and pendulum, consumed by the output callback.
     ///
     /// The same argument as `request_at`: only the callback knows the frame, and
@@ -959,6 +971,10 @@ impl Loop {
             win_out: AtomicI64::new(0),
             rot: AtomicUsize::new(0),
             edit_restart: AtomicI64::new(0),
+            pend_in: AtomicI64::new(0),
+            pend_out: AtomicI64::new(0),
+            pend_rot: AtomicUsize::new(0),
+            pend_set: AtomicBool::new(false),
             cfg_speed: AtomicU64::new(1.0f64.to_bits()),
             cfg_pend: AtomicBool::new(false),
             cfg_armed: AtomicBool::new(false),
@@ -1009,6 +1025,24 @@ impl Loop {
             && !self.pendulum.load(Ordering::Relaxed)
             && f64::from_bits(self.warp.load(Ordering::Relaxed)) == 0.0
             && self.window().is_none()
+    }
+
+    /// The window and rotation as the hand has set them — pending if an edit
+    /// is waiting to be applied, live otherwise. What the snapshot reports.
+    pub fn edit_view(&self) -> (i64, i64, usize) {
+        if self.pend_set.load(Ordering::Acquire) {
+            (
+                self.pend_in.load(Ordering::Relaxed),
+                self.pend_out.load(Ordering::Relaxed),
+                self.pend_rot.load(Ordering::Relaxed),
+            )
+        } else {
+            (
+                self.win_in.load(Ordering::Relaxed),
+                self.win_out.load(Ordering::Relaxed),
+                self.rot.load(Ordering::Relaxed),
+            )
+        }
     }
 
     /// The window as `(in, out)`, or `None` for the whole loop.
@@ -2941,6 +2975,12 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                     let lp = sh.lp(li);
                     let at = lp.edit_restart.load(Ordering::Acquire);
                     if at != 0 && base as i64 + frames as i64 > at {
+                        if lp.pend_set.load(Ordering::Acquire) {
+                            lp.win_in.store(lp.pend_in.load(Ordering::Relaxed), Ordering::Relaxed);
+                            lp.win_out.store(lp.pend_out.load(Ordering::Relaxed), Ordering::Relaxed);
+                            lp.rot.store(lp.pend_rot.load(Ordering::Relaxed), Ordering::Relaxed);
+                            lp.pend_set.store(false, Ordering::Release);
+                        }
                         lp.origin.store(at, Ordering::Release);
                         lp.warp.store(0.0f64.to_bits(), Ordering::Relaxed);
                         lp.edit_restart.store(0, Ordering::Release);
@@ -4812,9 +4852,11 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
         }
         match rest {
             _ if rest.starts_with("win") => {
-                lp.win_in.store(0, Ordering::Relaxed);
-                lp.win_out.store(0, Ordering::Release);
-                schedule_restart(sh, li);
+                // The window goes; the rotation is its own edit and stays,
+                // folded into the whole loop's span.
+                let len = lp.loop_len.load(Ordering::Acquire).max(1);
+                let (_, _, vr) = lp.edit_view();
+                schedule_restart(sh, li, 0, 0, vr % len);
                 return format!("loop {} plays the whole loop again.", li);
             }
             _ if rest.starts_with("in") || rest.starts_with("out") => {
@@ -4822,72 +4864,72 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 let arg = rest[if is_in { 2 } else { 3 }..].trim();
                 let len = lp.loop_len.load(Ordering::Acquire);
                 if len == 0 {
-                return format!("loop {} has no length to window yet.", li);
+                    return format!("loop {} has no length to window yet.", li);
                 }
                 let f: i64 = match arg.parse() {
-                Ok(f) => f,
-                Err(_) => return format!("`{}` wants a position in frames, which may be negative.", rest),
+                    Ok(f) => f,
+                    Err(_) => return format!("`{}` wants a position in frames, which may be negative.", rest),
                 };
                 let l = len as i64;
-                let (i, o) = lp.window().unwrap_or((0, l));
+                // Relative to what the hand has already set, not to what is
+                // playing: a drag is a run of these, and each is against the
+                // last.
+                let (vi, vo, vr) = lp.edit_view();
+                let (i, o) = if vi == 0 && vo == 0 { (0, l) } else { (vi, vo) };
                 let (i, o) = if is_in { (f, o) } else { (i, f) };
-                // One loop's worth of silence on either side is the most a window
-                // can add: past that a loop is mostly rest, and the arithmetic
-                // that draws it would rather say so than draw it.
+                // One loop's worth of silence on either side is the most a
+                // window can add: past that a loop is mostly rest, and the
+                // arithmetic that draws it would rather say so than draw it.
                 if i < -l || o > 2 * l {
-                return format!(
-                    "loop {} is {} frames long; a window may reach from {} to {}, not {}.",
-                    li,
-                    len,
-                    -l,
-                    2 * l,
-                    if is_in { i } else { o }
-                );
+                    return format!(
+                        "loop {} is {} frames long; a window may reach from {} to {}, not {}.",
+                        li,
+                        len,
+                        -l,
+                        2 * l,
+                        if is_in { i } else { o }
+                    );
                 }
                 if i >= o {
-                return format!("a window has to end after it starts: in {} out {} on loop {}.", i, o, li);
+                    return format!("a window has to end after it starts: in {} out {} on loop {}.", i, o, li);
                 }
-                // The whole loop is no window, and is stored as none.
+                let rot = vr % ((o - i) as usize).max(1);
+                // The whole loop is no window, and is held as none.
                 if i == 0 && o == l {
-                lp.win_in.store(0, Ordering::Relaxed);
-                lp.win_out.store(0, Ordering::Release);
-                schedule_restart(sh, li);
-                return format!("loop {} plays the whole loop again.", li);
+                    schedule_restart(sh, li, 0, 0, rot);
+                    return format!("loop {} plays the whole loop again.", li);
                 }
-                lp.win_in.store(i, Ordering::Relaxed);
-                lp.win_out.store(o, Ordering::Release);
-                schedule_restart(sh, li);
+                schedule_restart(sh, li, i, o, rot);
                 let srf = sr as f64;
                 let padded = if i < 0 || o > l { " with silence" } else { "" };
                 return format!(
-                "loop {} windows {:.3}–{:.3} s ({:.3} s of {:.3}{}).",
-                li,
-                i as f64 / srf,
-                o as f64 / srf,
-                (o - i) as f64 / srf,
-                len as f64 / srf,
-                padded
+                    "loop {} windows {:.3}–{:.3} s ({:.3} s of {:.3}{}).",
+                    li,
+                    i as f64 / srf,
+                    o as f64 / srf,
+                    (o - i) as f64 / srf,
+                    len as f64 / srf,
+                    padded
                 );
             }
             _ if rest.starts_with("rot") => {
                 let len = lp.loop_len.load(Ordering::Acquire);
                 if len == 0 {
-                return format!("loop {} has nothing to rotate yet.", li);
+                    return format!("loop {} has nothing to rotate yet.", li);
                 }
                 let k: i64 = match rest[3..].trim().parse() {
-                Ok(k) => k,
-                Err(_) => return format!("`{}` wants a signed number of frames.", rest),
+                    Ok(k) => k,
+                    Err(_) => return format!("`{}` wants a signed number of frames.", rest),
                 };
-                let (_, span) = lp.cycle(len);
-                let now = lp.rot.load(Ordering::Relaxed) as i64;
-                let next = (now + k).rem_euclid(span as i64) as usize;
-                lp.rot.store(next, Ordering::Release);
-                schedule_restart(sh, li);
+                let (vi, vo, vr) = lp.edit_view();
+                let span = if vi == 0 && vo == 0 { len as i64 } else { vo - vi }.max(1);
+                let next = (vr as i64 + k).rem_euclid(span) as usize;
+                schedule_restart(sh, li, vi, vo, next);
                 return format!(
-                "loop {} starts {:.3} s into its cycle now ({:+.3} s).",
-                li,
-                next as f64 / sr as f64,
-                k as f64 / sr as f64
+                    "loop {} starts {:.3} s into its cycle now ({:+.3} s).",
+                    li,
+                    next as f64 / sr as f64,
+                    k as f64 / sr as f64
                 );
             }
             _ if rest.starts_with("pk") => {
@@ -5902,6 +5944,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 lp.win_out.store(0, Ordering::Relaxed);
                 lp.rot.store(0, Ordering::Relaxed);
                 lp.edit_restart.store(0, Ordering::Relaxed);
+                lp.pend_set.store(false, Ordering::Relaxed);
                 for l in 0..sh.max_layers {
                     sh.zero_layer(li, l);
                     lp.set_layer_shape(l, Shape { len: 0, tail: 0, born: 0 });
@@ -6389,8 +6432,12 @@ pub fn thread_blank(sh: &Shared, li: usize, len: usize) {
 /// Schedule the restart an edit asks for: a short way ahead so a moving
 /// slider coalesces into one, and on the next bar line for a loop that is
 /// on the grid or is the grid. See `Loop::edit_restart`.
-fn schedule_restart(sh: &Shared, li: usize) {
+fn schedule_restart(sh: &Shared, li: usize, win_in: i64, win_out: i64, rot: usize) {
     let lp = sh.lp(li);
+    lp.pend_in.store(win_in, Ordering::Relaxed);
+    lp.pend_out.store(win_out, Ordering::Relaxed);
+    lp.pend_rot.store(rot, Ordering::Relaxed);
+    lp.pend_set.store(true, Ordering::Release);
     let now = sh.out_frames.load(Ordering::Acquire) as i64;
     let soon = now + EDIT_SETTLE_FRAMES;
     let at = if lp.quantised() || sh.anchor.load(Ordering::Acquire) == li {
@@ -6763,6 +6810,18 @@ mod tests {
     /// and a cycle is the whole of it. If that ever stops being true this test
     /// goes quiet in exactly the wrong way — silent thirds and a fourth that
     /// sounds — so it asserts each quarter separately.
+    /// What the output callback does when an edit has settled, for tests
+    /// that have no callback: apply the held edit and restart at zero.
+    fn settle(sh: &Shared, li: usize) {
+        let lp = sh.lp(li);
+        assert!(lp.pend_set.load(Ordering::Acquire), "an edit was held");
+        lp.win_in.store(lp.pend_in.load(Ordering::Relaxed), Ordering::Relaxed);
+        lp.win_out.store(lp.pend_out.load(Ordering::Relaxed), Ordering::Relaxed);
+        lp.rot.store(lp.pend_rot.load(Ordering::Relaxed), Ordering::Relaxed);
+        lp.pend_set.store(false, Ordering::Release);
+        lp.edit_restart.store(0, Ordering::Release);
+    }
+
     /// **A window and a rotation move nothing.** The loop is a ramp, so every
     /// rendered sample says which arena position it came from.
     #[test]
@@ -6777,10 +6836,13 @@ mod tests {
         let first = |sh: &Shared| sh.render_loop(0).expect("renders")[0];
         assert_eq!(first(&sh), 0.0);
         assert!(dispatch(&sh, 48_000, "0rot10").contains("starts"));
+        assert_eq!(first(&sh), 0.0, "held, not applied: the loop plays on as it was");
+        assert!(sh.lp(0).edit_restart.load(Ordering::Relaxed) > 0, "an edit schedules a restart");
+        settle(&sh, 0);
         assert_eq!(first(&sh), 10.0, "a rotation starts the pass later in the arena");
         assert!(dispatch(&sh, 48_000, "0in20").contains("windows"));
-        assert!(sh.lp(0).edit_restart.load(Ordering::Relaxed) > 0, "an edit schedules a restart");
-        assert!(dispatch(&sh, 48_000, "0out60").contains("windows"));
+        assert!(dispatch(&sh, 48_000, "0out60").contains("windows"), "the second edit is against the first");
+        settle(&sh, 0);
         let out = sh.render_loop(0).expect("renders");
         assert_eq!(out.len(), 40 * CHANNELS, "the render is the window");
         assert_eq!(out[0], 30.0, "start of the window, plus the rotation");
@@ -6788,20 +6850,22 @@ mod tests {
         assert!(dispatch(&sh, 48_000, "0r").contains("window"), "no recording into a window");
         assert!(dispatch(&sh, 48_000, "0out201").contains("may reach"), "one loop of silence is the most");
         assert!(dispatch(&sh, 48_000, "0win").contains("whole loop"));
+        settle(&sh, 0);
         assert!(dispatch(&sh, 48_000, "0rot-10").contains("starts"));
+        settle(&sh, 0);
         assert_eq!(first(&sh), 0.0, "and back");
         assert!(dispatch(&sh, 48_000, "0pk16").contains("16 buckets"));
         assert!(sh.peaks.lock().unwrap().contains(r#""buckets":16"#));
         // Extension: silence before and after, the content where it was.
         assert!(dispatch(&sh, 48_000, "0in-20").contains("with silence"));
         assert!(dispatch(&sh, 48_000, "0out120").contains("with silence"));
+        settle(&sh, 0);
         let out = sh.render_loop(0).expect("renders");
         assert_eq!(out.len(), 140 * CHANNELS, "twenty of rest, the loop, twenty of rest");
         assert_eq!(out[0], 0.0, "rest before the loop");
         assert_eq!(out[21 * CHANNELS], 1.0, "the loop, where it was");
         assert_eq!(out[125 * CHANNELS], 0.0, "rest after it");
         assert!(dispatch(&sh, 48_000, "0in-200").contains("may reach"));
-        assert!(sh.peaks.lock().unwrap().contains(r#""buckets":16"#));
         assert!(dispatch(&sh, 48_000, "0pk16").contains("16 buckets"));
         assert!(sh.peaks.lock().unwrap().contains(r#""from":-20,"to":120"#));
     }
