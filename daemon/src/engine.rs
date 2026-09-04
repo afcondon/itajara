@@ -5457,6 +5457,9 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // rather than on `e`, because this file has been bitten twice by a
             // one-character guard silently eating a longer verb defined below
             // it, and `ex` costs nothing to be careful with.
+            // Three characters, and ahead of `ex`: behind it, `exlriff` would
+            // export the set as "lriff" and say so cheerfully.
+            l if l.starts_with("exl") => return export_layers(sh, sr, &l[3..]),
             l if l.starts_with("ex") => return export_set(sh, sr, &l[2..]),
             l if l.starts_with('w') => return save_take(sh, li, sr, &l[1..]),
             // Take back an undo. Free, now that undo does not destroy what it
@@ -6068,27 +6071,89 @@ fn save_take(sh: &Shared, li: usize, sr: u32, name: &str) -> String {
     if lp.is_recording() || lp.is_armed() {
         return "finish the recording first — a layer still being written is half a thing.".into();
     }
-    let n = lp.n_layers.load(Ordering::Acquire);
-    let loop_len = lp.loop_len.load(Ordering::Acquire);
-    if n == 0 || loop_len == 0 {
+    if lp.n_layers.load(Ordering::Acquire) == 0 || lp.loop_len.load(Ordering::Acquire) == 0 {
         return "nothing to save yet.".into();
     }
 
     let name = safe_name(name);
     let dir = sh.takes_dir.join(&name);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        return format!("could not make {}: {}", dir.display(), e);
-    }
+    let (written, loop_len) = match write_take(sh, li, sr, &dir) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
 
-    let mut entries: Vec<String> = Vec::new();
-    let mut written = 0usize;
+    format!(
+        "saved {} layer{} ({:.3} s) to {}",
+        written,
+        if written == 1 { "" } else { "s" },
+        loop_len as f64 / sr as f64,
+        dir.display()
+    )
+}
+
+/// One layer as it will be written: the file it goes to and what the
+/// manifests say about it. Filled by `write_layers`, read by both formats.
+struct LayerFile {
+    file: String,
+    len: usize,
+    period: usize,
+    phase: usize,
+    gain: f32,
+    born: i64,
+    on: bool,
+}
+
+/// One loop's layers, raw, into `dir`: the audio and the version-1
+/// `take.json` beside it. What `w` has always written, so a folder written
+/// by `exl` is a take that reloads like any other. Returns the count written
+/// and the loop's length.
+fn write_take(sh: &Shared, li: usize, sr: u32, dir: &std::path::Path) -> Result<(usize, usize), String> {
+    let layers = write_layers(sh, li, sr, dir)?;
+    let loop_len = sh.lp(li).loop_len.load(Ordering::Acquire);
+    let entries: Vec<String> = layers
+        .iter()
+        .map(|l| {
+            format!(
+                r#"{{"file":"{}","len":{},"channels":{},"period":{},"phase":{}}}"#,
+                l.file, l.len, CHANNELS, l.period, l.phase
+            )
+        })
+        .collect();
+    // Hand-rolled for the same reason `snapshot` is: the shape is fixed and
+    // small, and every value in it is a number or a name this function chose,
+    // so there is nothing here that could need escaping.
+    let manifest = format!(
+        concat!(
+            "{{\n  \"version\": 1,\n  \"sampleRate\": {},\n",
+            "  \"loopFrames\": {},\n  \"loopSecs\": {:.6},\n  \"layers\": [\n    {}\n  ]\n}}\n"
+        ),
+        sr,
+        loop_len,
+        loop_len as f64 / sr as f64,
+        entries.join(",\n    ")
+    );
+    if let Err(e) = std::fs::write(dir.join("take.json"), manifest) {
+        return Err(format!("wrote the audio but not the manifest: {}", e));
+    }
+    Ok((layers.len(), loop_len))
+}
+
+/// The audio of one loop's layers, one WAV each, into `dir`. No manifest:
+/// the two callers write different ones.
+fn write_layers(sh: &Shared, li: usize, sr: u32, dir: &std::path::Path) -> Result<Vec<LayerFile>, String> {
+    let lp = sh.lp(li);
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        return Err(format!("could not make {}: {}", dir.display(), e));
+    }
+    let n = lp.n_layers.load(Ordering::Acquire);
+    let mut out = Vec::new();
     for l in 0..n {
         let (len, period, phase) = lp.layer_shape(l);
         if len == 0 {
             continue;
         }
         if len > crate::wav::MAX_FRAMES {
-            return format!("layer {} is longer than a WAV can address.", l);
+            return Err(format!("layer {} is longer than a WAV can address.", l));
         }
         // Nothing is writing the arena here — saving is refused while
         // recording — so a plain read is a consistent read.
@@ -6107,38 +6172,156 @@ fn save_take(sh: &Shared, li: usize, sr: u32, name: &str) -> String {
         // `--layers` is 4 by default, so this is insurance bought while it is free.
         let file = format!("layer-{:02}.wav", l);
         if let Err(e) = std::fs::write(dir.join(&file), crate::wav::wav_bytes(&samples, sr, CHANNELS as u16)) {
-            return format!("could not write {}: {}", file, e);
+            return Err(format!("could not write {}: {}", file, e));
         }
-        entries.push(format!(
-            r#"{{"file":"{}","len":{},"channels":{},"period":{},"phase":{}}}"#,
-            file, len, CHANNELS, period, phase
-        ));
-        written += 1;
+        out.push(LayerFile {
+            file,
+            len,
+            period,
+            phase,
+            gain: lp.layer_gain(l),
+            born: lp.layer_born(l),
+            on: lp.layer_on(l),
+        });
+    }
+    Ok(out)
+}
+
+/// Every loop that holds something, as a take each: `<name>/loop-<n>/` with
+/// the layers raw and a `take.json`, and one `export.json` for the set.
+///
+/// ## The third render
+///
+/// `w` is one loop's layers; `ex` is every loop flat. This is every loop's
+/// layers — the shape a sample-playing module wants when a loop is going to
+/// become a *scene* (Arbhar), a *reel* (Morphagene) or a *voice* (Rample):
+/// the six takes that were played against each other, kept apart so the
+/// module can scan across them, but grouped so they arrive together. One
+/// verb rather than a fan-out of `w`, so one ack says where it all went.
+///
+/// ## Raw, with the edit recorded beside it
+///
+/// The layers are written as they lie in the arena — the whole layer, not
+/// the window — and the window and rotation go in the manifest instead.
+/// Store everything, flatten late: the harvest that shapes these for a
+/// module applies the window itself, and needs the whole layer to do it
+/// (an Arbhar layer wants the loop's own wrap as its tail, which is audio
+/// *outside* the window). What we do not render, we record.
+///
+/// ## Version 2
+///
+/// The set manifest carries what the shaping side asks for: per loop its
+/// window, bars, tempo, source and the three things the render leaves out;
+/// per layer its gain, birth and whether it is in the mix. The per-loop
+/// `take.json` stays at version 1 so each folder reloads as a plain take.
+fn export_layers(sh: &Shared, sr: u32, name: &str) -> String {
+    // Checked across every loop before anything is written, as `ex` does.
+    for li in 0..sh.n_loops {
+        let lp = sh.lp(li);
+        if lp.is_recording() || lp.is_armed() {
+            return format!(
+                "loop {} is still recording — finish it before exporting the layers.",
+                li
+            );
+        }
     }
 
-    // Hand-rolled for the same reason `snapshot` is: the shape is fixed and
-    // small, and every value in it is a number or a name this function chose,
-    // so there is nothing here that could need escaping.
+    let name = safe_name(name);
+    let dir = sh.takes_dir.join(&name);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return format!("could not make {}: {}", dir.display(), e);
+    }
+
+    let quantum = f64::from_bits(sh.link_quantum.load(Ordering::Relaxed));
+    let beats_per_bar = if quantum >= 1.0 { quantum } else { 4.0 };
+
+    let mut entries: Vec<String> = Vec::new();
+    let mut wrote: Vec<String> = Vec::new();
+    for li in 0..sh.n_loops {
+        let lp = sh.lp(li);
+        let loop_len = lp.loop_len.load(Ordering::Acquire);
+        if lp.n_layers.load(Ordering::Acquire) == 0 || loop_len == 0 {
+            continue;
+        }
+        // Numbered from one, like `ex`: a folder name is a surface.
+        let sub = format!("loop-{}", li + 1);
+        let loop_dir = dir.join(&sub);
+        let layers = match write_layers(sh, li, sr, &loop_dir) {
+            Ok(l) => l,
+            Err(e) => return e,
+        };
+        if let Err(e) = write_take(sh, li, sr, &loop_dir) {
+            return e;
+        }
+        let bars = lp.cycles.load(Ordering::Acquire);
+        let tempo = if bars > 0 && lp.plain() {
+            format!("{:.4}", tempo_of(loop_len, bars, sr, quantum))
+        } else {
+            "null".to_string()
+        };
+        let window = match lp.window() {
+            Some((i, o)) => format!(r#"{{"in":{},"out":{}}}"#, i, o),
+            None => "null".to_string(),
+        };
+        let source = sh.sources.get(sh.src_of(li)).map(|s| s.name.as_str()).unwrap_or("");
+        let layer_entries: Vec<String> = layers
+            .iter()
+            .map(|l| {
+                format!(
+                    r#"{{"file":"{}","len":{},"channels":{},"period":{},"phase":{},"gain":{:.5},"born":{},"on":{}}}"#,
+                    l.file, l.len, CHANNELS, l.period, l.phase, l.gain, l.born, l.on
+                )
+            })
+            .collect();
+        entries.push(format!(
+            concat!(
+                "{{\"dir\":\"{}\",\"loop\":{},\"frames\":{},\"secs\":{:.6},\"bars\":{},\"tempo\":{},",
+                "\"quant\":{},\"window\":{},\"rot\":{},\"source\":\"{}\",",
+                "\"chance\":{:.4},\"oneShot\":{},\"muted\":{},\n      \"layers\":[\n        {}\n      ]}}"
+            ),
+            sub,
+            li + 1,
+            loop_len,
+            loop_len as f64 / sr as f64,
+            bars,
+            tempo,
+            lp.quant.load(Ordering::Relaxed),
+            window,
+            lp.rot.load(Ordering::Relaxed),
+            source,
+            lp.chance_of(),
+            lp.one_shot.load(Ordering::Relaxed),
+            lp.muted.load(Ordering::Relaxed),
+            layer_entries.join(",\n        "),
+        ));
+        wrote.push(sub);
+    }
+
+    if entries.is_empty() {
+        return "nothing to export — no loop has anything in it.".into();
+    }
+
+    // No timestamp, for the same reason the others have none.
     let manifest = format!(
         concat!(
-            "{{\n  \"version\": 1,\n  \"sampleRate\": {},\n",
-            "  \"loopFrames\": {},\n  \"loopSecs\": {:.6},\n  \"layers\": [\n    {}\n  ]\n}}\n"
+            "{{\n  \"version\": 2,\n  \"kind\": \"layers\",\n  \"sampleRate\": {},\n",
+            "  \"beatsPerBar\": {},\n  \"loops\": [\n    {}\n  ]\n}}\n"
         ),
         sr,
-        loop_len,
-        loop_len as f64 / sr as f64,
+        beats_per_bar,
         entries.join(",\n    ")
     );
-    if let Err(e) = std::fs::write(dir.join("take.json"), manifest) {
+    if let Err(e) = std::fs::write(dir.join("export.json"), manifest) {
         return format!("wrote the audio but not the manifest: {}", e);
     }
 
     format!(
-        "saved {} layer{} ({:.3} s) to {}",
-        written,
-        if written == 1 { "" } else { "s" },
-        loop_len as f64 / sr as f64,
-        dir.display()
+        "exported the layers of {} loop{} to {}: {} — numbered as the board labels them, so \
+         loop 0 is loop-1/.",
+        wrote.len(),
+        if wrote.len() == 1 { "" } else { "s" },
+        dir.display(),
+        wrote.join(", ")
     )
 }
 
@@ -6873,6 +7056,48 @@ mod tests {
         assert!(dispatch(&sh, 48_000, "0in-200").contains("may reach"));
         assert!(dispatch(&sh, 48_000, "0pk16").contains("16 buckets"));
         assert!(sh.peaks.lock().unwrap().contains(r#""from":-20,"to":120"#));
+    }
+
+    /// **`exl` is a take per loop and one manifest for the set.** The
+    /// folders are what `w` writes, so each reloads as a plain take; the
+    /// set manifest is version 2 and carries the edit rather than applying it.
+    #[test]
+    fn exporting_layers_writes_a_take_per_loop_and_one_set_manifest() {
+        let mut sh = rig(LEN);
+        sh.takes_dir = std::env::temp_dir().join(format!("itajara-exl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sh.takes_dir);
+        // Loop 0: two layers. Loop 2: one, windowed. Loop 1: nothing.
+        one_layer_loop(&sh, 0, 100, 0.25);
+        lay(&sh, 0, 1, 100, 0.5);
+        sh.lp(0).n_layers.store(2, Ordering::Release);
+        one_layer_loop(&sh, 2, 80, 0.75);
+        sh.lp(2).n_layers.store(1, Ordering::Release);
+        assert!(dispatch(&sh, 48_000, "2in10").contains("windows"));
+        settle(&sh, 2);
+
+        let ack = dispatch(&sh, 48_000, "exlriff");
+        assert!(ack.contains("layers of 2 loops"), "ack was: {}", ack);
+        assert!(ack.contains("loop-1, loop-3"), "ack was: {}", ack);
+        let dir = sh.takes_dir.join("riff");
+        for f in ["loop-1/layer-00.wav", "loop-1/layer-01.wav", "loop-1/take.json",
+                  "loop-3/layer-00.wav", "loop-3/take.json", "export.json"] {
+            assert!(dir.join(f).exists(), "missing {}", f);
+        }
+        assert!(!dir.join("loop-2").exists(), "an empty loop gets no folder");
+        let m = std::fs::read_to_string(dir.join("export.json")).unwrap();
+        assert!(m.contains("\"version\": 2"), "{}", m);
+        assert!(m.contains("\"kind\": \"layers\""), "{}", m);
+        assert!(m.contains(r#""loop":3"#), "{}", m);
+        assert!(m.contains(r#""window":{"in":10,"out":80}"#), "the edit is recorded: {}", m);
+        assert!(m.contains(r#""window":null"#), "and its absence: {}", m);
+        assert!(m.contains(r#""source":"test""#), "{}", m);
+        assert!(m.contains(r#""gain":1.00000"#), "{}", m);
+        // The whole layer went to disk, not the window: 80 frames of stereo.
+        let wav = std::fs::read(dir.join("loop-3/layer-00.wav")).unwrap();
+        assert!(wav.len() > 80 * CHANNELS * 4, "the layer was cropped to the window");
+        // And `ex` still means the set: this must not have been eaten by `exl`.
+        assert!(dispatch(&sh, 48_000, "exriff2").contains("exported 2 loops"));
+        let _ = std::fs::remove_dir_all(&sh.takes_dir);
     }
 
     /// **Off is a switch, not a gain.** The layer stays whole and comes

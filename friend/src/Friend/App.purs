@@ -166,20 +166,18 @@ handleAction = case _ of
   AskPeaks loop -> duty loop (Duty.AskPeaks 600)
   EditDone key -> H.modify_ \s -> s { local = Map.delete key s.local }
   SetTake t -> H.modify_ _ { take = t }
-  -- **One take per loop, named for the loop.** `w<name>` is the daemon's
-  -- own format — a loop's layers, raw, with `take.json` — which is exactly
-  -- the material a scene is made of. The shaping into the module's own
-  -- folder is the harvest step, which the face says whether it has yet.
-  -- Named saves are the one thing here that does not go through `perform`:
-  -- no switch can carry a name, so the vocabulary has no slot for one.
+  -- **One verb, one ack.** `exl<name>` writes every loop that holds
+  -- something as a take of its own — `<name>/loop-<n>/`, the layers raw —
+  -- and one manifest for the set, which is exactly the material a scene is
+  -- made of. The shaping into the module's own folder is the harvest step,
+  -- which the face says whether it has yet. The one thing here that does
+  -- not go through `perform`: no switch can carry a name, so the vocabulary
+  -- has no slot for one.
   SaveAll -> do
     st <- H.get
-    let name = safeName st.take
-        loops = maybe [] _.loops st.looper
-        withMaterial = Array.filter (\lp -> lp.layers > 0) loops
-    if Array.null withMaterial then H.modify_ (note "nothing to save: no loop has a layer")
-    else for_ withMaterial \lp ->
-      runAction (Machine.Command (Verb.at lp.index (Verb.SaveTake (name <> "-" <> show (lp.index + 1)))))
+    let loops = maybe [] _.loops st.looper
+    if Array.all (\lp -> lp.layers == 0) loops then H.modify_ (note "nothing to save: no loop has a layer")
+    else runAction (Machine.Command (Verb.render (Verb.ExportLayers (safeName st.take))))
   where
   duty loop d = do
     st <- H.get
@@ -328,7 +326,7 @@ render st =
           [ HH.text
               (if f.harvest
                 then "Writes " <> f.unit <> "s in the module's own layout."
-                else "Writes each loop's layers to ~/.itajara/takes/<take>-<loop>/ as the daemon's own take. The " <> f.module_ <> " layout is the next step.")
+                else "Writes every loop's layers to ~/.itajara/takes/<take>/loop-<n>/, raw, with one manifest. The " <> f.module_ <> " layout is the next step.")
           ]
       ]
 

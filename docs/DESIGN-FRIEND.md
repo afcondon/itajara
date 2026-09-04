@@ -105,30 +105,31 @@ problem (§7 step 11), not the Friend's.
 
 ## 4. Saving, and what is not built yet
 
-`Save for Arbhar` today writes each loop's layers to
-`~/.itajara/takes/<take>-<loop>/` as the daemon's own take (`w<name>`): raw
-layers plus `take.json`, which is exactly the material a scene is made of.
-The page says so under the button. The shaping into the module's own layout
-— 24-bit, `<bank>_<scene>_scene/1_…6_.wav`, the 10 s window with the loop's
-own first 3 s as tail, a `preset.txt` — is HARVEST §4's `msm harvest`, and
-`Face.harvest` is `false` on every face until it exists. When it does, the
-Friend needs a way to run it: the browser cannot spawn a process and the
-daemon must not, so the Friend grows a small Node server with `POST /harvest`
-(the pedalboard's `pwyf-store` is that seam there), and `make serve` stops
-being `python3 -m http.server`.
+`Save for Arbhar` sends one verb, `exl<take>`, and the daemon writes
+`~/.itajara/takes/<take>/loop-<n>/` for every loop that holds something —
+the layers raw, a version-1 `take.json` in each folder so it reloads as a
+plain take, and one `export.json` at version 2 for the set carrying the
+window, rotation, bars, tempo, source and per-layer gain and birth. That is
+exactly the material a scene is made of, with the edit recorded beside it
+rather than applied to it. The page says so under the button. The shaping
+into the module's own layout — 24-bit, `<bank>_<scene>_scene/1_…6_.wav`,
+the 10 s window with the loop's own first 3 s as tail, a `preset.txt` — is
+HARVEST §4's `msm harvest`, and `Face.harvest` is `false` on every face
+until it exists. When it does, the Friend needs a way to run it: the browser
+cannot spawn a process and the daemon must not, so the Friend grows a small
+Node server with `POST /harvest` (the pedalboard's `pwyf-store` is that seam
+there), and `make serve` stops being `python3 -m http.server`.
 
 Also not built, in the order they are likely wanted:
 
-1. `exl` in the daemon (one render, every loop's layers, one manifest) so a
-   save is one verb rather than a fan-out, and manifest v2 (HARVEST §4).
-2. `msm harvest` for Arbhar; then `Face.harvest = true` and the button means
+1. `msm harvest` for Arbhar; then `Face.harvest = true` and the button means
    what it says.
-3. Per-loop level and source on the card. The daemon has both; the page
+2. Per-loop level and source on the card. The daemon has both; the page
    shows neither yet.
-4. Keyboard: number keys select a loop, space is Record. Recording with a
+3. Keyboard: number keys select a loop, space is Record. Recording with a
    mouse is a compromise, and the first thing a player will ask for.
-5. The Instruo skin, out of tree.
-6. The Twister, for those who have one.
+4. The Instruo skin, out of tree.
+5. The Twister, for those who have one.
 
 ---
 

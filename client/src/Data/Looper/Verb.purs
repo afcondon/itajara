@@ -192,6 +192,13 @@ data Verb
   -- | those receivers can do them itself.
   | ExportSet String
 
+  -- | Every loop that holds something as a take each — `<name>/loop-<n>/`
+  -- | with the layers raw — and one manifest for the set. The third render:
+  -- | what a module that plays a loop's layers *as layers* (an Arbhar scene,
+  -- | a Morphagene reel) is fed. Bare, like `ExportSet`, and the daemon
+  -- | matches it ahead of `ex` so the `l` cannot be read as a name.
+  | ExportLayers String
+
   -- | Every loop that holds something, from the top, **together**.
   -- |
   -- | This was eight `Sounding true`s, and eight unmutes is not a start: mute
@@ -351,6 +358,7 @@ render = case _ of
   ClaimPast -> "t"
   SaveTake name -> "w" <> name
   ExportSet name -> "ex" <> name
+  ExportLayers name -> "exl" <> name
   StartAll -> "go"
   Playing on -> flag "play" on
 
