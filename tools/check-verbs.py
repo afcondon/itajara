@@ -26,8 +26,8 @@ import sys
 import pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-VERB_PURS = ROOT / "itajara-client/src/Data/Looper/Verb.purs"
-ENGINE_RS = ROOT / "itajara/src/engine.rs"
+VERB_PURS = ROOT / "client/src/Data/Looper/Verb.purs"
+ENGINE_RS = ROOT / "daemon/src/engine.rs"
 
 
 def ours():

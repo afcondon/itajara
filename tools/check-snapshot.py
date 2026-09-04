@@ -41,7 +41,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PURS = ROOT / "src" / "Foreign" / "LooperSocket.purs"
+PURS = ROOT / "client" / "src" / "Foreign" / "LooperSocket.purs"
 DEFAULT_URL = "ws://127.0.0.1:23028"
 
 # One entry per PLACE the type appears on the wire, which is not the same as one

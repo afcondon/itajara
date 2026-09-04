@@ -33,7 +33,7 @@
 -- |
 -- | ## The grammar, which is the daemon's and not ours
 -- |
--- | `dispatch` in `itajara/src/engine.rs` accepts three shapes, and this type has
+-- | `dispatch` in `daemon/src/engine.rs` accepts three shapes, and this type has
 -- | one family per shape:
 -- |
 -- | * **bare** — `r`, `c`, `u`, a word on its own;

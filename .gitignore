@@ -1,0 +1,4 @@
+daemon/target/
+client/output/
+client/.spago/
+__pycache__/
