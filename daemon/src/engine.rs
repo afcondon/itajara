@@ -135,7 +135,12 @@ struct Shape {
 /// at the size a slot actually is, and it makes the whole envelope for six
 /// loops small enough to ride in the ordinary snapshot rather than needing a
 /// message of its own.
-const ENV_BUCKETS: usize = 48;
+/// **192, up from 48 on 2026-09-04.** Forty-eight drew a loop as a fat band;
+/// the Edit panel's six hundred showed what the slot was hiding, and the
+/// slot is where a loop is watched. Four times the bytes on the wire —
+/// eight loops of four layers is six kilobytes a snapshot, thirty a second,
+/// on localhost — for a picture that says which loop this is.
+const ENV_BUCKETS: usize = 192;
 
 /// The quietest thing the envelope draws, in dBFS.
 ///
