@@ -87,7 +87,13 @@ USAGE
                         `deepstar latency --write` curates from Amphora; with
                         neither it falls back to 252 and says so, because
                         the default is an assertion and not an abstention
-      --max-secs <s>    longest loop, and so the arena size   (default 30)
+      --max-secs <s>    longest loop, and so the arena size   (default 300)
+      --loops <n>       how many loops, 1 to 10: the wire names a loop by one
+                        digit                                     (default 8)
+      --layers <n>      layers per loop, which is the undo stack  (default 4)
+      --fixed-secs <s>  every loop starts, and after `c` returns, as an empty
+                        tape this long: record, and it closes itself there.
+                        Stands in for --max-secs unless that is given too.
       --click           metronome at loop position zero
       --monitor         pass live input to the output. Off by default: the
                         interface's own direct monitoring costs no latency
@@ -362,7 +368,29 @@ fn parse_loop(args: &[String]) -> Result<engine::Opts, String> {
                 opts.residual = value.parse().map_err(|_| "--residual wants a number")?;
                 opts.residual_given = true;
             }
-            "--max-secs" => opts.max_secs = value.parse().map_err(|_| "--max-secs wants a number")?,
+            "--max-secs" => {
+                opts.max_secs = value.parse().map_err(|_| "--max-secs wants a number")?;
+                opts.max_secs_given = true;
+            }
+            "--loops" => {
+                opts.loops = value.parse().map_err(|_| "--loops wants an integer")?;
+                if opts.loops < 1 || opts.loops > engine::MAX_LOOPS {
+                    return Err(format!("--loops wants 1 to {}: a loop is named by one digit on the wire", engine::MAX_LOOPS));
+                }
+            }
+            "--layers" => {
+                opts.layers = value.parse().map_err(|_| "--layers wants an integer")?;
+                if opts.layers < 1 || opts.layers > 32 {
+                    return Err("--layers wants 1 to 32".to_string());
+                }
+            }
+            "--fixed-secs" => {
+                let f: f64 = value.parse().map_err(|_| "--fixed-secs wants a number of seconds")?;
+                if f <= 0.0 {
+                    return Err("--fixed-secs wants a length greater than zero".to_string());
+                }
+                opts.fixed_secs = Some(f);
+            }
             "--rate" => opts.sample_rate = value.parse().map_err(|_| "--rate wants an integer")?,
             "--buffer" => opts.buffer = Some(value.parse().map_err(|_| "--buffer wants an integer")?),
             "--ws-port" => {
@@ -387,6 +415,11 @@ fn parse_loop(args: &[String]) -> Result<engine::Opts, String> {
     }
     if opts.max_secs <= 0.0 {
         return Err("--max-secs must be positive".into());
+    }
+    if let Some(f) = opts.fixed_secs {
+        if !opts.max_secs_given {
+            opts.max_secs = f;
+        }
     }
     Ok(opts)
 }

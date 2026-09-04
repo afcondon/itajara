@@ -29,11 +29,11 @@
 //! startup, so no callback ever touches the allocator.
 //!
 //! The price is a fixed ceiling on loop length and layer count, which is what
-//! `--max-secs` and `MAX_LAYERS` are. At the defaults — eight loops, eight
+//! `--max-secs`, `--loops` and `--layers` are. At the defaults — eight loops, eight
 //! layers, thirty seconds, 48 kHz — the arena is 351 MiB.
 //!
 //! **This said 46 MB until 2026-08-25**, which was true of some earlier set of
-//! defaults and of nothing since; the figure beside `N_LOOPS` was right and
+//! defaults and of nothing since; the figure beside `DEFAULT_LOOPS` was right and
 //! this one had simply never been recomputed. Both are now derived from the
 //! same arithmetic in the comment on that constant.
 
@@ -58,7 +58,10 @@ use crate::measure::{choose_input, choose_output, signed_secs, Width};
 /// length for the same footprint. Undo and redo still walk the whole stack, so
 /// the ceiling is a ceiling and not a discipline — `t` and `r` both refuse at
 /// it, and say so.
-pub const MAX_LAYERS: usize = 4;
+///
+/// **A default since 2026-09-04**, not a constant: `--layers` sets it, and
+/// everything that used to read the constant reads `Shared::max_layers`.
+pub const DEFAULT_LAYERS: usize = 4;
 
 /// How many bars a loop may be declared, and how sparsely a layer may sound.
 ///
@@ -212,6 +215,15 @@ pub struct Opts {
     /// address space, and the cost of *using* it is paid a layer at a time by
     /// whoever uses it.
     pub max_secs: f64,
+    /// Whether `--max-secs` was given, so `--fixed-secs` can stand in for it.
+    pub max_secs_given: bool,
+    /// How many loops and how many layers each; the arena is their product.
+    pub loops: usize,
+    pub layers: usize,
+    /// Every loop threaded as an empty tape of this length at startup and
+    /// after a clear, so a first recording closes itself there. For rigs
+    /// whose destination has a fixed length — an Arbhar layer is ten seconds.
+    pub fixed_secs: Option<f64>,
     pub sample_rate: u32,
     pub buffer: Option<u32>,
     pub click: bool,
@@ -253,6 +265,10 @@ impl Default for Opts {
             residual: 252.0,
             residual_given: false,
             max_secs: 300.0,
+            max_secs_given: false,
+            loops: DEFAULT_LOOPS,
+            layers: DEFAULT_LAYERS,
+            fixed_secs: None,
             sample_rate: 48_000,
             buffer: None,
             click: false,
@@ -407,10 +423,20 @@ pub fn default_takes_dir() -> PathBuf {
 /// digit, so 0–7 still fits.
 ///
 /// The cost is linear and paid at startup: the arena is
-/// `N_LOOPS × MAX_LAYERS × max_secs × 4 bytes`, so eight loops of eight layers
+/// `loops × layers × max_secs × 4 bytes`, so eight loops of eight layers
 /// at the default thirty seconds and 48 kHz is **351 MiB**, up from 263. It is
 /// allocated once and never touched by the allocator again.
-pub const N_LOOPS: usize = 8;
+///
+/// **A default since 2026-09-04**, not a constant: `--loops` sets it, up to
+/// `MAX_LOOPS`, and everything that used to read the constant reads
+/// `Shared::n_loops`. The arena line above is now `loops × layers × …`.
+pub const DEFAULT_LOOPS: usize = 8;
+
+/// The most loops a rig can have, and the sentinel `anchor` holds when no
+/// loop owns the grid. **Ten because the wire names a loop by one leading
+/// digit** — `3r` records loop 3 — and that grammar is shared with every
+/// surface; a two-digit form would be a protocol change, not a flag.
+pub const MAX_LOOPS: usize = 10;
 
 /// **Two, everywhere.** The arena, the pre-roll rings and every layer are
 /// stereo as of 2026-08-29.
@@ -876,21 +902,21 @@ pub struct Loop {
 }
 
 impl Loop {
-    fn new() -> Self {
+    fn new(max_layers: usize) -> Self {
         Loop {
             loop_len: AtomicUsize::new(0),
             cycles: AtomicUsize::new(0),
             close_at: AtomicI64::new(i64::MIN),
             rec_len: AtomicUsize::new(0),
             n_layers: AtomicUsize::new(0),
-            l_len: (0..MAX_LAYERS).map(|_| AtomicUsize::new(0)).collect(),
-            l_tail: (0..MAX_LAYERS).map(|_| AtomicUsize::new(0)).collect(),
-            l_born: (0..MAX_LAYERS).map(|_| AtomicI64::new(0)).collect(),
-            l_gain: (0..MAX_LAYERS).map(|_| AtomicU32::new(1.0f32.to_bits())).collect(),
-            l_on: (0..MAX_LAYERS).map(|_| AtomicBool::new(true)).collect(),
-            env: Mutex::new((0..MAX_LAYERS).map(|_| Vec::new()).collect()),
-            l_period: (0..MAX_LAYERS).map(|_| AtomicUsize::new(1)).collect(),
-            l_phase: (0..MAX_LAYERS).map(|_| AtomicUsize::new(0)).collect(),
+            l_len: (0..max_layers).map(|_| AtomicUsize::new(0)).collect(),
+            l_tail: (0..max_layers).map(|_| AtomicUsize::new(0)).collect(),
+            l_born: (0..max_layers).map(|_| AtomicI64::new(0)).collect(),
+            l_gain: (0..max_layers).map(|_| AtomicU32::new(1.0f32.to_bits())).collect(),
+            l_on: (0..max_layers).map(|_| AtomicBool::new(true)).collect(),
+            env: Mutex::new((0..max_layers).map(|_| Vec::new()).collect()),
+            l_period: (0..max_layers).map(|_| AtomicUsize::new(1)).collect(),
+            l_phase: (0..max_layers).map(|_| AtomicUsize::new(0)).collect(),
             origin: AtomicI64::new(0),
             muted: AtomicBool::new(false),
             speed: AtomicU64::new(1.0f64.to_bits()),
@@ -1295,7 +1321,7 @@ impl Loop {
     fn age(&self, out_frame: i64) {
         let d = self.decay_of();
         let now = self.pass_index(out_frame, self.loop_len.load(Ordering::Acquire));
-        for l in 0..MAX_LAYERS {
+        for l in 0..self.l_len.len() {
             let g = if d >= 1.0 {
                 1.0
             } else {
@@ -1418,6 +1444,11 @@ impl Loop {
 pub struct Shared {
     arena: Vec<AtomicU32>,
     max_frames: usize,
+    /// `--loops` and `--layers`: the arena's shape, fixed at startup.
+    pub n_loops: usize,
+    pub max_layers: usize,
+    /// `--fixed-secs` in frames, or zero for none.
+    pub fixed_frames: usize,
     /// The pre-roll. The input callback writes every frame it ever receives here
     /// whether anything is recording or not, indexed by input frame modulo its
     /// length — so the last `ring_secs` of playing are always retrievable.
@@ -1454,7 +1485,7 @@ pub struct Shared {
     /// is a mode, and a mode that a footswitch could fall out of step with is
     /// the thing this design is trying not to have.
     pub selected: AtomicUsize,
-    /// Which loop's cycle is the grid, or `N_LOOPS` for none yet. Set by the
+    /// Which loop's cycle is the grid, or `MAX_LOOPS` for none yet. Set by the
     /// first loop to acquire a length; see `grid`.
     pub anchor: AtomicUsize,
     pub out_frames: AtomicUsize,
@@ -1631,10 +1662,10 @@ impl Shared {
     /// can only come from a command string, and a bad command should be refused
     /// where commands are parsed, not by killing the audio thread.
     pub fn lp(&self, li: usize) -> &Loop {
-        &self.loops[li.min(N_LOOPS - 1)]
+        &self.loops[li.min(self.n_loops - 1)]
     }
     pub fn sel(&self) -> usize {
-        self.selected.load(Ordering::Relaxed).min(N_LOOPS - 1)
+        self.selected.load(Ordering::Relaxed).min(self.n_loops - 1)
     }
     /// Which loop currently owns the input, if any.
     ///
@@ -1643,11 +1674,11 @@ impl Shared {
     /// loops' own states, the input callback asks. Six relaxed loads per buffer
     /// is nothing, and a derived answer cannot go stale.
     pub fn recording_loop(&self) -> Option<usize> {
-        (0..N_LOOPS).find(|&i| self.loops[i].is_recording())
+        (0..self.n_loops).find(|&i| self.loops[i].is_recording())
     }
     /// Whether any loop is claiming the input, including one merely armed.
     pub fn input_claimed(&self) -> Option<usize> {
-        (0..N_LOOPS).find(|&i| self.loops[i].wants_input())
+        (0..self.n_loops).find(|&i| self.loops[i].wants_input())
     }
     /// The loop waiting for a sound, if one is. Asked by the input callback on
     /// every buffer, and derived for the same reason `recording_loop` is.
@@ -1658,7 +1689,7 @@ impl Shared {
     /// next buffer finding a second crossing and back-dating the recording to
     /// *that* one instead.
     pub fn armed_loop(&self) -> Option<usize> {
-        (0..N_LOOPS).find(|&i| self.loops[i].is_armed() && self.loops[i].request.get() == 0)
+        (0..self.n_loops).find(|&i| self.loops[i].is_armed() && self.loops[i].request.get() == 0)
     }
 
     /// **The bar.** Link's when there is a clock, the first loop's cycle when
@@ -1740,7 +1771,7 @@ impl Shared {
     /// clockless session gets a pulse shorter than its first take.
     fn loop_grid(&self) -> Option<(i64, usize)> {
         let a = self.anchor.load(Ordering::Acquire);
-        if a >= N_LOOPS {
+        if a >= self.n_loops {
             return None;
         }
         let lp = self.lp(a);
@@ -1767,7 +1798,7 @@ impl Shared {
     /// Remember which loop laid down the grid, the first time one does.
     fn claim_anchor(&self, li: usize) {
         let _ = self.anchor.compare_exchange(
-            N_LOOPS,
+            MAX_LOOPS,
             li,
             Ordering::AcqRel,
             Ordering::Relaxed,
@@ -1784,7 +1815,7 @@ impl Shared {
     fn release_anchor(&self, li: usize) {
         let _ = self.anchor.compare_exchange(
             li,
-            N_LOOPS,
+            MAX_LOOPS,
             Ordering::AcqRel,
             Ordering::Relaxed,
         );
@@ -1809,7 +1840,7 @@ impl Shared {
     /// both — so a stereo frame is one cache line's work rather than two walks
     /// a `max_frames` apart.
     fn cell(&self, li: usize, layer: usize, pos: usize, ch: usize) -> &AtomicU32 {
-        &self.arena[((li * MAX_LAYERS + layer) * self.max_frames + pos) * CHANNELS + ch]
+        &self.arena[((li * self.max_layers + layer) * self.max_frames + pos) * CHANNELS + ch]
     }
     fn read(&self, li: usize, layer: usize, pos: usize, ch: usize) -> f32 {
         f32::from_bits(self.cell(li, layer, pos, ch).load(Ordering::Relaxed))
@@ -2336,6 +2367,15 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     let in_channels = in_cfg.channels as usize;
     let out_channels = out_cfg.channels as usize;
     let max_frames = (opts.max_secs * sr_f).round() as usize;
+    let fixed_frames = opts.fixed_secs.map(|f| (f * sr_f).round() as usize).unwrap_or(0);
+    if fixed_frames > max_frames {
+        return Err(format!(
+            "--fixed-secs {:.1} is longer than --max-secs {:.1}; a tape cannot outgrow the arena.",
+            opts.fixed_secs.unwrap_or(0.0),
+            opts.max_secs
+        )
+        .into());
+    }
     let ring_len = (opts.ring_secs * sr_f).round() as usize;
 
     // **`--in-ch` becomes a source when nobody named any**, so an existing
@@ -2371,11 +2411,11 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     println!(
         "Arena: {} loops x {} layers x {:.0} s x {} ch = {} MB.   \
          Pre-roll: {:.0} s x {} src x {} ch = {} MB.\n",
-        N_LOOPS,
-        MAX_LAYERS,
+        opts.loops,
+        opts.layers,
         opts.max_secs,
         CHANNELS,
-        N_LOOPS * MAX_LAYERS * max_frames * CHANNELS * 4 / 1_048_576,
+        opts.loops * opts.layers * max_frames * CHANNELS * 4 / 1_048_576,
         opts.ring_secs,
         sources.len(),
         CHANNELS,
@@ -2383,19 +2423,22 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     );
 
     let sh = Arc::new(Shared {
-        arena: (0..N_LOOPS * MAX_LAYERS * max_frames * CHANNELS)
+        arena: (0..opts.loops * opts.layers * max_frames * CHANNELS)
             .map(|_| AtomicU32::new(0))
             .collect(),
         max_frames,
+        n_loops: opts.loops,
+        max_layers: opts.layers,
+        fixed_frames,
         ring: (0..ring_len * sources.len() * CHANNELS)
             .map(|_| AtomicU32::new(0))
             .collect(),
         ring_len,
         in_peak: (0..sources.len()).map(|_| AtomicU32::new(0)).collect(),
         sources,
-        loops: (0..N_LOOPS).map(|_| Loop::new()).collect(),
+        loops: (0..opts.loops).map(|_| Loop::new(opts.layers)).collect(),
         selected: AtomicUsize::new(0),
-        anchor: AtomicUsize::new(N_LOOPS),
+        anchor: AtomicUsize::new(MAX_LOOPS),
         out_frames: AtomicUsize::new(0),
         in_frames: AtomicUsize::new(0),
         k: AtomicI64::new(0),
@@ -2429,6 +2472,16 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         link_anchors: AtomicUsize::new(0),
         link_rejected: AtomicUsize::new(0),
     });
+
+    if sh.fixed_frames > 0 {
+        for li in 0..sh.n_loops {
+            thread_blank(&sh, li, sh.fixed_frames);
+        }
+        println!(
+            "Every loop is an empty {:.1} s tape (--fixed-secs): record, and it closes itself there.",
+            sh.fixed_frames as f64 / sr_f
+        );
+    }
 
     // Both streams are rebuilt on recovery, so building them lives in a closure
     // rather than inline. Everything it captures is either `Arc` or `Copy`.
@@ -2481,7 +2534,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                 // is a loop boundary that is audibly wrong.
                 // Every loop's pending transition, stamped to this frame. Six
                 // `take`s a buffer, and each is a swap on an uncontended atomic.
-                for li in 0..N_LOOPS {
+                for li in 0..sh.n_loops {
                     let lp = sh.lp(li);
                     // Speed first, and at the buffer start, because adopting it
                     // reads the playhead and everything below may move `origin`.
@@ -2540,7 +2593,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                                     .store((stamp - want).max(0), Ordering::Release),
                             }
                             let n = lp.n_layers.load(Ordering::Acquire);
-                            if n < MAX_LAYERS {
+                            if n < sh.max_layers {
                                 // **Layers, not length.** This asked whether the
                                 // loop had a length, which was the same question
                                 // while the only way to have one was to have
@@ -2672,7 +2725,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                 // playing into is the loop that is armed or recording. Falls
                 // back to the first source when nothing is, which is what a rig
                 // with one source has always done.
-                let mon_src = (0..N_LOOPS)
+                let mon_src = (0..sh.n_loops)
                     .find(|&li| {
                         let lp = sh.lp(li);
                         lp.is_armed() || lp.is_recording()
@@ -2683,9 +2736,9 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                 let mut peak = 0.0f32;
                 // Once per buffer, not once per frame: six loops times two
                 // trig calls is free here and wasteful inside the frame loop.
-                let mut gains = [(0.0f32, 0.0f32); N_LOOPS];
-                let mut folds = [false; N_LOOPS];
-                for li in 0..N_LOOPS {
+                let mut gains = [(0.0f32, 0.0f32); MAX_LOOPS];
+                let mut folds = [false; MAX_LOOPS];
+                for li in 0..sh.n_loops {
                     let lp = sh.lp(li);
                     // Level folded into the placement gains rather than applied
                     // in the frame loop: it is a per-buffer constant like the
@@ -2710,7 +2763,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                     let mut vl = 0.0f32;
                     let mut vr = 0.0f32;
 
-                    for li in 0..N_LOOPS {
+                    for li in 0..sh.n_loops {
                         let s = sh.loop_at(li, out_frame, &mut rng, true);
                         if folds[li] {
                             // Averaged rather than summed: two channels of the
@@ -2909,7 +2962,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                 // them and the stereo would collapse a little on every pass.
                 let rec_src = &sh.sources[sh.src_of(li)];
                 let mut lp_mem = [f32::from_bits(lp.tape_lp.load(Ordering::Relaxed)); CHANNELS];
-                if layer >= MAX_LAYERS && !revox {
+                if layer >= sh.max_layers && !revox {
                     sh.in_frames.store(base + frames, Ordering::Release);
                     return;
                 }
@@ -3190,7 +3243,7 @@ fn supervise<F>(
             });
             eprintln!("  the recording in progress on loop {} was dropped — it would have had a gap", li);
         }
-        for li in 0..N_LOOPS {
+        for li in 0..sh.n_loops {
             sh.lp(li).request.take();
         }
 
@@ -3271,7 +3324,7 @@ fn spawn_closer(sh: Arc<Shared>, sr: u32) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_millis(5));
         let now = sh.out_frames.load(Ordering::Acquire) as i64;
-        for li in 0..N_LOOPS {
+        for li in 0..sh.n_loops {
             let lp = sh.lp(li);
             let at = lp.close_at.load(Ordering::Acquire);
             if at == i64::MIN || now < at {
@@ -3731,10 +3784,10 @@ fn take(sh: &Shared, li: usize, sr: u32, secs: f64, late: i64) -> String {
         return "no input has arrived yet.".to_string();
     }
     let layer = lp.n_layers.load(Ordering::Acquire);
-    if layer >= MAX_LAYERS {
+    if layer >= sh.max_layers {
         return format!(
             "loop {} is at {} layers, the ceiling; undo one first.",
-            li, MAX_LAYERS
+            li, sh.max_layers
         );
     }
 
@@ -3847,10 +3900,10 @@ fn multiply_start(sh: &Shared, li: usize, sr: u32) -> String {
     if loop_len == 0 {
         return format!("loop {} has nothing to multiply — record a loop first.", li);
     }
-    if lp.n_layers.load(Ordering::Acquire) >= MAX_LAYERS {
+    if lp.n_layers.load(Ordering::Acquire) >= sh.max_layers {
         return format!(
             "loop {} is at {} layers, the ceiling; undo one first.",
-            li, MAX_LAYERS
+            li, sh.max_layers
         );
     }
 
@@ -4272,7 +4325,7 @@ fn take_tempo(sh: &Shared, li: usize, sr: u32) -> String {
     // Everything that would now disagree with the click, counted. Not a
     // refusal — re-deciding the tempo around the loop that came out well is a
     // real move — but it is never something to discover afterwards.
-    let others = (0..N_LOOPS)
+    let others = (0..sh.n_loops)
         .filter(|&o| o != li && sh.lp(o).n_layers.load(Ordering::Acquire) > 0)
         .count();
     let heard = sh.link_anchors.load(Ordering::Relaxed) > 0;
@@ -4342,7 +4395,7 @@ fn start_all(sh: &Shared, sr: u32) -> String {
     let at = sh.next_boundary(now);
     let mut n = 0usize;
     let mut busy = 0usize;
-    for li in 0..N_LOOPS {
+    for li in 0..sh.n_loops {
         let lp = sh.lp(li);
         if lp.loop_len.load(Ordering::Acquire) == 0 {
             continue;
@@ -4466,8 +4519,8 @@ fn control_loop(sh: &Shared, sr: u32) -> bool {
     println!(
         "           a leading digit picks the loop: 3r records loop 3, 3s2 spreads it,\n\
          \x20          a bare 3 selects it. {} loops, 0 to {}.",
-        N_LOOPS,
-        N_LOOPS - 1
+        sh.n_loops,
+        sh.n_loops - 1
     );
     println!("           k = click   m = input monitoring");
     println!("           l = levels   p = status + waveforms   q = quit\n");
@@ -4533,8 +4586,8 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
     let (li, rest) = match trimmed.chars().next() {
         Some(c) if c.is_ascii_digit() => {
             let n = c.to_digit(10).unwrap() as usize;
-            if n >= N_LOOPS {
-                return format!("there are {} loops, numbered 0 to {}.", N_LOOPS, N_LOOPS - 1);
+            if n >= sh.n_loops {
+                return format!("there are {} loops, numbered 0 to {}.", sh.n_loops, sh.n_loops - 1);
             }
             (n, trimmed[1..].trim())
         }
@@ -4581,10 +4634,10 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                         return no;
                     }
                     let layer = lp.n_layers.load(Ordering::Acquire);
-                    if layer >= MAX_LAYERS {
+                    if layer >= sh.max_layers {
                         return format!(
                             "loop {} is at {} layers, the ceiling; undo one first.",
-                            li, MAX_LAYERS
+                            li, sh.max_layers
                         );
                     } else {
                         // An overdub sums into its layer, so anything left there
@@ -4872,7 +4925,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                             "Link".to_string()
                         } else {
                             match sh.anchor.load(Ordering::Acquire) {
-                                a if a < N_LOOPS => format!("loop {}", a),
+                                a if a < sh.n_loops => format!("loop {}", a),
                                 _ => "nowhere".to_string(),
                             }
                         };
@@ -4947,7 +5000,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // Per-layer enable. `ly31` is layer 3 on, `ly30` is layer 3 off.
             // Layers count from one on the wire, as `ph` does, and the flag is
             // the *last* character so a two-digit layer still parses once
-            // `MAX_LAYERS` grows. **Set, never flipped**, for the reason every
+            // `--layers` grows. **Set, never flipped**, for the reason every
             // flag verb in here gives: a client that flips drifts out of step
             // the first time a message is dropped.
             _ if rest.starts_with("ly") => {
@@ -5167,15 +5220,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                         said = format!(" ({} grid cycle{})", n, if n == 1 { "" } else { "s" });
                     }
                 }
-                let now = sh.out_frames.load(Ordering::Acquire) as i64;
-                sh.zero_layer(li, 0);
-                lp.origin.store(now, Ordering::Release);
-                lp.loop_len.store(len, Ordering::Release);
-                lp.set_layer_shape(0, Shape { len, tail: 0, born: 0 });
-                lp.n_layers.store(1, Ordering::Release);
-                lp.threaded.store(true, Ordering::Relaxed);
-                lp.state.set(PLAYING);
-                sh.rebuild_env(li, 0);
+                thread_blank(sh, li, len);
                 return format!(
                     "loop {} is an empty {:.3} s tape{}, going round.",
                     li,
@@ -5510,12 +5555,22 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             }
             "c" => {
                 lp.cleared();
-                for l in 0..MAX_LAYERS {
+                for l in 0..sh.max_layers {
                     sh.zero_layer(li, l);
                     lp.set_layer_shape(l, Shape { len: 0, tail: 0, born: 0 });
                 }
                 sh.clear_env(li);
                 sh.release_anchor(li);
+                // A fixed rig does not have empty loops, it has empty tapes:
+                // clearing puts the tape back so the next take closes itself.
+                if sh.fixed_frames > 0 {
+                    thread_blank(sh, li, sh.fixed_frames);
+                    return format!(
+                        "loop {} cleared; an empty {:.3} s tape again.",
+                        li,
+                        sh.fixed_frames as f64 / sr as f64
+                    );
+                }
                 return format!("loop {} cleared.", li);
             }
             // `k` and `m` flip, which is right at a console and wrong over a
@@ -5654,7 +5709,7 @@ fn save_take(sh: &Shared, li: usize, sr: u32, name: &str) -> String {
         // Unpadded, a tenth layer would sort between the first and the second
         // and every index past it would name the wrong audio — silently, since
         // nothing downstream can tell a misordered bank from an intended one.
-        // `MAX_LAYERS` is 4 today, so this is insurance bought while it is free.
+        // `--layers` is 4 by default, so this is insurance bought while it is free.
         let file = format!("layer-{:02}.wav", l);
         if let Err(e) = std::fs::write(dir.join(&file), crate::wav::wav_bytes(&samples, sr, CHANNELS as u16)) {
             return format!("could not write {}: {}", file, e);
@@ -5813,7 +5868,7 @@ fn export_set(sh: &Shared, sr: u32, name: &str) -> String {
     // Checked across every loop before anything is written, rather than per
     // loop as it goes: a half-written folder that stopped at loop 5 because
     // loop 5 was recording is worse than one that never started.
-    for li in 0..N_LOOPS {
+    for li in 0..sh.n_loops {
         let lp = sh.lp(li);
         if lp.is_recording() || lp.is_armed() {
             return format!(
@@ -5834,7 +5889,7 @@ fn export_set(sh: &Shared, sr: u32, name: &str) -> String {
 
     let mut entries: Vec<String> = Vec::new();
     let mut wrote: Vec<String> = Vec::new();
-    for li in 0..N_LOOPS {
+    for li in 0..sh.n_loops {
         let lp = sh.lp(li);
         let Some(samples) = sh.render_loop(li) else {
             continue;
@@ -5924,6 +5979,22 @@ fn export_set(sh: &Shared, sr: u32, name: &str) -> String {
 /// A loop's own length, named so the `acid` arithmetic above reads as arithmetic.
 fn len_of(lp: &Loop) -> usize {
     lp.loop_len.load(Ordering::Acquire)
+}
+
+/// Thread an empty tape of `len` frames onto loop `li`: one blank layer,
+/// playing, so the first recording closes itself at that length. What `blank`
+/// does, and what `--fixed-secs` does to every loop at startup and after `c`.
+pub fn thread_blank(sh: &Shared, li: usize, len: usize) {
+    let lp = sh.lp(li);
+    let now = sh.out_frames.load(Ordering::Acquire) as i64;
+    sh.zero_layer(li, 0);
+    lp.origin.store(now, Ordering::Release);
+    lp.loop_len.store(len, Ordering::Release);
+    lp.set_layer_shape(0, Shape { len, tail: 0, born: 0 });
+    lp.n_layers.store(1, Ordering::Release);
+    lp.threaded.store(true, Ordering::Relaxed);
+    lp.state.set(PLAYING);
+    sh.rebuild_env(li, 0);
 }
 
 fn safe_name(raw: &str) -> String {
@@ -6202,17 +6273,20 @@ mod tests {
     /// the only kind of drift worth defending against here.
     fn rig(max_frames: usize) -> Shared {
         Shared {
-            arena: (0..N_LOOPS * MAX_LAYERS * max_frames * CHANNELS)
+            arena: (0..DEFAULT_LOOPS * DEFAULT_LAYERS * max_frames * CHANNELS)
                 .map(|_| AtomicU32::new(0))
                 .collect(),
             max_frames,
+            n_loops: DEFAULT_LOOPS,
+            max_layers: DEFAULT_LAYERS,
+            fixed_frames: 0,
             ring: (0..CHANNELS).map(|_| AtomicU32::new(0)).collect(),
             ring_len: 1,
             in_peak: vec![AtomicU32::new(0)],
             sources: vec![Source::mono("test", 0)],
-            loops: (0..N_LOOPS).map(|_| Loop::new()).collect(),
+            loops: (0..DEFAULT_LOOPS).map(|_| Loop::new(DEFAULT_LAYERS)).collect(),
             selected: AtomicUsize::new(0),
-            anchor: AtomicUsize::new(N_LOOPS),
+            anchor: AtomicUsize::new(MAX_LOOPS),
             out_frames: AtomicUsize::new(0),
             in_frames: AtomicUsize::new(0),
             k: AtomicI64::new(0),
@@ -6423,7 +6497,7 @@ mod tests {
 
     /// A loop with its position zero at output frame zero.
     fn at_origin() -> Loop {
-        let lp = Loop::new();
+        let lp = Loop::new(DEFAULT_LAYERS);
         lp.origin.store(0, Ordering::Relaxed);
         lp
     }
@@ -6483,7 +6557,7 @@ mod tests {
     /// was recorded rather than inventing one.
     #[test]
     fn a_stereo_loop_is_balanced_and_a_folded_one_is_panned() {
-        let lp = Loop::new();
+        let lp = Loop::new(DEFAULT_LAYERS);
 
         // Centre. A balance leaves both sides alone; a pan is 3 dB down on each
         // because it is spending the difference on placing a mono signal.
@@ -6531,7 +6605,7 @@ mod tests {
 
     #[test]
     fn clearing_forgets_the_length_and_the_bar_count_together() {
-        let lp = Loop::new();
+        let lp = Loop::new(DEFAULT_LAYERS);
         // Sized and empty, as `len<n>` leaves it: four bars of a two-second bar.
         lp.loop_len.store(4 * 96_000, Ordering::Release);
         lp.cycles.store(4, Ordering::Release);
@@ -6555,7 +6629,7 @@ mod tests {
         );
         // And is indistinguishable from one that was never touched, on every
         // field that describes a length.
-        let fresh = Loop::new();
+        let fresh = Loop::new(DEFAULT_LAYERS);
         assert_eq!(
             lp.loop_len.load(Ordering::Acquire),
             fresh.loop_len.load(Ordering::Acquire)

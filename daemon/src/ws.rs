@@ -166,7 +166,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
     // untouched while the six-loop display is built against `loops` — rather
     // than the display and the engine both being new at once, which is how you
     // end up debugging two things and knowing neither.
-    let each: Vec<String> = (0..crate::engine::N_LOOPS)
+    let each: Vec<String> = (0..sh.n_loops)
         .map(|li| {
             let lp = sh.lp(li);
             let len = lp.loop_len.load(Ordering::Acquire);
@@ -385,7 +385,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
         ),
         cl.state_name(),
         cl.n_layers.load(Ordering::Acquire),
-        crate::engine::MAX_LAYERS,
+        sh.max_layers,
         loop_len,
         loop_len as f64 / sr as f64,
         pos,
@@ -433,7 +433,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
         sh.grid().map(|(o, _)| o).unwrap_or(0),
         sh.launch_q.load(Ordering::Relaxed),
         sel,
-        crate::engine::N_LOOPS,
+        sh.n_loops,
         // **The sources, named, in the order a `src<n>` counts them.** Without
         // this the app would have a number and no way to say what it meant, and
         // "input 2" on an encoder is the numbering problem all over again.
