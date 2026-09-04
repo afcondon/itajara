@@ -662,6 +662,17 @@ pub struct Loop {
     /// come; instead the callback records where the loop *is* and rescales only
     /// what happens next.
     warp: AtomicU64,
+    /// The window: an in and an out point in arena positions, or both zero
+    /// for none. **Non-destructive.** Playback goes round `in..out` and so
+    /// does the render, which is what makes an edit you can hear the edit
+    /// you export. Recording is refused while one is set — see `dispatch`.
+    win_in: AtomicUsize,
+    win_out: AtomicUsize,
+    /// Where the cycle starts, as an offset into the window (or the loop):
+    /// position zero of a pass is arena position `start + rot`. Shifting the
+    /// starting point of a loop without moving a sample, so a render begins
+    /// where you chose rather than where the take happened to close.
+    pub rot: AtomicUsize,
     /// A pending speed and pendulum, consumed by the output callback.
     ///
     /// The same argument as `request_at`: only the callback knows the frame, and
@@ -926,6 +937,9 @@ impl Loop {
             src: AtomicUsize::new(0),
             mono: AtomicBool::new(false),
             warp: AtomicU64::new(0.0f64.to_bits()),
+            win_in: AtomicUsize::new(0),
+            win_out: AtomicUsize::new(0),
+            rot: AtomicUsize::new(0),
             cfg_speed: AtomicU64::new(1.0f64.to_bits()),
             cfg_pend: AtomicBool::new(false),
             cfg_armed: AtomicBool::new(false),
@@ -975,6 +989,37 @@ impl Loop {
         self.speed() == 1.0
             && !self.pendulum.load(Ordering::Relaxed)
             && f64::from_bits(self.warp.load(Ordering::Relaxed)) == 0.0
+            && self.window().is_none()
+    }
+
+    /// The window as `(in, out)`, or `None` for the whole loop.
+    pub fn window(&self) -> Option<(usize, usize)> {
+        let o = self.win_out.load(Ordering::Relaxed);
+        if o == 0 {
+            None
+        } else {
+            Some((self.win_in.load(Ordering::Relaxed), o))
+        }
+    }
+
+    /// One trip round, as `(start, span)` in arena positions: the window's,
+    /// or the loop's. A window that no longer fits the loop counts as none.
+    pub fn cycle(&self, len: usize) -> (usize, usize) {
+        match self.window() {
+            Some((i, o)) if o > i && o <= len => (i, o - i),
+            _ => (0, len),
+        }
+    }
+
+    /// Cycle position `c` (0 to span) as an arena position: rotated inside
+    /// the window, so position zero of a pass is `start + rot`.
+    fn place(&self, start: usize, span: usize, c: f64) -> f64 {
+        let r = self.rot.load(Ordering::Relaxed) % span.max(1);
+        let mut q = c + r as f64;
+        if q >= span as f64 {
+            q -= span as f64;
+        }
+        start as f64 + q
     }
 
     /// Where the playhead is, in loop frames, at an output frame.
@@ -1010,7 +1055,8 @@ impl Loop {
         if len == 0 {
             return 0;
         }
-        let span = if self.pendulum.load(Ordering::Relaxed) { 2 * len } else { len } as f64;
+        let (_, cyc) = self.cycle(len);
+        let span = if self.pendulum.load(Ordering::Relaxed) { 2 * cyc } else { cyc } as f64;
         (self.raw_pos(out_frame) / span).floor() as i64
     }
 
@@ -1019,8 +1065,9 @@ impl Loop {
             return 0.0;
         }
         let raw = self.raw_pos(out_frame);
-        let lenf = len as f64;
-        if self.pendulum.load(Ordering::Relaxed) {
+        let (start, span) = self.cycle(len);
+        let lenf = span as f64;
+        let c = if self.pendulum.load(Ordering::Relaxed) {
             // A triangle where a plain loop is a sawtooth. `2 * len` is one
             // there-and-back, and the second half is read as the reflection of
             // the first — so the turn happens at the ends of the audio rather
@@ -1034,7 +1081,8 @@ impl Loop {
             }
         } else {
             raw.rem_euclid(lenf)
-        }
+        };
+        self.place(start, span, c)
     }
 
     /// Adopt a new speed and pendulum without moving the audio.
@@ -1044,7 +1092,12 @@ impl Loop {
     /// ones put it in the same place — after which everything downstream is
     /// arithmetic and nothing is stored about how it got there.
     fn adopt(&self, out_frame: i64, len: usize, speed: f64, pend: bool) {
-        let here = self.play_pos(out_frame, len);
+        // The cycle position, not the arena one: `raw_pos` counts from the
+        // start of the window and before the rotation, so that is what the
+        // new warp has to reproduce.
+        let (start, span) = self.cycle(len);
+        let r = self.rot.load(Ordering::Relaxed) % span.max(1);
+        let here = (self.play_pos(out_frame, len) - start as f64 - r as f64).rem_euclid(span.max(1) as f64);
         self.speed.store(speed.to_bits(), Ordering::Relaxed);
         self.pendulum.store(pend, Ordering::Relaxed);
         if len == 0 {
@@ -1083,7 +1136,8 @@ impl Loop {
     /// it is a function with tests rather than three lines inside a callback.
     fn pass_frames(&self, len: usize) -> i64 {
         // A pendulum goes there and back before it has been round once.
-        let span = if self.pendulum.load(Ordering::Relaxed) { 2 * len } else { len };
+        let (_, cyc) = self.cycle(len);
+        let span = if self.pendulum.load(Ordering::Relaxed) { 2 * cyc } else { cyc };
         // Direction does not change how long a pass takes, only which end it
         // starts at — so the rate is the magnitude.
         let rate = self.speed().abs().max(1e-6);
@@ -1554,6 +1608,12 @@ pub struct Shared {
     /// the same one still being shown — and if two commands land inside one
     /// tick the counter jumps by two, so the loss is visible instead of silent.
     pub ack: Mutex<String>,
+    /// The last `pk` answer, as the JSON object the socket forwards once, and
+    /// a sequence number so each connection can tell a new one from the one
+    /// it has sent. Off the snapshot on purpose: a waveform is asked for once
+    /// and changes when a layer does, not thirty times a second.
+    pub peaks: Mutex<String>,
+    pub peaks_seq: AtomicUsize,
     pub ack_seq: AtomicUsize,
     /// The newest `/link/anchor`, as sent: microseconds, beat, tempo, quantum.
     /// Doubles are held as bits because there is no `AtomicF64`.
@@ -2120,16 +2180,39 @@ impl Shared {
         // arithmetic is `warp + (frame - origin) * 1.0` on integers — so the
         // ordinary case reads one sample per layer, as it always did, and the
         // second read is bought only by the loops that asked for it.
-        if frac == 0.0 {
-            return self.mix_at(li, n, p0);
-        }
-        let p1 = (p0 + 1) % len;
-        let f = frac as f32;
-        let a = self.mix_at(li, n, p0);
-        let b = self.mix_at(li, n, p1);
-        let mut out = [0.0f32; CHANNELS];
-        for ch in 0..CHANNELS {
-            out[ch] = a[ch] * (1.0 - f) + b[ch] * f;
+        let (start, span) = lp.cycle(len);
+        let end = start + span;
+        let mut out = if frac == 0.0 {
+            self.mix_at(li, n, p0)
+        } else {
+            // The next sample is the next arena position, unless this is the
+            // last of the cycle — then it is the first, which with a window
+            // is `start` and not zero.
+            let p1 = if p0 + 1 >= end { start } else { p0 + 1 };
+            let f = frac as f32;
+            let a = self.mix_at(li, n, p0);
+            let b = self.mix_at(li, n, p1);
+            let mut o = [0.0f32; CHANNELS];
+            for ch in 0..CHANNELS {
+                o[ch] = a[ch] * (1.0 - f) + b[ch] * f;
+            }
+            o
+        };
+        // **The window's seam gets the crossfade too.** A window ends in the
+        // middle of audio, so `out -> in` is a cut where the whole-loop wrap
+        // was a join, and it needs `xf` more than the join did: for the first
+        // `xf` positions after `in`, what would have followed `out` fades out
+        // under what follows `in`. Inside a whole loop the per-layer wrap in
+        // `sample_at` still does the job it always did.
+        if span < len {
+            let xf = lp.fade.load(Ordering::Relaxed).min(span / 2);
+            let k = p0.saturating_sub(start);
+            if xf > 0 && k < xf {
+                let tail = self.mix_at(li, n, (end + k) % len);
+                for ch in 0..CHANNELS {
+                    out[ch] = wrap_mix(out[ch], tail[ch], k, xf);
+                }
+            }
         }
         out
     }
@@ -2139,7 +2222,7 @@ impl Shared {
     /// Split out because interpolation needs the same question asked at two
     /// neighbouring positions, and summing the layers first is the same number
     /// as interpolating each layer and summing after — for half the reads.
-    fn mix_at(&self, li: usize, n: usize, pos: usize) -> [f32; CHANNELS] {
+    pub fn mix_at(&self, li: usize, n: usize, pos: usize) -> [f32; CHANNELS] {
         let lp = self.lp(li);
         let mut v = [0.0f32; CHANNELS];
         for l in 0..n {
@@ -2195,7 +2278,8 @@ impl Shared {
         if !rate.is_finite() || rate == 0.0 {
             return None;
         }
-        let span = if lp.pendulum.load(Ordering::Relaxed) { 2 * len } else { len } as f64;
+        let (_, cyc) = lp.cycle(len);
+        let span = if lp.pendulum.load(Ordering::Relaxed) { 2 * cyc } else { cyc } as f64;
         let frames = (span / rate.abs()).round() as usize;
         if frames == 0 || frames > crate::wav::MAX_FRAMES {
             return None;
@@ -2509,6 +2593,8 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         takes_dir: opts.takes_dir.clone(),
         ack: Mutex::new(String::new()),
         ack_seq: AtomicUsize::new(0),
+        peaks: Mutex::new(String::new()),
+        peaks_seq: AtomicUsize::new(0),
         link_micros: AtomicI64::new(0),
         link_beat: AtomicU64::new(0),
         link_tempo: AtomicU64::new(0),
@@ -4656,7 +4742,126 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
     }
     let lp = sh.lp(li);
     {
+        // **The window, the rotation and the peaks** — the editing verbs, all
+        // non-destructive, all in arena positions (frames from the start of
+        // the loop), because the page that sends them is looking at a picture
+        // drawn in those. `in<f>` and `out<f>` set the window, `win` clears
+        // it, `rot<f>` shifts the start by a signed number of frames, and
+        // `pk<n>` asks for the loop's waveform in `n` buckets, which comes
+        // back as its own message rather than in the ack.
+        // `t` is the claim-the-past verb, matched below by its first letter;
+        // spelled the same way here so `tone` is not mistaken for it.
+        let claims_past = rest.as_bytes().first() == Some(&b't') && rest.strip_prefix("tone").is_none();
+        if lp.window().is_some() && (rest == "r" || rest == "x" || claims_past) {
+            return format!(
+                "loop {} has a window; clear it with `win` before recording into it.",
+                li
+            );
+        }
         match rest {
+            _ if rest.starts_with("win") => {
+            lp.win_in.store(0, Ordering::Relaxed);
+            lp.win_out.store(0, Ordering::Release);
+            return format!("loop {} plays the whole loop again.", li);
+        }
+            _ if rest.starts_with("in") || rest.starts_with("out") => {
+            let is_in = rest.starts_with("in");
+            let arg = rest[if is_in { 2 } else { 3 }..].trim();
+            let len = lp.loop_len.load(Ordering::Acquire);
+            if len == 0 {
+                return format!("loop {} has no length to window yet.", li);
+            }
+            let f: usize = match arg.parse() {
+                Ok(f) => f,
+                Err(_) => return format!("`{}` wants a position in frames.", rest),
+            };
+            let (i, o) = lp.window().unwrap_or((0, len));
+            let (i, o) = if is_in { (f, o) } else { (i, f) };
+            if o > len {
+                return format!("loop {} is {} frames long; {} is past its end.", li, len, o);
+            }
+            if i >= o {
+                return format!("a window has to end after it starts: in {} out {} on loop {}.", i, o, li);
+            }
+            lp.win_in.store(i, Ordering::Relaxed);
+            // Zero means none, so a window that ends at the loop's end and
+            // starts at zero is no window — and is stored as such.
+            if i == 0 && o == len {
+                lp.win_out.store(0, Ordering::Release);
+                return format!("loop {} plays the whole loop again.", li);
+            }
+            lp.win_out.store(o, Ordering::Release);
+            let srf = sr as f64;
+            return format!(
+                "loop {} windows {:.3}–{:.3} s ({:.3} s of {:.3}).",
+                li,
+                i as f64 / srf,
+                o as f64 / srf,
+                (o - i) as f64 / srf,
+                len as f64 / srf
+            );
+        }
+            _ if rest.starts_with("rot") => {
+            let len = lp.loop_len.load(Ordering::Acquire);
+            if len == 0 {
+                return format!("loop {} has nothing to rotate yet.", li);
+            }
+            let k: i64 = match rest[3..].trim().parse() {
+                Ok(k) => k,
+                Err(_) => return format!("`{}` wants a signed number of frames.", rest),
+            };
+            let (_, span) = lp.cycle(len);
+            let now = lp.rot.load(Ordering::Relaxed) as i64;
+            let next = (now + k).rem_euclid(span as i64) as usize;
+            lp.rot.store(next, Ordering::Release);
+            return format!(
+                "loop {} starts {:.3} s into its cycle now ({:+.3} s).",
+                li,
+                next as f64 / sr as f64,
+                k as f64 / sr as f64
+            );
+        }
+            _ if rest.starts_with("pk") => {
+            let len = lp.loop_len.load(Ordering::Acquire);
+            let n = lp.n_layers.load(Ordering::Acquire);
+            if len == 0 || n == 0 {
+                return format!("loop {} has nothing to draw.", li);
+            }
+            let buckets: usize = rest[2..].trim().parse().unwrap_or(600).clamp(16, 4000);
+            let (i, o) = lp.window().unwrap_or((0, 0));
+            let mut lo = Vec::with_capacity(buckets);
+            let mut hi = Vec::with_capacity(buckets);
+            for b in 0..buckets {
+                let from = b * len / buckets;
+                let to = ((b + 1) * len / buckets).max(from + 1).min(len);
+                let (mut mn, mut mx) = (0.0f32, 0.0f32);
+                for p in from..to {
+                    let v = sh.mix_at(li, n, p);
+                    for ch in 0..CHANNELS {
+                        mn = mn.min(v[ch]);
+                        mx = mx.max(v[ch]);
+                    }
+                }
+                lo.push(((mn * 1000.0).round() as i32).clamp(-1000, 1000));
+                hi.push(((mx * 1000.0).round() as i32).clamp(-1000, 1000));
+            }
+            let json = format!(
+                r#"{{"peaks":{{"loop":{},"frames":{},"buckets":{},"winIn":{},"winOut":{},"rot":{},"lo":[{}],"hi":[{}]}}}}"#,
+                li,
+                len,
+                buckets,
+                i,
+                o,
+                lp.rot.load(Ordering::Relaxed),
+                lo.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
+                hi.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
+            );
+            if let Ok(mut slot) = sh.peaks.lock() {
+                *slot = json;
+            }
+            sh.peaks_seq.fetch_add(1, Ordering::Release);
+            return format!("peaks for loop {}: {} buckets over {:.3} s.", li, buckets, len as f64 / sr as f64);
+        }
             "x" => match lp.state.get() {
                 MULTIPLY => return multiply_end(sh, li, sr),
                 FIRST | OVERDUB => return format!("loop {} is still recording — finish that first.", li),
@@ -5612,6 +5817,9 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             }
             "c" => {
                 lp.cleared();
+                lp.win_in.store(0, Ordering::Relaxed);
+                lp.win_out.store(0, Ordering::Relaxed);
+                lp.rot.store(0, Ordering::Relaxed);
                 for l in 0..sh.max_layers {
                     sh.zero_layer(li, l);
                     lp.set_layer_shape(l, Shape { len: 0, tail: 0, born: 0 });
@@ -6406,6 +6614,8 @@ mod tests {
             takes_dir: std::env::temp_dir().join("itajara-test-takes"),
             ack: Mutex::new(String::new()),
             ack_seq: AtomicUsize::new(0),
+            peaks: Mutex::new(String::new()),
+            peaks_seq: AtomicUsize::new(0),
             link_micros: AtomicI64::new(0),
             link_beat: AtomicU64::new(0),
             link_tempo: AtomicU64::new(0),
@@ -6451,6 +6661,36 @@ mod tests {
     /// and a cycle is the whole of it. If that ever stops being true this test
     /// goes quiet in exactly the wrong way — silent thirds and a fourth that
     /// sounds — so it asserts each quarter separately.
+    /// **A window and a rotation move nothing.** The loop is a ramp, so every
+    /// rendered sample says which arena position it came from.
+    #[test]
+    fn a_window_and_a_rotation_change_where_a_pass_starts_and_ends() {
+        let sh = rig(LEN);
+        one_layer_loop(&sh, 0, 100, 0.0);
+        for p in 0..100 {
+            for ch in 0..CHANNELS {
+                sh.write(0, 0, p, ch, p as f32);
+            }
+        }
+        let first = |sh: &Shared| sh.render_loop(0).expect("renders")[0];
+        assert_eq!(first(&sh), 0.0);
+        assert!(dispatch(&sh, 48_000, "0rot10").contains("starts"));
+        assert_eq!(first(&sh), 10.0, "a rotation starts the pass later in the arena");
+        assert!(dispatch(&sh, 48_000, "0in20").contains("windows"));
+        assert!(dispatch(&sh, 48_000, "0out60").contains("windows"));
+        let out = sh.render_loop(0).expect("renders");
+        assert_eq!(out.len(), 40 * CHANNELS, "the render is the window");
+        assert_eq!(out[0], 30.0, "start of the window, plus the rotation");
+        assert_eq!(out[(40 - 1) * CHANNELS], 29.0, "and it wraps inside the window");
+        assert!(dispatch(&sh, 48_000, "0r").contains("window"), "no recording into a window");
+        assert!(dispatch(&sh, 48_000, "0out200").contains("past its end"));
+        assert!(dispatch(&sh, 48_000, "0win").contains("whole loop"));
+        assert!(dispatch(&sh, 48_000, "0rot-10").contains("starts"));
+        assert_eq!(first(&sh), 0.0, "and back");
+        assert!(dispatch(&sh, 48_000, "0pk16").contains("16 buckets"));
+        assert!(sh.peaks.lock().unwrap().contains(r#""buckets":16"#));
+    }
+
     /// **Off is a switch, not a gain.** The layer stays whole and comes
     /// back with one verb; while it is off the render, which is the mix, has
     /// nothing from it.

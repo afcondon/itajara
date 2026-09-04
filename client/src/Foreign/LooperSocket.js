@@ -182,7 +182,15 @@ function openSocket(url) {
   ws.onmessage = function (ev) {
     markAlive();
     try {
-      state.latest = JSON.parse(ev.data);
+      var msg = JSON.parse(ev.data);
+      // Two kinds of message on one socket: the snapshot, thirty a second,
+      // and a `peaks` answer, once per ask. Told apart by the one key the
+      // snapshot never carries.
+      if (msg && msg.peaks) {
+        state.peaks = msg.peaks;
+      } else {
+        state.latest = msg;
+      }
     } catch (e) {
       // A snapshot we cannot parse is worth knowing about but not worth
       // dropping the connection over.
@@ -241,6 +249,10 @@ export const sendImpl = function (cmd) {
 
 // Returns the latest snapshot as a plain object, or null. Deliberately a
 // pull rather than a callback: the component decides when it wants to look.
+export const latestPeaksImpl = function () {
+  return state.peaks || null;
+};
+
 export const latestImpl = function () {
   return state.latest;
 };

@@ -133,6 +133,18 @@ data Verb
   -- | Take one layer out of the mix, or put it back. The layer number is
   -- | the one the surface shows, counted from one, as `Place'` counts slots.
   | LayerOn Int Boolean
+  -- | The window: an in point and an out point in frames from the start of
+  -- | the loop, and the whole loop again. Non-destructive, and the daemon
+  -- | refuses to record into a windowed loop until it is cleared.
+  | WindowIn Int
+  | WindowOut Int
+  | ClearWindow
+  -- | Shift where a pass starts by a signed number of frames, without
+  -- | moving a sample.
+  | Shift Int
+  -- | Ask for the loop's waveform in this many buckets. Answered as its own
+  -- | message — `Foreign.LooperSocket.latestPeaks` — not in the ack.
+  | AskPeaks Int
   -- | Clear the loop: layers and length together.
   | Clear
   -- | Fire a one-shot: one pass, rather than turning for ever.
@@ -329,6 +341,11 @@ render = case _ of
   Source n -> "src" <> show n
   Mono on -> flag "mono" on
   LayerOn l on -> "ly" <> show l <> (if on then "1" else "0")
+  WindowIn f -> "in" <> show f
+  WindowOut f -> "out" <> show f
+  ClearWindow -> "win"
+  Shift k -> "rot" <> show k
+  AskPeaks n -> "pk" <> show n
   Clear -> "c"
   Fire -> "f"
   ClaimPast -> "t"

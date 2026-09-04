@@ -79,6 +79,9 @@ fn talk(
     // the app instead.
     let mut last_frames = sh.out_frames.load(Ordering::Acquire);
     let mut still = 0u32;
+    // Peaks go out once per answer, as their own message before the next
+    // snapshot; a connection that arrives later does not get the old one.
+    let mut peaks_seen = sh.peaks_seq.load(Ordering::Acquire);
     // At 30 Hz, a second and a half of a motionless counter. Longer than any
     // buffer, shorter than anyone's patience.
     const STILL_LIMIT: u32 = PUSH_HZ as u32 * 3 / 2;
@@ -143,6 +146,14 @@ fn talk(
         }
         let alive = still < STILL_LIMIT && !sh.device_lost.load(Ordering::Acquire);
 
+        let seq = sh.peaks_seq.load(Ordering::Acquire);
+        if seq != peaks_seen {
+            peaks_seen = seq;
+            let p = sh.peaks.lock().map(|s| s.clone()).unwrap_or_default();
+            if !p.is_empty() {
+                ws.send(tungstenite::Message::Text(p))?;
+            }
+        }
         ws.send(tungstenite::Message::Text(snapshot(&sh, sr, alive)))?;
     }
 }
@@ -209,7 +220,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                     r#""recording":{},"quant":{},"muted":{},"reverse":{},"pan":{},"#,
                     r#""speed":{:.4},"pendulum":{},"oneShot":{},"levelArm":{},"#,
                     r#""firing":{},"chance":{:.4},"skipping":{},"fadeMs":{:.1},"decayDb":{:.2},"#,
-                    r#""volDb":{:.2},"revox":{},"fbDb":{:.2},"toneHz":{:.0},"cycles":{},"#,
+                    r#""volDb":{:.2},"revox":{},"fbDb":{:.2},"toneHz":{:.0},"cycles":{},"winIn":{},"winOut":{},"rot":{},"#,
                     r#""src":{},"mono":{},"pendingAt":{},"recEnv":[{}],"shapes":[{}]}}"#
                 ),
                 li,
@@ -286,6 +297,9 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                 // told, which reads as one everywhere — reported as stored, so
                 // the app can tell "one bar" from "nobody has said".
                 lp.cycles.load(Ordering::Acquire),
+                lp.window().map(|w| w.0).unwrap_or(0),
+                lp.window().map(|w| w.1).unwrap_or(0),
+                lp.rot.load(Ordering::Relaxed),
                 // **One-based, because it is an index into a list a person
                 // reads.** The wire counts loops from zero and that is a debt
                 // being carried; a field added today should not add to it.

@@ -18,10 +18,12 @@ module Foreign.LooperSocket
   , allPhases
   , isWriting
   , LayerShape
+  , Peaks
   , SocketStatus
   , connect
   , send
   , latest
+  , latestPeaks
   , status
   , defaultUrl
   , snapshotAge
@@ -304,6 +306,12 @@ type LoopState =
   -- | pass through and `pan` is a balance.
   , mono :: Boolean
   , revox :: Boolean
+  -- | The window, in arena positions, or both zero for none; and the
+  -- | rotation, where a pass starts inside it. Non-destructive edits — see
+  -- | `Verb.WindowIn`, `Verb.WindowOut`, `Verb.Shift`.
+  , winIn :: Int
+  , winOut :: Int
+  , rot :: Int
   -- | What a Revox pass leaves of what was under it, in decibels. Zero leaves
   -- | everything, -60 replaces it.
   -- |
@@ -415,6 +423,7 @@ type SocketStatus =
 foreign import connectImpl :: String -> Effect Unit
 foreign import sendImpl :: String -> Effect Boolean
 foreign import latestImpl :: Effect (Nullable LooperState)
+foreign import latestPeaksImpl :: Effect (Nullable Peaks)
 foreign import statusImpl :: Effect SocketStatus
 
 -- | Milliseconds since the newest snapshot arrived, or negative if none has.
@@ -446,6 +455,24 @@ send = sendImpl
 
 latest :: Effect (Maybe LooperState)
 latest = toMaybe <$> latestImpl
+
+-- | The last answer to `Verb.AskPeaks`: one loop's waveform, as `buckets`
+-- | pairs of low and high in thousandths of full scale, over `frames` arena
+-- | positions, with the window and rotation as they were when it was drawn.
+-- | Its own message rather than a field of the snapshot, so it arrives once.
+type Peaks =
+  { loop :: Int
+  , frames :: Int
+  , buckets :: Int
+  , winIn :: Int
+  , winOut :: Int
+  , rot :: Int
+  , lo :: Array Int
+  , hi :: Array Int
+  }
+
+latestPeaks :: Effect (Maybe Peaks)
+latestPeaks = toMaybe <$> latestPeaksImpl
 
 status :: Effect SocketStatus
 status = statusImpl
