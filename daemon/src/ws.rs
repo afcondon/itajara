@@ -77,6 +77,29 @@ fn talk(
     // was unplugged mid-session, and it cost an afternoon of looking for a MIDI
     // fault. Watching the output frame counter makes the failure visible from
     // the app instead.
+    // **Edits run in order, on one worker per connection.** Every command
+    // used to run on a thread of its own, so that the ones that block on
+    // purpose — ending a multiply waits for the cycle boundary — would not
+    // hold up the snapshot. That also let a burst of edits from a slider
+    // execute out of order: a straggler landing after the restart had fired
+    // re-applied an older window and restarted the loop again, which was
+    // "it keeps restarting after I stop". So the editing verbs go through a
+    // channel and run in the order they were sent; everything else keeps its
+    // own thread, because a press must not queue behind a multiply.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    {
+        let sh = sh.clone();
+        std::thread::spawn(move || {
+            for cmd in rx {
+                let ack = dispatch(&sh, sr, &cmd);
+                if !ack.is_empty() {
+                    println!("  [app] {}", ack);
+                    sh.note_ack(&ack);
+                }
+            }
+        });
+    }
+
     let mut last_frames = sh.out_frames.load(Ordering::Acquire);
     let mut still = 0u32;
     // Peaks go out once per answer, as their own message before the next
@@ -111,18 +134,21 @@ fn talk(
                 // exactly as long, which is precisely when the display most
                 // needs to be moving. The snapshot must keep flowing whatever
                 // the engine is busy doing.
-                let sh = sh.clone();
-                std::thread::spawn(move || {
-                    let ack = dispatch(&sh, sr, &cmd);
-                    if !ack.is_empty() {
-                        println!("  [app] {}", ack);
-                        // Which is where it used to stop. Printing to the
-                        // daemon's stdout told whoever was looking at a
-                        // terminal, and the app — the only thing that is
-                        // definitely watching — learned nothing at all.
-                        sh.note_ack(&ack);
+                if is_edit(&cmd) {
+                    // A closed worker means this connection is on its way out.
+                    if tx.send(cmd.to_string()).is_err() {
+                        return Ok(());
                     }
-                });
+                } else {
+                    let sh = sh.clone();
+                    std::thread::spawn(move || {
+                        let ack = dispatch(&sh, sr, &cmd);
+                        if !ack.is_empty() {
+                            println!("  [app] {}", ack);
+                            sh.note_ack(&ack);
+                        }
+                    });
+                }
             }
             Ok(tungstenite::Message::Close(_)) => {
                 println!("  app disconnected.");
@@ -494,4 +520,11 @@ fn db(x: f32) -> f64 {
     // Floored rather than -inf, because JSON has no infinity and a meter with a
     // bottom is more useful than one without.
     (20.0 * (x.max(1e-9) as f64).log10()).max(-120.0)
+}
+
+/// The verbs that must keep their order: the window, the rotation and the
+/// waveform. Spelled the way `dispatch` spells them, after the loop digits.
+fn is_edit(cmd: &str) -> bool {
+    let rest = cmd.trim().trim_start_matches(|c: char| c.is_ascii_digit());
+    ["in", "out", "win", "rot", "pk", "ly"].iter().any(|v| rest.starts_with(v))
 }
