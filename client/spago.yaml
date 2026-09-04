@@ -1,0 +1,17 @@
+package:
+  name: itajara-client
+  description: The client half of the Itajara looper daemon — the socket with
+    its liveness watchdog, the snapshot decoder, the verb vocabulary that
+    tools/check-verbs.py pins against engine.rs, and the recipes. Nothing of
+    the pedalboard, the MC6 or the Twister; the first thing any surface on the
+    daemon needs and the last thing that should be rewritten (DESIGN-HARVEST §6).
+  dependencies:
+    - control
+    - effect
+    - integers
+    - maybe
+    - nullable
+    - prelude
+    - strings
+  build:
+    strict: true
