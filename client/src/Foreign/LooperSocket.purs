@@ -463,6 +463,11 @@ latest = toMaybe <$> latestImpl
 type Peaks =
   { loop :: Int
   , frames :: Int
+  -- | The drawn range in arena positions: the loop, and whatever silence
+  -- | the window reaches into before or after it. `from` is at most zero
+  -- | and `to` at least `frames`.
+  , from :: Int
+  , to :: Int
   , buckets :: Int
   , winIn :: Int
   , winOut :: Int

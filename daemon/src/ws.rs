@@ -184,7 +184,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
             // Through the engine's own playhead rather than subtracting `origin`
             // here, so the display cannot disagree with the audio about where a
             // loop is — which it would the moment speed or a pendulum was on.
-            let pos = lp.play_pos(cur, len) as usize;
+            let pos = lp.play_pos(cur, len) as i64;
             let shapes: Vec<String> = (0..lp.n_layers.load(Ordering::Acquire))
                 .map(|l| {
                     let (slen, period, phase) = lp.layer_shape(l);
@@ -328,7 +328,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
     let sel = sh.sel();
     let cl = sh.lp(sel);
     let loop_len = cl.loop_len.load(Ordering::Acquire);
-    let pos = cl.play_pos(cur, loop_len) as usize;
+    let pos = cl.play_pos(cur, loop_len) as i64;
 
     // Peaks are swapped out, so each reader gets the peak since the last read
     // rather than a decaying maximum. With one client that is exactly right;

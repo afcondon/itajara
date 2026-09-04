@@ -666,8 +666,14 @@ pub struct Loop {
     /// for none. **Non-destructive.** Playback goes round `in..out` and so
     /// does the render, which is what makes an edit you can hear the edit
     /// you export. Recording is refused while one is set — see `dispatch`.
-    win_in: AtomicUsize,
-    win_out: AtomicUsize,
+    ///
+    /// **Signed, and allowed past the loop's ends.** An in point before zero
+    /// or an out point past the length is silence — up to one loop's worth
+    /// on either side — so a window can *extend* a loop as well as trim it:
+    /// counter-rotate at the start and the loop gains rest before its
+    /// downbeat, and nothing in the arena has to move to make room.
+    win_in: AtomicI64,
+    win_out: AtomicI64,
     /// Where the cycle starts, as an offset into the window (or the loop):
     /// position zero of a pass is arena position `start + rot`. Shifting the
     /// starting point of a loop without moving a sample, so a render begins
@@ -937,8 +943,8 @@ impl Loop {
             src: AtomicUsize::new(0),
             mono: AtomicBool::new(false),
             warp: AtomicU64::new(0.0f64.to_bits()),
-            win_in: AtomicUsize::new(0),
-            win_out: AtomicUsize::new(0),
+            win_in: AtomicI64::new(0),
+            win_out: AtomicI64::new(0),
             rot: AtomicUsize::new(0),
             cfg_speed: AtomicU64::new(1.0f64.to_bits()),
             cfg_pend: AtomicBool::new(false),
@@ -993,27 +999,31 @@ impl Loop {
     }
 
     /// The window as `(in, out)`, or `None` for the whole loop.
-    pub fn window(&self) -> Option<(usize, usize)> {
+    pub fn window(&self) -> Option<(i64, i64)> {
+        let i = self.win_in.load(Ordering::Relaxed);
         let o = self.win_out.load(Ordering::Relaxed);
-        if o == 0 {
+        if i == 0 && o == 0 {
             None
         } else {
-            Some((self.win_in.load(Ordering::Relaxed), o))
+            Some((i, o))
         }
     }
 
     /// One trip round, as `(start, span)` in arena positions: the window's,
-    /// or the loop's. A window that no longer fits the loop counts as none.
-    pub fn cycle(&self, len: usize) -> (usize, usize) {
+    /// or the loop's. `start` may be negative and `start + span` may pass the
+    /// length — that is the silence a window can add. A window that has
+    /// stopped making sense (an emptied loop, say) counts as none.
+    pub fn cycle(&self, len: usize) -> (i64, usize) {
+        let l = len as i64;
         match self.window() {
-            Some((i, o)) if o > i && o <= len => (i, o - i),
+            Some((i, o)) if o > i && i >= -l && o <= 2 * l && len > 0 => (i, (o - i) as usize),
             _ => (0, len),
         }
     }
 
     /// Cycle position `c` (0 to span) as an arena position: rotated inside
     /// the window, so position zero of a pass is `start + rot`.
-    fn place(&self, start: usize, span: usize, c: f64) -> f64 {
+    fn place(&self, start: i64, span: usize, c: f64) -> f64 {
         let r = self.rot.load(Ordering::Relaxed) % span.max(1);
         let mut q = c + r as f64;
         if q >= span as f64 {
@@ -2174,24 +2184,32 @@ impl Shared {
         // cycle turns over together — which is what playing a loop at a speed
         // means, and not the same as playing every layer at one.
         let pf = lp.play_pos(out_frame, len);
-        let p0 = (pf as usize).min(len - 1);
+        let p0 = pf.floor() as i64;
         let frac = pf - p0 as f64;
+        // Outside the arena is the silence a window added, not a read.
+        let at = |pos: i64| -> [f32; CHANNELS] {
+            if pos >= 0 && (pos as usize) < len {
+                self.mix_at(li, n, pos as usize)
+            } else {
+                [0.0; CHANNELS]
+            }
+        };
         // At rate one going forwards the fraction is exactly zero — the
         // arithmetic is `warp + (frame - origin) * 1.0` on integers — so the
         // ordinary case reads one sample per layer, as it always did, and the
         // second read is bought only by the loops that asked for it.
         let (start, span) = lp.cycle(len);
-        let end = start + span;
+        let end = start + span as i64;
         let mut out = if frac == 0.0 {
-            self.mix_at(li, n, p0)
+            at(p0)
         } else {
             // The next sample is the next arena position, unless this is the
             // last of the cycle — then it is the first, which with a window
             // is `start` and not zero.
             let p1 = if p0 + 1 >= end { start } else { p0 + 1 };
             let f = frac as f32;
-            let a = self.mix_at(li, n, p0);
-            let b = self.mix_at(li, n, p1);
+            let a = at(p0);
+            let b = at(p1);
             let mut o = [0.0f32; CHANNELS];
             for ch in 0..CHANNELS {
                 o[ch] = a[ch] * (1.0 - f) + b[ch] * f;
@@ -2204,11 +2222,19 @@ impl Shared {
         // `xf` positions after `in`, what would have followed `out` fades out
         // under what follows `in`. Inside a whole loop the per-layer wrap in
         // `sample_at` still does the job it always did.
-        if span < len {
+        if start != 0 || span != len {
             let xf = lp.fade.load(Ordering::Relaxed).min(span / 2);
-            let k = p0.saturating_sub(start);
+            let k = (p0 - start).max(0) as usize;
             if xf > 0 && k < xf {
-                let tail = self.mix_at(li, n, (end + k) % len);
+                // What would have followed `out`: the loop's own next audio
+                // when the window ends inside it, wrapping as the loop does;
+                // silence when the window already reaches past the end.
+                let after = end + k as i64;
+                let tail = if after >= len as i64 && end <= len as i64 {
+                    at(after % len as i64)
+                } else {
+                    at(after)
+                };
                 for ch in 0..CHANNELS {
                     out[ch] = wrap_mix(out[ch], tail[ch], k, xf);
                 }
@@ -4771,34 +4797,47 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             if len == 0 {
                 return format!("loop {} has no length to window yet.", li);
             }
-            let f: usize = match arg.parse() {
+            let f: i64 = match arg.parse() {
                 Ok(f) => f,
-                Err(_) => return format!("`{}` wants a position in frames.", rest),
+                Err(_) => return format!("`{}` wants a position in frames, which may be negative.", rest),
             };
-            let (i, o) = lp.window().unwrap_or((0, len));
+            let l = len as i64;
+            let (i, o) = lp.window().unwrap_or((0, l));
             let (i, o) = if is_in { (f, o) } else { (i, f) };
-            if o > len {
-                return format!("loop {} is {} frames long; {} is past its end.", li, len, o);
+            // One loop's worth of silence on either side is the most a window
+            // can add: past that a loop is mostly rest, and the arithmetic
+            // that draws it would rather say so than draw it.
+            if i < -l || o > 2 * l {
+                return format!(
+                    "loop {} is {} frames long; a window may reach from {} to {}, not {}.",
+                    li,
+                    len,
+                    -l,
+                    2 * l,
+                    if is_in { i } else { o }
+                );
             }
             if i >= o {
                 return format!("a window has to end after it starts: in {} out {} on loop {}.", i, o, li);
             }
-            lp.win_in.store(i, Ordering::Relaxed);
-            // Zero means none, so a window that ends at the loop's end and
-            // starts at zero is no window — and is stored as such.
-            if i == 0 && o == len {
+            // The whole loop is no window, and is stored as none.
+            if i == 0 && o == l {
+                lp.win_in.store(0, Ordering::Relaxed);
                 lp.win_out.store(0, Ordering::Release);
                 return format!("loop {} plays the whole loop again.", li);
             }
+            lp.win_in.store(i, Ordering::Relaxed);
             lp.win_out.store(o, Ordering::Release);
             let srf = sr as f64;
+            let padded = if i < 0 || o > l { " with silence" } else { "" };
             return format!(
-                "loop {} windows {:.3}–{:.3} s ({:.3} s of {:.3}).",
+                "loop {} windows {:.3}–{:.3} s ({:.3} s of {:.3}{}).",
                 li,
                 i as f64 / srf,
                 o as f64 / srf,
                 (o - i) as f64 / srf,
-                len as f64 / srf
+                len as f64 / srf,
+                padded
             );
         }
             _ if rest.starts_with("rot") => {
@@ -4829,14 +4868,24 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             }
             let buckets: usize = rest[2..].trim().parse().unwrap_or(600).clamp(16, 4000);
             let (i, o) = lp.window().unwrap_or((0, 0));
+            // The picture spans the loop and whatever silence the window
+            // reaches into, so a window that extends past an end is drawn
+            // where it is rather than off the edge.
+            let l = len as i64;
+            let (from_all, to_all) = (i.min(0), o.max(l));
+            let total = (to_all - from_all) as usize;
             let mut lo = Vec::with_capacity(buckets);
             let mut hi = Vec::with_capacity(buckets);
             for b in 0..buckets {
-                let from = b * len / buckets;
-                let to = ((b + 1) * len / buckets).max(from + 1).min(len);
+                let from = b * total / buckets;
+                let to = ((b + 1) * total / buckets).max(from + 1).min(total);
                 let (mut mn, mut mx) = (0.0f32, 0.0f32);
                 for p in from..to {
-                    let v = sh.mix_at(li, n, p);
+                    let pos = from_all + p as i64;
+                    if pos < 0 || pos >= l {
+                        continue;
+                    }
+                    let v = sh.mix_at(li, n, pos as usize);
                     for ch in 0..CHANNELS {
                         mn = mn.min(v[ch]);
                         mx = mx.max(v[ch]);
@@ -4846,9 +4895,11 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 hi.push(((mx * 1000.0).round() as i32).clamp(-1000, 1000));
             }
             let json = format!(
-                r#"{{"peaks":{{"loop":{},"frames":{},"buckets":{},"winIn":{},"winOut":{},"rot":{},"lo":[{}],"hi":[{}]}}}}"#,
+                r#"{{"peaks":{{"loop":{},"frames":{},"from":{},"to":{},"buckets":{},"winIn":{},"winOut":{},"rot":{},"lo":[{}],"hi":[{}]}}}}"#,
                 li,
                 len,
+                from_all,
+                to_all,
                 buckets,
                 i,
                 o,
@@ -6683,12 +6734,24 @@ mod tests {
         assert_eq!(out[0], 30.0, "start of the window, plus the rotation");
         assert_eq!(out[(40 - 1) * CHANNELS], 29.0, "and it wraps inside the window");
         assert!(dispatch(&sh, 48_000, "0r").contains("window"), "no recording into a window");
-        assert!(dispatch(&sh, 48_000, "0out200").contains("past its end"));
+        assert!(dispatch(&sh, 48_000, "0out201").contains("may reach"), "one loop of silence is the most");
         assert!(dispatch(&sh, 48_000, "0win").contains("whole loop"));
         assert!(dispatch(&sh, 48_000, "0rot-10").contains("starts"));
         assert_eq!(first(&sh), 0.0, "and back");
         assert!(dispatch(&sh, 48_000, "0pk16").contains("16 buckets"));
         assert!(sh.peaks.lock().unwrap().contains(r#""buckets":16"#));
+        // Extension: silence before and after, the content where it was.
+        assert!(dispatch(&sh, 48_000, "0in-20").contains("with silence"));
+        assert!(dispatch(&sh, 48_000, "0out120").contains("with silence"));
+        let out = sh.render_loop(0).expect("renders");
+        assert_eq!(out.len(), 140 * CHANNELS, "twenty of rest, the loop, twenty of rest");
+        assert_eq!(out[0], 0.0, "rest before the loop");
+        assert_eq!(out[21 * CHANNELS], 1.0, "the loop, where it was");
+        assert_eq!(out[125 * CHANNELS], 0.0, "rest after it");
+        assert!(dispatch(&sh, 48_000, "0in-200").contains("may reach"));
+        assert!(sh.peaks.lock().unwrap().contains(r#""buckets":16"#));
+        assert!(dispatch(&sh, 48_000, "0pk16").contains("16 buckets"));
+        assert!(sh.peaks.lock().unwrap().contains(r#""from":-20,"to":120"#));
     }
 
     /// **Off is a switch, not a gain.** The layer stays whole and comes
