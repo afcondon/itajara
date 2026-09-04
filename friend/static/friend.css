@@ -1,0 +1,71 @@
+/* friend.css — the plain skin. Light, sans-serif, a grid of loop cards.
+   Nothing here is anyone's house style; a house-styled skin is a second
+   file that replaces this one and leaves looper.css's class names alone. */
+
+:root {
+  --ink: #2e2b27;
+  --muted: #7a746c;
+  --line: #d8d3ca;
+  --ground: #f7f5f1;
+  --card: #ffffff;
+  --accent: #3a7d6c;
+  --record: #c0392b;
+  --armed: #d99a2b;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--ground); color: var(--ink);
+  font: 14px/1.45 -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif; }
+.friend { max-width: 1180px; margin: 0 auto; padding: 28px 24px 48px; display: flex; flex-direction: column; gap: 20px; }
+
+.friend-head h1 { margin: 0; font-size: 28px; font-weight: 700; letter-spacing: -0.01em; }
+.friend-sub { margin: 4px 0 0; color: var(--muted); }
+.friend-conn { margin: 10px 0 0; font-variant-numeric: tabular-nums; }
+.friend-conn.is-on::before, .friend-conn.is-off::before { content: ""; display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 8px; vertical-align: middle; }
+.friend-conn.is-on::before { background: var(--accent); }
+.friend-conn.is-off::before { background: var(--record); }
+
+.friend-start pre { background: var(--card); border: 1px solid var(--line); padding: 12px 14px; margin: 0 0 10px; overflow-x: auto; }
+.friend-start ul { margin: 6px 0 0; padding-left: 20px; color: var(--muted); }
+
+.friend-shape { display: flex; flex-wrap: wrap; gap: 6px 24px; color: var(--muted); font-size: 13px; }
+.friend-warn { color: var(--record); flex-basis: 100%; }
+
+.friend-loops { display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); gap: 14px; }
+.friend-loop { background: var(--card); border: 1px solid var(--line); padding: 12px 14px 12px; display: flex; flex-direction: column; gap: 10px; cursor: default; }
+.friend-loop.is-focus { border-color: var(--ink); box-shadow: 0 0 0 1px var(--ink) inset; }
+.friend-loop-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.friend-loop-name { font-weight: 700; }
+.friend-loop-state { color: var(--muted); }
+.is-recording .friend-loop-state { color: var(--record); font-weight: 600; }
+.is-armed .friend-loop-state { color: var(--armed); font-weight: 600; }
+.is-playing .friend-loop-state { color: var(--accent); }
+.friend-loop-len { color: var(--muted); font-variant-numeric: tabular-nums; }
+.friend-loop-dest { margin-left: auto; color: var(--muted); font-size: 12px; }
+
+.friend-layers { display: flex; flex-direction: column; gap: 3px; min-height: 24px; }
+.friend-layer { display: flex; align-items: center; gap: 8px; height: 22px; }
+.friend-layer.is-empty { color: var(--muted); font-size: 12px; font-style: italic; }
+.friend-layer.is-off .friend-layer-wave { opacity: 0.25; }
+.friend-layer-n { width: 12px; font-size: 11px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+.friend-layer-wave { position: relative; flex: 1 1 auto; height: 100%; background: #e9efec; }
+.is-recording .friend-layer-wave .loop-wave path { fill: var(--record); }
+.is-stopped .friend-layer-wave .loop-wave path { fill: #9a958d; }
+
+.friend-loop-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+.friend-btn { font: inherit; font-size: 13px; padding: 5px 10px; background: var(--card); color: var(--ink);
+  border: 1px solid var(--line); cursor: pointer; }
+.friend-btn:hover { border-color: var(--accent); }
+.friend-btn.on { background: var(--ink); color: #fff; border-color: var(--ink); }
+.is-recording .friend-btn:first-child { border-color: var(--record); color: var(--record); }
+
+.friend-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding-top: 6px; border-top: 1px solid var(--line); }
+.friend-gap { flex: 1 1 auto; }
+.friend-take { font: inherit; padding: 5px 8px; border: 1px solid var(--line); width: 160px; }
+.friend-note { flex-basis: 100%; color: var(--muted); font-size: 12px; }
+
+.friend-log { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--muted);
+  border-top: 1px solid var(--line); padding-top: 8px; display: flex; flex-direction: column; gap: 2px; }
+.friend-log div:first-child { color: var(--ink); }
+
+.looper-modal h2 { margin: 0 0 12px; font-size: 16px; }
+.looper-help-btn { font: inherit; font-size: 13px; padding: 4px 9px; background: var(--card); color: var(--ink); border: 1px solid var(--line); cursor: pointer; }

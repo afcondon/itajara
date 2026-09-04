@@ -1,0 +1,28 @@
+package:
+  name: itajara-surface
+  description: Halogen views of an Itajara snapshot that any surface on the
+    daemon can draw — a layer's envelope as the loop now plays it, and the Edit
+    panel (window, start, waveform). Pure render functions over the client's
+    types and a handler record; no app state, no controller, no CSS of their
+    own (the class names are the contract, and surface/looper.css is one
+    rendering of them). producing-with-your-feet and the Friend both draw
+    with these, which is what keeps one picture true in two places.
+  dependencies:
+    - arrays
+    - halogen
+    - integers
+    - itajara-client
+    - maybe
+    - numbers
+    - ordered-collections
+    - prelude
+    - strings
+  build:
+    strict: true
+
+workspace:
+  packageSet:
+    registry: 77.13.1
+  extraPackages:
+    itajara-client:
+      path: ../client

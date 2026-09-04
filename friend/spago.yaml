@@ -1,0 +1,40 @@
+package:
+  name: itajara-friend
+  description: A looper for people with a sample-playing module, a sound
+    source and a Mac — the Itajara daemon with a page on it. One app, and a
+    face per module (`?face=arbhar` first) that says what the module holds,
+    what a loop and a layer become there, and how to start the daemon to
+    suit it. Nothing of any pedalboard; every control is a button on the page.
+  dependencies:
+    - aff
+    - arrays
+    - console
+    - effect
+    - foldable-traversable
+    - halogen
+    - halogen-subscriptions
+    - integers
+    - itajara-client
+    - itajara-surface
+    - maybe
+    - numbers
+    - ordered-collections
+    - prelude
+    - strings
+    - web-dom
+    - web-html
+  build:
+    strict: true
+  bundle:
+    module: Main
+    outfile: static/index.js
+    platform: browser
+
+workspace:
+  packageSet:
+    registry: 77.13.1
+  extraPackages:
+    itajara-client:
+      path: ../client
+    itajara-surface:
+      path: ../surface

@@ -1,0 +1,69 @@
+/* looper.css — one rendering of the class names Itajara.Surface draws with.
+   The names are the contract (looper-edit*, looper-wave*, loop-wave,
+   loop-layer-on, looper-modal*); these rules are producing-with-your-feet's
+   own, copied here on 2026-09-04 so the Friend draws the Edit panel the same
+   way. A skin restyles these; it does not rename them. */
+
+.looper-edit { display: flex; flex-direction: column; gap: 10px; min-width: 520px; }
+.looper-wave { width: 100%; height: 140px; display: block; background: #f4f2ee; border: 1px solid #d8d3ca; }
+.looper-wave-loop { fill: #ffffff; }
+.looper-wave-outside { fill: #f4f2ee; opacity: 0.82; }
+.looper-wave-edge { stroke: #3a7d6c; stroke-width: 2; vector-effect: non-scaling-stroke; }
+.looper-wave-body { fill: #3a7d6c; }
+.looper-wave-start { stroke: #c0392b; stroke-width: 2; vector-effect: non-scaling-stroke; }
+.looper-wave-head { stroke: #111; stroke-width: 2; vector-effect: non-scaling-stroke; opacity: 0.75; }
+.looper-wave-missing { height: 140px; display: flex; align-items: center; justify-content: center; color: #888; border: 1px dashed #d8d3ca; }
+.looper-edit-row { display: grid; grid-template-columns: 48px 1fr 150px; gap: 10px; align-items: center; }
+.looper-edit-label { font-weight: 600; }
+.looper-edit-slider { width: 100%; accent-color: #3a7d6c; }
+.looper-edit-word { font-variant-numeric: tabular-nums; color: #444; }
+.looper-edit-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.looper-edit-note { color: #666; font-size: 12px; margin-left: auto; }
+.looper-help-btn {
+  font: inherit; font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
+  padding: 4px 10px; cursor: pointer;
+  border: 1px solid #ccc5ba; background: #fff; color: #6d675f;
+}
+.looper-help-btn:hover { border-color: #3a7d6c; color: #2e2b27; }
+.looper-help-btn.on { background: #2e2b27; border-color: #2e2b27; color: #fff; }
+/* The one in this row that is not a panel: it opens a document in another tab
+   rather than laying one over this page. Set apart so a hand does not reach for
+   it expecting the others' behaviour, and pushed to the end of the row. */
+.looper-help-btn.is-print {
+  margin-left: auto; border-style: dashed; color: #6d675f;
+}
+.looper-help-btn.is-print:hover { border-style: solid; }
+
+.looper-modal-overlay {
+  position: fixed; inset: 0; z-index: 1000;
+  display: flex; align-items: center; justify-content: center;
+}
+.looper-modal-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,0.35); }
+/* Wider and taller than it was, and with no title bar: the panel is opened to
+   read a grid, and every band across the top is a row of that grid pushed under
+   a scrollbar. */
+.looper-modal {
+  position: relative; background: #fff; border: 1px solid #ded9d1;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.18);
+  max-width: 1180px; width: 94%; max-height: 92vh;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+/* One Twister page is four cells across and nothing else, so the panel is
+   sized to that rather than to the widest thing the app has. The reclaimed
+   half is loops you can still see while reading the card. */
+.looper-modal.is-narrow { max-width: 640px; }
+.looper-modal-body { padding: 18px 20px 16px; overflow-y: auto; }
+/* Floats over the body rather than sitting in a bar of its own. The right
+   padding above leaves it somewhere to be without overlapping anything. */
+.looper-modal-close {
+  position: absolute; top: 6px; right: 8px; z-index: 1;
+  font: inherit; font-size: 22px; line-height: 1; padding: 2px 6px;
+  background: rgba(255,255,255,0.85); border: none; color: #a39a8c; cursor: pointer;
+}
+.looper-modal-close:hover { color: #2e2b27; }
+
+/* The layer envelope, as Itajara.Surface.Wave draws it: an SVG that fills
+   whatever block it is put in, the path the ink. */
+.loop-wave { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.loop-wave path { fill: #3a7d6c; }
+.loop-layer-on { flex: 0 0 auto; width: 12px; height: 12px; margin: 0; align-self: center; accent-color: #3a7d6c; cursor: pointer; }

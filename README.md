@@ -11,7 +11,17 @@ grouper, which booms.
   terminal cannot mean different things by the same name.
 - **`client/`** — the PureScript half every surface on the daemon needs:
   the socket with its liveness watchdog, the snapshot decoder, the verb
-  vocabulary, and the recipes. No word for a pedal, an MC6 or a Twister.
+  vocabulary, the recipes, and the meaning layer — `Data.Looper.Duty`, what
+  a control can ask for, and `Data.Looper.Machine`, what each duty means
+  against the daemon's own snapshot. No word for a pedal, an MC6 or a
+  Twister.
+- **`surface/`** — Halogen views over the client's types that any page on
+  the daemon can draw: a layer's envelope as the loop now plays it, and the
+  Edit panel. Plus `looper.css`, one rendering of the class names they use.
+- **`friend/`** — **the Friend**: a looper for people with a sample-playing
+  module, a sound source and a Mac. One app, a face per module
+  (`?face=arbhar` first); every control a button on the page. Design in
+  `docs/DESIGN-FRIEND.md`.
 - **`tools/`** — `check-verbs.py` holds the vocabulary to `dispatch`, and
   `check-snapshot.py` holds the snapshot types to what `ws.rs` sends. Both
   read both sources rather than trusting a comment. Run them after touching
@@ -39,5 +49,7 @@ that repo's `docs/DESIGN-LOOPER.md`.
 ```
 cd daemon && cargo build --release && cargo test
 cd client && spago build
+cd surface && spago build
+cd friend && make serve          # the Friend on http://localhost:3029/
 python3 tools/check-verbs.py && python3 tools/check-snapshot.py
 ```

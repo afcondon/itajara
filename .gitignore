@@ -1,4 +1,10 @@
 daemon/target/
 client/output/
 client/.spago/
+surface/output/
+surface/.spago/
+friend/output/
+friend/.spago/
+friend/static/index.js
+friend/static/looper.css
 __pycache__/
