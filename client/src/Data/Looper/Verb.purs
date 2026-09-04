@@ -396,6 +396,7 @@ addressed s = do
   n <- Int.fromString digits
   pure { loop: n, verb: SCU.dropWhile isDigit s }
   where
-  -- The wire's own alphabet, not Unicode's: a loop prefix is `0`-`7` and
-  -- nothing else ever appears there.
+  -- The wire's own alphabet, not Unicode's: a loop prefix is a run of ASCII
+  -- digits — one for the first ten loops, more past that since 2026-09-04 —
+  -- and nothing else ever appears there.
   isDigit c = c >= '0' && c <= '9'

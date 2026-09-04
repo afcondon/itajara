@@ -204,6 +204,15 @@ type LooperState =
   -- | neither. When the new display lands, the flat fields go.
   , selected :: Int
   , nLoops :: Int
+  -- | **The shape**, with `nLoops`, `maxLayers` and `sampleRate`: everything
+  -- | a surface needs to lay itself out, in every snapshot because the
+  -- | display never has to ask. `maxSecs` is the arena — the longest any loop
+  -- | can be — `fixedSecs` is `--fixed-secs` or zero, and `ringSecs` is how
+  -- | far back `ClaimPast` can reach. None of them changes while the daemon
+  -- | lives.
+  , maxSecs :: Number
+  , fixedSecs :: Number
+  , ringSecs :: Number
   , loops :: Array LoopState
   }
 

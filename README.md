@@ -17,6 +17,20 @@ grouper, which booms.
   read both sources rather than trusting a comment. Run them after touching
   either side.
 
+**How big can it be?** As big as memory. `--loops` and `--layers` have no
+ceiling; the arena is `loops × layers × --max-secs × 2 channels × 4 bytes`,
+allocated zeroed so the kernel commits pages only as loops fill (an 11 GB
+ceiling costs about 45 MB until you record into it). At startup the daemon
+prints the ceiling, asks on a terminal if it is more than a quarter of
+physical memory, and refuses if it is more than all of it. There is no
+flag past the refusal: the source is right here. `--yes` skips the
+question for scripts and supervisors; with no terminal it goes ahead and
+says so.
+
+**What a client can know.** Every snapshot carries the shape — `nLoops`,
+`maxLayers`, `sampleRate`, `maxSecs`, `fixedSecs`, `ringSecs` — so a page
+lays itself out from the daemon rather than from a constant.
+
 Split out of `producing-with-your-feet` on 2026-09-04 with its history; that
 app is the first consumer, and the reasons for the split are in its
 `docs/DESIGN-HARVEST.md` §6. The design notes for the engine are still in

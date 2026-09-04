@@ -88,9 +88,14 @@ USAGE
                         neither it falls back to 252 and says so, because
                         the default is an assertion and not an abstention
       --max-secs <s>    longest loop, and so the arena size   (default 300)
-      --loops <n>       how many loops, 1 to 10: the wire names a loop by one
-                        digit                                     (default 8)
+      --loops <n>       how many loops                            (default 8)
       --layers <n>      layers per loop, which is the undo stack  (default 4)
+                        Neither is capped: the arena is loops x layers x
+                        --max-secs, committed only as loops fill, and the
+                        daemon says what that comes to at startup, asks on a
+                        terminal past a quarter of memory, and refuses past
+                        all of it.
+      --yes             take the footprint as read; do not ask
       --fixed-secs <s>  every loop starts, and after `c` returns, as an empty
                         tape this long: record, and it closes itself there.
                         Stands in for --max-secs unless that is given too.
@@ -326,6 +331,11 @@ fn parse_loop(args: &[String]) -> Result<engine::Opts, String> {
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
+        if flag == "--yes" {
+            opts.yes = true;
+            i += 1;
+            continue;
+        }
         if flag == "--click" {
             opts.click = true;
             i += 1;
@@ -374,14 +384,14 @@ fn parse_loop(args: &[String]) -> Result<engine::Opts, String> {
             }
             "--loops" => {
                 opts.loops = value.parse().map_err(|_| "--loops wants an integer")?;
-                if opts.loops < 1 || opts.loops > engine::MAX_LOOPS {
-                    return Err(format!("--loops wants 1 to {}: a loop is named by one digit on the wire", engine::MAX_LOOPS));
+                if opts.loops < 1 {
+                    return Err("--loops wants at least one".to_string());
                 }
             }
             "--layers" => {
                 opts.layers = value.parse().map_err(|_| "--layers wants an integer")?;
-                if opts.layers < 1 || opts.layers > 32 {
-                    return Err("--layers wants 1 to 32".to_string());
+                if opts.layers < 1 {
+                    return Err("--layers wants at least one".to_string());
                 }
             }
             "--fixed-secs" => {

@@ -41,6 +41,7 @@ use cpal::traits::{DeviceTrait, StreamTrait};
 use std::error::Error;
 use std::io::BufRead;
 use std::path::PathBuf;
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -224,6 +225,8 @@ pub struct Opts {
     /// after a clear, so a first recording closes itself there. For rigs
     /// whose destination has a fixed length — an Arbhar layer is ten seconds.
     pub fixed_secs: Option<f64>,
+    /// `--yes`: take the memory footprint as read instead of asking.
+    pub yes: bool,
     pub sample_rate: u32,
     pub buffer: Option<u32>,
     pub click: bool,
@@ -269,6 +272,7 @@ impl Default for Opts {
             loops: DEFAULT_LOOPS,
             layers: DEFAULT_LAYERS,
             fixed_secs: None,
+            yes: false,
             sample_rate: 48_000,
             buffer: None,
             click: false,
@@ -427,16 +431,14 @@ pub fn default_takes_dir() -> PathBuf {
 /// at the default thirty seconds and 48 kHz is **351 MiB**, up from 263. It is
 /// allocated once and never touched by the allocator again.
 ///
-/// **A default since 2026-09-04**, not a constant: `--loops` sets it, up to
-/// `MAX_LOOPS`, and everything that used to read the constant reads
-/// `Shared::n_loops`. The arena line above is now `loops × layers × …`.
+/// **A default since 2026-09-04**, not a constant: `--loops` sets it, with
+/// no ceiling but memory, and everything that used to read the constant
+/// reads `Shared::n_loops`. The arena line above is now `loops × layers × …`.
 pub const DEFAULT_LOOPS: usize = 8;
 
-/// The most loops a rig can have, and the sentinel `anchor` holds when no
-/// loop owns the grid. **Ten because the wire names a loop by one leading
-/// digit** — `3r` records loop 3 — and that grammar is shared with every
-/// surface; a two-digit form would be a protocol change, not a flag.
-pub const MAX_LOOPS: usize = 10;
+/// What `anchor` holds when no loop owns the grid. Any loop index is below
+/// it, however many loops `--loops` asked for.
+pub const NO_ANCHOR: usize = usize::MAX;
 
 /// **Two, everywhere.** The arena, the pre-roll rings and every layer are
 /// stereo as of 2026-08-29.
@@ -1443,7 +1445,7 @@ impl Loop {
 
 pub struct Shared {
     arena: Vec<AtomicU32>,
-    max_frames: usize,
+    pub max_frames: usize,
     /// `--loops` and `--layers`: the arena's shape, fixed at startup.
     pub n_loops: usize,
     pub max_layers: usize,
@@ -1473,7 +1475,7 @@ pub struct Shared {
     /// is 11.5 MB a source a channel at the default sixty seconds, against an
     /// arena of hundreds — which is why "all of them, always" is affordable.
     ring: Vec<AtomicU32>,
-    ring_len: usize,
+    pub ring_len: usize,
     /// What each source is called and which input channels it reads.
     pub sources: Vec<Source>,
     pub loops: Vec<Loop>,
@@ -1485,7 +1487,7 @@ pub struct Shared {
     /// is a mode, and a mode that a footswitch could fall out of step with is
     /// the thing this design is trying not to have.
     pub selected: AtomicUsize,
-    /// Which loop's cycle is the grid, or `MAX_LOOPS` for none yet. Set by the
+    /// Which loop's cycle is the grid, or `NO_ANCHOR` for none yet. Set by the
     /// first loop to acquire a length; see `grid`.
     pub anchor: AtomicUsize,
     pub out_frames: AtomicUsize,
@@ -1798,7 +1800,7 @@ impl Shared {
     /// Remember which loop laid down the grid, the first time one does.
     fn claim_anchor(&self, li: usize) {
         let _ = self.anchor.compare_exchange(
-            MAX_LOOPS,
+            NO_ANCHOR,
             li,
             Ordering::AcqRel,
             Ordering::Relaxed,
@@ -1815,7 +1817,7 @@ impl Shared {
     fn release_anchor(&self, li: usize) {
         let _ = self.anchor.compare_exchange(
             li,
-            MAX_LOOPS,
+            NO_ANCHOR,
             Ordering::AcqRel,
             Ordering::Relaxed,
         );
@@ -2421,24 +2423,70 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         CHANNELS,
         ring_len * sources.len() * CHANNELS * 4 / 1_048_576
     );
+    // **The footprint, said out loud and, on a terminal, asked about.** The
+    // arena is committed lazily (see `zeroed_atomics`), so what is printed is
+    // the ceiling rather than the cost — but a ceiling above physical memory
+    // is a crash waiting for the loop that fills it, and that is refused. No
+    // flag overrides the refusal: the source is right there for anyone who
+    // wants to crash their own machine, and they can do it in their own name.
+    let arena_len = opts
+        .loops
+        .checked_mul(opts.layers)
+        .and_then(|n| n.checked_mul(max_frames))
+        .and_then(|n| n.checked_mul(CHANNELS))
+        .ok_or("that many loops, layers and seconds overflow the arena's arithmetic")?;
+    let ring_elems = ring_len * sources.len() * CHANNELS;
+    let total_bytes = (arena_len + ring_elems) as u64 * 4;
+    let mb = |b: u64| b / 1_048_576;
+    match physical_memory_bytes() {
+        Some(phys) if total_bytes > phys => {
+            return Err(format!(
+                "{} MB of loop memory on a machine with {} MB: it will not fit. \
+                 Fewer loops, fewer layers, or a shorter --max-secs.",
+                mb(total_bytes),
+                mb(phys)
+            )
+            .into());
+        }
+        Some(phys) if total_bytes > phys / 4 && !opts.yes => {
+            let pct = total_bytes * 100 / phys;
+            if std::io::stdin().is_terminal() {
+                print!(
+                    "That is {} MB, {}% of this machine's memory, committed only as loops fill. Go ahead? [y/N] ",
+                    mb(total_bytes),
+                    pct
+                );
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+                if !matches!(line.trim(), "y" | "Y" | "yes") {
+                    return Err("stopped before allocating anything.".into());
+                }
+            } else {
+                println!(
+                    "({} MB is {}% of this machine's memory; no terminal to ask on, so going ahead — --yes says so on purpose.)",
+                    mb(total_bytes),
+                    pct
+                );
+            }
+        }
+        _ => {}
+    }
+
 
     let sh = Arc::new(Shared {
-        arena: (0..opts.loops * opts.layers * max_frames * CHANNELS)
-            .map(|_| AtomicU32::new(0))
-            .collect(),
+        arena: zeroed_atomics(arena_len),
         max_frames,
         n_loops: opts.loops,
         max_layers: opts.layers,
         fixed_frames,
-        ring: (0..ring_len * sources.len() * CHANNELS)
-            .map(|_| AtomicU32::new(0))
-            .collect(),
+        ring: zeroed_atomics(ring_elems),
         ring_len,
         in_peak: (0..sources.len()).map(|_| AtomicU32::new(0)).collect(),
         sources,
         loops: (0..opts.loops).map(|_| Loop::new(opts.layers)).collect(),
         selected: AtomicUsize::new(0),
-        anchor: AtomicUsize::new(MAX_LOOPS),
+        anchor: AtomicUsize::new(NO_ANCHOR),
         out_frames: AtomicUsize::new(0),
         in_frames: AtomicUsize::new(0),
         k: AtomicI64::new(0),
@@ -2500,6 +2548,11 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         // A fixed seed would make every session drop the same cycles, which is
         // the opposite of what anybody switches chance on for.
         let mut rng = SmallRng::from_entropy();
+        // Per-buffer scratch, sized once here and carried into the callback,
+        // which must not allocate: one placement gain and one fold flag per
+        // loop, rewritten every buffer before they are read.
+        let mut gains: Vec<(f32, f32)> = vec![(0.0, 0.0); sh.n_loops];
+        let mut folds: Vec<bool> = vec![false; sh.n_loops];
         device.build_output_stream(
             &out_cfg,
             move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
@@ -2736,8 +2789,6 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                 let mut peak = 0.0f32;
                 // Once per buffer, not once per frame: six loops times two
                 // trig calls is free here and wasteful inside the frame loop.
-                let mut gains = [(0.0f32, 0.0f32); MAX_LOOPS];
-                let mut folds = [false; MAX_LOOPS];
                 for li in 0..sh.n_loops {
                     let lp = sh.lp(li);
                     // Level folded into the placement gains rather than applied
@@ -4583,15 +4634,21 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
     let late = (late_ms / 1000.0 * sr as f64).round() as i64;
 
     let trimmed = line.trim();
-    let (li, rest) = match trimmed.chars().next() {
-        Some(c) if c.is_ascii_digit() => {
-            let n = c.to_digit(10).unwrap() as usize;
-            if n >= sh.n_loops {
-                return format!("there are {} loops, numbered 0 to {}.", sh.n_loops, sh.n_loops - 1);
-            }
-            (n, trimmed[1..].trim())
+    // The loop is the leading run of digits, however long: `3r` and `12r`
+    // both parse, because no verb begins with a digit. Was one digit until
+    // 2026-09-04, which capped a rig at ten loops for no reason of the engine's.
+    let digits = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+    let (li, rest) = if digits > 0 {
+        let n: usize = match trimmed[..digits].parse() {
+            Ok(n) => n,
+            Err(_) => return format!("`{}` is not a loop number.", &trimmed[..digits]),
+        };
+        if n >= sh.n_loops {
+            return format!("there are {} loops, numbered 0 to {}.", sh.n_loops, sh.n_loops - 1);
         }
-        _ => (sh.sel(), trimmed),
+        (n, trimmed[digits..].trim())
+    } else {
+        (sh.sel(), trimmed)
     };
     if !trimmed.is_empty() && rest.is_empty() {
         sh.selected.store(li, Ordering::Relaxed);
@@ -5981,6 +6038,48 @@ fn len_of(lp: &Loop) -> usize {
     lp.loop_len.load(Ordering::Acquire)
 }
 
+/// A zeroed block the kernel commits lazily. `alloc_zeroed` hands back pages
+/// that cost nothing until a loop is written into them, where writing zeros
+/// element by element would touch — and so commit — every page at startup.
+/// This is what lets `--loops 100 --max-secs 3600` start on a laptop and
+/// cost only what gets recorded.
+fn zeroed_atomics(n: usize) -> Vec<AtomicU32> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let layout = std::alloc::Layout::array::<AtomicU32>(n).expect("arena size overflows a Layout");
+    // SAFETY: an all-zero bit pattern is a valid `AtomicU32` (it is zero); the
+    // layout is exactly the one `Vec<AtomicU32>` frees with; and the pointer
+    // is checked before it is trusted.
+    unsafe {
+        let p = std::alloc::alloc_zeroed(layout) as *mut AtomicU32;
+        if p.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        Vec::from_raw_parts(p, n, n)
+    }
+}
+
+/// Physical memory, in bytes, where the platform will say.
+fn physical_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("sysctl").args(["-n", "hw.memsize"]).output().ok()?;
+        String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let line = s.lines().find(|l| l.starts_with("MemTotal:"))?;
+        let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kb * 1024)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
 /// Thread an empty tape of `len` frames onto loop `li`: one blank layer,
 /// playing, so the first recording closes itself at that length. What `blank`
 /// does, and what `--fixed-secs` does to every loop at startup and after `c`.
@@ -6286,7 +6385,7 @@ mod tests {
             sources: vec![Source::mono("test", 0)],
             loops: (0..DEFAULT_LOOPS).map(|_| Loop::new(DEFAULT_LAYERS)).collect(),
             selected: AtomicUsize::new(0),
-            anchor: AtomicUsize::new(MAX_LOOPS),
+            anchor: AtomicUsize::new(NO_ANCHOR),
             out_frames: AtomicUsize::new(0),
             in_frames: AtomicUsize::new(0),
             k: AtomicI64::new(0),

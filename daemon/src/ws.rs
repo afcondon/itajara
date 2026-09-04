@@ -381,7 +381,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
             r#""ack":"{}","ackSeq":{},"linkTempo":{:.4},"linkQuantum":{:.4},"#,
             r#""linkBarFrames":{},"linkAnchors":{},"linkRejected":{},"#,
             r#""barFrames":{},"barOrigin":{},"launchQ":{},"#,
-            r#""selected":{},"nLoops":{},"sources":[{}],"loops":[{}]}}"#
+            r#""maxSecs":{:.3},"fixedSecs":{:.3},"ringSecs":{:.3},"selected":{},"nLoops":{},"sources":[{}],"loops":[{}]}}"#
         ),
         cl.state_name(),
         cl.n_layers.load(Ordering::Acquire),
@@ -432,6 +432,12 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
         sh.grid().map(|(_, len)| len).unwrap_or(0),
         sh.grid().map(|(o, _)| o).unwrap_or(0),
         sh.launch_q.load(Ordering::Relaxed),
+        // **The shape**, with `nLoops`, `maxLayers` and `sampleRate`: what a
+        // surface lays itself out from. Static for the daemon's life, and in
+        // every snapshot anyway, because the display never has to ask.
+        sh.max_frames as f64 / sr as f64,
+        sh.fixed_frames as f64 / sr as f64,
+        sh.ring_len as f64 / sr as f64,
         sel,
         sh.n_loops,
         // **The sources, named, in the order a `src<n>` counts them.** Without
