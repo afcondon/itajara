@@ -679,6 +679,18 @@ pub struct Loop {
     /// starting point of a loop without moving a sample, so a render begins
     /// where you chose rather than where the take happened to close.
     pub rot: AtomicUsize,
+    /// The frame at which an edit restarts the pass, or zero for none.
+    ///
+    /// **An edit you can hear is a restart, debounced.** Moving the in point
+    /// while the loop plays should play the loop *from* the new in point —
+    /// that is what "trim from the start" means to the ear — but a slider
+    /// sends a dozen edits a second while it moves, and a dozen restarts a
+    /// second is static. So each edit schedules the restart a short way
+    /// ahead and the next edit moves it on; the callback fires it when the
+    /// edits have stopped. A loop on the grid, or the one the grid comes
+    /// from, restarts on the next bar line instead, so the edit lands
+    /// where a bar starts and the grid does not move.
+    edit_restart: AtomicI64,
     /// A pending speed and pendulum, consumed by the output callback.
     ///
     /// The same argument as `request_at`: only the callback knows the frame, and
@@ -946,6 +958,7 @@ impl Loop {
             win_in: AtomicI64::new(0),
             win_out: AtomicI64::new(0),
             rot: AtomicUsize::new(0),
+            edit_restart: AtomicI64::new(0),
             cfg_speed: AtomicU64::new(1.0f64.to_bits()),
             cfg_pend: AtomicBool::new(false),
             cfg_armed: AtomicBool::new(false),
@@ -2921,6 +2934,19 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                     gains[li] = (l * v, r * v);
                 }
 
+                // Edits that have settled restart their pass here, at the
+                // frame they asked for: position zero of the cycle lands on
+                // it, and any speed offset is dropped so that is exact.
+                for li in 0..sh.n_loops {
+                    let lp = sh.lp(li);
+                    let at = lp.edit_restart.load(Ordering::Acquire);
+                    if at != 0 && base as i64 + frames as i64 > at {
+                        lp.origin.store(at, Ordering::Release);
+                        lp.warp.store(0.0f64.to_bits(), Ordering::Relaxed);
+                        lp.edit_restart.store(0, Ordering::Release);
+                    }
+                }
+
                 for f in 0..frames {
                     let out_frame = (base + f) as i64;
                     let mut vl = 0.0f32;
@@ -4786,28 +4812,29 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
         }
         match rest {
             _ if rest.starts_with("win") => {
-            lp.win_in.store(0, Ordering::Relaxed);
-            lp.win_out.store(0, Ordering::Release);
-            return format!("loop {} plays the whole loop again.", li);
-        }
-            _ if rest.starts_with("in") || rest.starts_with("out") => {
-            let is_in = rest.starts_with("in");
-            let arg = rest[if is_in { 2 } else { 3 }..].trim();
-            let len = lp.loop_len.load(Ordering::Acquire);
-            if len == 0 {
-                return format!("loop {} has no length to window yet.", li);
+                lp.win_in.store(0, Ordering::Relaxed);
+                lp.win_out.store(0, Ordering::Release);
+                schedule_restart(sh, li);
+                return format!("loop {} plays the whole loop again.", li);
             }
-            let f: i64 = match arg.parse() {
+            _ if rest.starts_with("in") || rest.starts_with("out") => {
+                let is_in = rest.starts_with("in");
+                let arg = rest[if is_in { 2 } else { 3 }..].trim();
+                let len = lp.loop_len.load(Ordering::Acquire);
+                if len == 0 {
+                return format!("loop {} has no length to window yet.", li);
+                }
+                let f: i64 = match arg.parse() {
                 Ok(f) => f,
                 Err(_) => return format!("`{}` wants a position in frames, which may be negative.", rest),
-            };
-            let l = len as i64;
-            let (i, o) = lp.window().unwrap_or((0, l));
-            let (i, o) = if is_in { (f, o) } else { (i, f) };
-            // One loop's worth of silence on either side is the most a window
-            // can add: past that a loop is mostly rest, and the arithmetic
-            // that draws it would rather say so than draw it.
-            if i < -l || o > 2 * l {
+                };
+                let l = len as i64;
+                let (i, o) = lp.window().unwrap_or((0, l));
+                let (i, o) = if is_in { (f, o) } else { (i, f) };
+                // One loop's worth of silence on either side is the most a window
+                // can add: past that a loop is mostly rest, and the arithmetic
+                // that draws it would rather say so than draw it.
+                if i < -l || o > 2 * l {
                 return format!(
                     "loop {} is {} frames long; a window may reach from {} to {}, not {}.",
                     li,
@@ -4816,21 +4843,23 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     2 * l,
                     if is_in { i } else { o }
                 );
-            }
-            if i >= o {
+                }
+                if i >= o {
                 return format!("a window has to end after it starts: in {} out {} on loop {}.", i, o, li);
-            }
-            // The whole loop is no window, and is stored as none.
-            if i == 0 && o == l {
+                }
+                // The whole loop is no window, and is stored as none.
+                if i == 0 && o == l {
                 lp.win_in.store(0, Ordering::Relaxed);
                 lp.win_out.store(0, Ordering::Release);
+                schedule_restart(sh, li);
                 return format!("loop {} plays the whole loop again.", li);
-            }
-            lp.win_in.store(i, Ordering::Relaxed);
-            lp.win_out.store(o, Ordering::Release);
-            let srf = sr as f64;
-            let padded = if i < 0 || o > l { " with silence" } else { "" };
-            return format!(
+                }
+                lp.win_in.store(i, Ordering::Relaxed);
+                lp.win_out.store(o, Ordering::Release);
+                schedule_restart(sh, li);
+                let srf = sr as f64;
+                let padded = if i < 0 || o > l { " with silence" } else { "" };
+                return format!(
                 "loop {} windows {:.3}–{:.3} s ({:.3} s of {:.3}{}).",
                 li,
                 i as f64 / srf,
@@ -4838,45 +4867,46 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 (o - i) as f64 / srf,
                 len as f64 / srf,
                 padded
-            );
-        }
-            _ if rest.starts_with("rot") => {
-            let len = lp.loop_len.load(Ordering::Acquire);
-            if len == 0 {
-                return format!("loop {} has nothing to rotate yet.", li);
+                );
             }
-            let k: i64 = match rest[3..].trim().parse() {
+            _ if rest.starts_with("rot") => {
+                let len = lp.loop_len.load(Ordering::Acquire);
+                if len == 0 {
+                return format!("loop {} has nothing to rotate yet.", li);
+                }
+                let k: i64 = match rest[3..].trim().parse() {
                 Ok(k) => k,
                 Err(_) => return format!("`{}` wants a signed number of frames.", rest),
-            };
-            let (_, span) = lp.cycle(len);
-            let now = lp.rot.load(Ordering::Relaxed) as i64;
-            let next = (now + k).rem_euclid(span as i64) as usize;
-            lp.rot.store(next, Ordering::Release);
-            return format!(
+                };
+                let (_, span) = lp.cycle(len);
+                let now = lp.rot.load(Ordering::Relaxed) as i64;
+                let next = (now + k).rem_euclid(span as i64) as usize;
+                lp.rot.store(next, Ordering::Release);
+                schedule_restart(sh, li);
+                return format!(
                 "loop {} starts {:.3} s into its cycle now ({:+.3} s).",
                 li,
                 next as f64 / sr as f64,
                 k as f64 / sr as f64
-            );
-        }
-            _ if rest.starts_with("pk") => {
-            let len = lp.loop_len.load(Ordering::Acquire);
-            let n = lp.n_layers.load(Ordering::Acquire);
-            if len == 0 || n == 0 {
-                return format!("loop {} has nothing to draw.", li);
+                );
             }
-            let buckets: usize = rest[2..].trim().parse().unwrap_or(600).clamp(16, 4000);
-            let (i, o) = lp.window().unwrap_or((0, 0));
-            // The picture spans the loop and whatever silence the window
-            // reaches into, so a window that extends past an end is drawn
-            // where it is rather than off the edge.
-            let l = len as i64;
-            let (from_all, to_all) = (i.min(0), o.max(l));
-            let total = (to_all - from_all) as usize;
-            let mut lo = Vec::with_capacity(buckets);
-            let mut hi = Vec::with_capacity(buckets);
-            for b in 0..buckets {
+            _ if rest.starts_with("pk") => {
+                let len = lp.loop_len.load(Ordering::Acquire);
+                let n = lp.n_layers.load(Ordering::Acquire);
+                if len == 0 || n == 0 {
+                return format!("loop {} has nothing to draw.", li);
+                }
+                let buckets: usize = rest[2..].trim().parse().unwrap_or(600).clamp(16, 4000);
+                let (i, o) = lp.window().unwrap_or((0, 0));
+                // The picture spans the loop and whatever silence the window
+                // reaches into, so a window that extends past an end is drawn
+                // where it is rather than off the edge.
+                let l = len as i64;
+                let (from_all, to_all) = (i.min(0), o.max(l));
+                let total = (to_all - from_all) as usize;
+                let mut lo = Vec::with_capacity(buckets);
+                let mut hi = Vec::with_capacity(buckets);
+                for b in 0..buckets {
                 let from = b * total / buckets;
                 let to = ((b + 1) * total / buckets).max(from + 1).min(total);
                 let (mut mn, mut mx) = (0.0f32, 0.0f32);
@@ -4893,8 +4923,8 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 }
                 lo.push(((mn * 1000.0).round() as i32).clamp(-1000, 1000));
                 hi.push(((mx * 1000.0).round() as i32).clamp(-1000, 1000));
-            }
-            let json = format!(
+                }
+                let json = format!(
                 r#"{{"peaks":{{"loop":{},"frames":{},"from":{},"to":{},"buckets":{},"winIn":{},"winOut":{},"rot":{},"lo":[{}],"hi":[{}]}}}}"#,
                 li,
                 len,
@@ -4906,13 +4936,13 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 lp.rot.load(Ordering::Relaxed),
                 lo.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
                 hi.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
-            );
-            if let Ok(mut slot) = sh.peaks.lock() {
+                );
+                if let Ok(mut slot) = sh.peaks.lock() {
                 *slot = json;
+                }
+                sh.peaks_seq.fetch_add(1, Ordering::Release);
+                return format!("peaks for loop {}: {} buckets over {:.3} s.", li, buckets, len as f64 / sr as f64);
             }
-            sh.peaks_seq.fetch_add(1, Ordering::Release);
-            return format!("peaks for loop {}: {} buckets over {:.3} s.", li, buckets, len as f64 / sr as f64);
-        }
             "x" => match lp.state.get() {
                 MULTIPLY => return multiply_end(sh, li, sr),
                 FIRST | OVERDUB => return format!("loop {} is still recording — finish that first.", li),
@@ -5871,6 +5901,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 lp.win_in.store(0, Ordering::Relaxed);
                 lp.win_out.store(0, Ordering::Relaxed);
                 lp.rot.store(0, Ordering::Relaxed);
+                lp.edit_restart.store(0, Ordering::Relaxed);
                 for l in 0..sh.max_layers {
                     sh.zero_layer(li, l);
                     lp.set_layer_shape(l, Shape { len: 0, tail: 0, born: 0 });
@@ -6355,6 +6386,26 @@ pub fn thread_blank(sh: &Shared, li: usize, len: usize) {
     sh.rebuild_env(li, 0);
 }
 
+/// Schedule the restart an edit asks for: a short way ahead so a moving
+/// slider coalesces into one, and on the next bar line for a loop that is
+/// on the grid or is the grid. See `Loop::edit_restart`.
+fn schedule_restart(sh: &Shared, li: usize) {
+    let lp = sh.lp(li);
+    let now = sh.out_frames.load(Ordering::Acquire) as i64;
+    let soon = now + EDIT_SETTLE_FRAMES;
+    let at = if lp.quantised() || sh.anchor.load(Ordering::Acquire) == li {
+        sh.next_boundary(soon).unwrap_or(soon)
+    } else {
+        soon
+    };
+    lp.edit_restart.store(at, Ordering::Release);
+}
+
+/// How long the edits have to stop for before the pass restarts: 150 ms at
+/// 48 kHz, which is longer than the gap between two slider events and
+/// shorter than a hand pausing to listen.
+const EDIT_SETTLE_FRAMES: i64 = 7_200;
+
 fn safe_name(raw: &str) -> String {
     let cleaned: String = raw
         .trim()
@@ -6728,6 +6779,7 @@ mod tests {
         assert!(dispatch(&sh, 48_000, "0rot10").contains("starts"));
         assert_eq!(first(&sh), 10.0, "a rotation starts the pass later in the arena");
         assert!(dispatch(&sh, 48_000, "0in20").contains("windows"));
+        assert!(sh.lp(0).edit_restart.load(Ordering::Relaxed) > 0, "an edit schedules a restart");
         assert!(dispatch(&sh, 48_000, "0out60").contains("windows"));
         let out = sh.render_loop(0).expect("renders");
         assert_eq!(out.len(), 40 * CHANNELS, "the render is the window");
