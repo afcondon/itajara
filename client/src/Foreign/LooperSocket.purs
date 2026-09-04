@@ -375,6 +375,10 @@ type LayerShape =
   -- | old age, which is exactly the question that could not be answered from
   -- | outside when it was asked (2026-08-25).
   , born :: Int
+  -- | Whether the layer is in the mix. A switch, not a gain: off keeps the
+  -- | layer whole and silent, and `gain` goes on reporting what decay has
+  -- | done to it meanwhile. Set with `Verb.LayerOn`.
+  , on :: Boolean
   -- | The layer's shape, as peaks 0-255 across its own length.
   -- |
   -- | **Absolute and logarithmic, never normalised per layer.** The picture is

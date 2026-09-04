@@ -130,6 +130,9 @@ data Verb
   -- | Fold a loop's two channels together at playback. Reversible by
   -- | construction: the audio is always kept in stereo.
   | Mono Boolean
+  -- | Take one layer out of the mix, or put it back. The layer number is
+  -- | the one the surface shows, counted from one, as `Place'` counts slots.
+  | LayerOn Int Boolean
   -- | Clear the loop: layers and length together.
   | Clear
   -- | Fire a one-shot: one pass, rather than turning for ever.
@@ -325,6 +328,7 @@ render = case _ of
   TakeTempo -> "bpm"
   Source n -> "src" <> show n
   Mono on -> flag "mono" on
+  LayerOn l on -> "ly" <> show l <> (if on then "1" else "0")
   Clear -> "c"
   Fire -> "f"
   ClaimPast -> "t"

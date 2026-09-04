@@ -536,6 +536,14 @@ pub struct Loop {
     /// frame. Six loops times eight layers of `powi` once a buffer is nothing;
     /// the same arithmetic per frame would be real.
     l_gain: Vec<AtomicU32>,
+    /// Whether the layer is in the mix at all.
+    ///
+    /// **Off is not a gain of zero.** The gain is what decay and the mixer
+    /// own; this is a switch the player throws — a layer parked for now, kept
+    /// whole, back with one verb. Reset to on whenever the layer is written
+    /// fresh, because a new take that arrived silent would be the mute bug
+    /// with a new name.
+    l_on: Vec<AtomicBool>,
     l_period: Vec<AtomicUsize>,
     l_phase: Vec<AtomicUsize>,
     /// The output frame at which this loop's position zero sits.
@@ -879,6 +887,7 @@ impl Loop {
             l_tail: (0..MAX_LAYERS).map(|_| AtomicUsize::new(0)).collect(),
             l_born: (0..MAX_LAYERS).map(|_| AtomicI64::new(0)).collect(),
             l_gain: (0..MAX_LAYERS).map(|_| AtomicU32::new(1.0f32.to_bits())).collect(),
+            l_on: (0..MAX_LAYERS).map(|_| AtomicBool::new(true)).collect(),
             env: Mutex::new((0..MAX_LAYERS).map(|_| Vec::new()).collect()),
             l_period: (0..MAX_LAYERS).map(|_| AtomicUsize::new(1)).collect(),
             l_phase: (0..MAX_LAYERS).map(|_| AtomicUsize::new(0)).collect(),
@@ -1269,6 +1278,10 @@ impl Loop {
         f32::from_bits(self.l_gain[layer].load(Ordering::Relaxed))
     }
 
+    pub fn layer_on(&self, layer: usize) -> bool {
+        self.l_on[layer].load(Ordering::Relaxed)
+    }
+
     /// The pass this layer was laid on. Reported so a quiet layer can say why
     /// it is quiet: `gain` alone shows that it has receded and not how far back
     /// it started, and the difference between "born three passes ago" and "born
@@ -1378,6 +1391,7 @@ impl Loop {
         self.l_tail[layer].store(s.tail, Ordering::Release);
         self.l_born[layer].store(s.born, Ordering::Release);
         self.l_gain[layer].store(1.0f32.to_bits(), Ordering::Release);
+        self.l_on[layer].store(true, Ordering::Release);
     }
     /// Where in a layer's own buffer the loop position `pos` falls — or `None`
     /// when the layer is silent there.
@@ -1973,7 +1987,11 @@ impl Shared {
                 for ch in 0..CHANNELS {
                     let mut v = 0.0f32;
                     for l in 0..n {
-                        v += self.read(li, l, p, ch) * lp.layer_gain(l);
+                        // A parked layer is not carried into the tape: what
+                        // flattens is what you were hearing.
+                        if lp.layer_on(l) {
+                            v += self.read(li, l, p, ch) * lp.layer_gain(l);
+                        }
                     }
                     self.write(li, 0, p, ch, v);
                 }
@@ -2096,7 +2114,7 @@ impl Shared {
             // Eighty decibels down is not quiet, it is gone — and skipping it
             // saves the arena read and the wrap fade's second read with it. The
             // audio is still there; only the reading of it stops.
-            if g > 1.0e-4 {
+            if g > 1.0e-4 && lp.layer_on(l) {
                 for ch in 0..CHANNELS {
                     v[ch] += self.sample_at(li, l, pos, ch) * g;
                 }
@@ -4926,6 +4944,36 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // Rig-wide, so the loop prefix is ignored — the same shape as `arm`,
             // `k` and `m`, and said in the ack so a `3lq4` does not look like it
             // set something on loop 3.
+            // Per-layer enable. `ly31` is layer 3 on, `ly30` is layer 3 off.
+            // Layers count from one on the wire, as `ph` does, and the flag is
+            // the *last* character so a two-digit layer still parses once
+            // `MAX_LAYERS` grows. **Set, never flipped**, for the reason every
+            // flag verb in here gives: a client that flips drifts out of step
+            // the first time a message is dropped.
+            _ if rest.starts_with("ly") => {
+                let arg = rest[2..].trim();
+                let (num, flag) = arg.split_at(arg.len().saturating_sub(1));
+                let on = match flag {
+                    "1" => true,
+                    "0" => false,
+                    _ => return format!("`{}` wants a layer number and then 1 or 0, as in `ly21`.", rest),
+                };
+                let n = lp.n_layers.load(Ordering::Acquire);
+                return match num.parse::<usize>() {
+                    Ok(l) if l >= 1 && l <= n => {
+                        lp.l_on[l - 1].store(on, Ordering::Release);
+                        format!("loop {} layer {} is {}.", li, l, if on { "on" } else { "off" })
+                    }
+                    Ok(l) => format!(
+                        "loop {} has {} layer{}, not a layer {}.",
+                        li,
+                        n,
+                        if n == 1 { "" } else { "s" },
+                        l
+                    ),
+                    Err(_) => format!("`{}` wants a layer number and then 1 or 0, as in `ly21`.", rest),
+                };
+            }
             _ if rest.starts_with("lq") => {
                 return match rest[2..].trim().parse::<i64>() {
                     Ok(n) if n >= -1 && n <= 64 => {
@@ -6230,6 +6278,24 @@ mod tests {
     /// and a cycle is the whole of it. If that ever stops being true this test
     /// goes quiet in exactly the wrong way — silent thirds and a fourth that
     /// sounds — so it asserts each quarter separately.
+    /// **Off is a switch, not a gain.** The layer stays whole and comes
+    /// back with one verb; while it is off the render, which is the mix, has
+    /// nothing from it.
+    #[test]
+    fn a_layer_switched_off_leaves_the_mix_and_comes_back_whole() {
+        let sh = rig(LEN);
+        one_layer_loop(&sh, 0, 100, 0.5);
+        let lp = sh.lp(0);
+        assert_eq!(sh.render_loop(0).expect("renders")[0], 0.5);
+        assert!(dispatch(&sh, 48_000, "0ly10").contains("off"));
+        assert!(!lp.layer_on(0));
+        assert_eq!(sh.render_loop(0).expect("still renders")[0], 0.0, "parked, not gone");
+        assert!(dispatch(&sh, 48_000, "0ly11").contains("on"));
+        assert_eq!(sh.render_loop(0).expect("renders")[0], 0.5, "back whole");
+        assert!(dispatch(&sh, 48_000, "0ly20").contains("not a layer"));
+        assert!(dispatch(&sh, 48_000, "0ly1").contains("wants a layer number"));
+    }
+
     #[test]
     fn a_sparse_layer_renders_where_it_lands() {
         let sh = rig(LEN);

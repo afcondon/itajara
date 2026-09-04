@@ -182,13 +182,14 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                     // could be made from. Reported so the display can say a
                     // loop has it rather than leaving it invisible.
                     format!(
-                        r#"{{"len":{},"period":{},"phase":{},"tail":{},"gain":{:.5},"born":{},"env":[{}]}}"#,
+                        r#"{{"len":{},"period":{},"phase":{},"tail":{},"gain":{:.5},"born":{},"on":{},"env":[{}]}}"#,
                         slen,
                         period,
                         phase,
                         lp.layer_tail(l),
                         lp.layer_gain(l),
                         lp.layer_born(l),
+                        lp.layer_on(l),
                         // Forty-eight bytes, and only for layers that exist —
                         // small enough to ride here rather than needing a
                         // message of its own, a request to trigger it, and a
@@ -345,13 +346,14 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
         .map(|l| {
             let (len, period, phase) = cl.layer_shape(l);
             format!(
-                r#"{{"len":{},"period":{},"phase":{},"tail":{},"gain":{:.5},"born":{},"env":[{}]}}"#,
+                r#"{{"len":{},"period":{},"phase":{},"tail":{},"gain":{:.5},"born":{},"on":{},"env":[{}]}}"#,
                 len,
                 period,
                 phase,
                 cl.layer_tail(l),
                 cl.layer_gain(l),
                 cl.layer_born(l),
+                cl.layer_on(l),
                 cl.layer_env(l)
                     .iter()
                     .map(|v| v.to_string())
