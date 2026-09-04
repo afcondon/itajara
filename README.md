@@ -18,10 +18,11 @@ grouper, which booms.
 - **`surface/`** — Halogen views over the client's types that any page on
   the daemon can draw: a layer's envelope as the loop now plays it, and the
   Edit panel. Plus `looper.css`, one rendering of the class names they use.
-- **`friend/`** — **the Friend**: a looper for people with a sample-playing
-  module, a sound source and a Mac. One app, a face per module
-  (`?face=arbhar` first); every control a button on the page. Design in
-  `docs/DESIGN-FRIEND.md`.
+
+**The Friends** — the looper app for people with a sample-playing module,
+a sound source and a Mac, one face per module — live in their own
+repository, [FriendsOfItajara](https://github.com/afcondon/FriendsOfItajara),
+and consume `client/` and `surface/` by path from beside this one.
 - **`tools/`** — `check-verbs.py` holds the vocabulary to `dispatch`, and
   `check-snapshot.py` holds the snapshot types to what `ws.rs` sends. Both
   read both sources rather than trusting a comment. Run them after touching
@@ -50,6 +51,5 @@ that repo's `docs/DESIGN-LOOPER.md`.
 cd daemon && cargo build --release && cargo test
 cd client && spago build
 cd surface && spago build
-cd friend && make serve          # the Friend on http://localhost:3029/
 python3 tools/check-verbs.py && python3 tools/check-snapshot.py
 ```
