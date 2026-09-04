@@ -7,9 +7,11 @@ package:
     suit it. Nothing of any pedalboard; every control is a button on the page.
   dependencies:
     - aff
+    - aff-promise
     - arrays
     - console
     - effect
+    - either
     - foldable-traversable
     - halogen
     - halogen-subscriptions

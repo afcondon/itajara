@@ -44,7 +44,8 @@ type Face =
   -- | How to start the daemon to suit this module. `<device>` is the user's.
   , daemon :: String
   -- | Whether the shaping step (msm `harvest`) exists for this module yet.
-  -- | Until it does, Save writes the daemon's own take format and says so.
+  -- | Until it does, Save writes the daemon's own take format and the
+  -- | Harvest button is not offered.
   , harvest :: Boolean
   , notes :: Array String
   }
@@ -66,7 +67,7 @@ arbhar =
   , layerWord: "layer"
   , holds: "36 scenes of 6 layers, and 36 single-layer library slots, per stick"
   , daemon: "itajara loop --device <device> --layers 6 --yes"
-  , harvest: false
+  , harvest: true
   , notes:
       [ "A layer holds 10 s; the first 3 s of the loop follow it as the tail the module reads past the end."
       , "Layers load in name order, 1_ to 6_; a scene's preset.txt with Load Layers loads audio without touching the panel."

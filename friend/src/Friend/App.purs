@@ -15,7 +15,9 @@ module Friend.App (component) where
 import Prelude
 
 import Control.Monad.Rec.Class (forever)
+import Control.Promise (toAffE)
 import Data.Array as Array
+import Data.Either (Either(..))
 import Data.Foldable (for_, traverse_)
 import Data.Int as Int
 import Data.Looper.Duty (Duty, Subject(..))
@@ -24,10 +26,11 @@ import Data.Looper.Machine as Machine
 import Data.Looper.Verb as Verb
 import Data.Map (Map)
 import Data.Map as Map
-import Data.Maybe (Maybe(..), maybe)
+import Data.Maybe (Maybe(..), fromMaybe, maybe)
 import Data.Number as Number
 import Data.String as String
-import Effect.Aff (Milliseconds(..), delay)
+import Effect.Aff (Milliseconds(..), attempt, delay)
+import Effect.Exception (message)
 import Effect.Aff as Aff
 import Effect.Aff.Class (class MonadAff)
 import Effect.Class (liftEffect)
@@ -36,6 +39,8 @@ import Foreign.LooperSocket (LoopState, LooperState, Peaks, SocketStatus)
 import Foreign.LooperSocket as Socket
 import Friend.Face (Face)
 import Friend.Face as Face
+import Friend.Http (Notes, LoopNote)
+import Friend.Http as Http
 import Halogen as H
 import Halogen.HTML as HH
 import Halogen.HTML.Events as HE
@@ -55,12 +60,40 @@ type State =
   , peaksKey :: String
   -- | The slider a hand is on; see `Itajara.Surface.Edit.View`.
   , local :: Map String Int
-  , editing :: Boolean
+  , panel :: Panel
   , ackSeq :: Int
   , log :: Array String
   -- | The name the next save goes under.
   , take :: String
+  -- | Takes the server can see on disk: a name in here has been saved.
+  , saved :: Array String
+  -- | The player's notes for the take in hand, and which take they were
+  -- | loaded for, so switching takes does not carry one's notes to another.
+  , notes :: Notes
+  , notesFor :: String
+  , notesStatus :: String
+  -- | The harvest form.
+  , sticks :: Array String
+  , stick :: String
+  , bank :: String
+  , scene :: String
+  , overwrite :: Boolean
+  , allLayers :: Boolean
+  , harvestOut :: String
+  , harvestBusy :: Boolean
   }
+
+-- | One modal at a time: the loop in hand's edit, the take's notes, or the
+-- | harvest. The Edit panel is the shared one; the other two are this page's.
+data Panel = NoPanel | EditPanel | NotesPanel | HarvestPanel
+
+derive instance Eq Panel
+
+-- | A field of the take's notes, so one action sets any of them.
+data NoteField = NTitle | NKey | NBpm | NTimbre | NUses | NNotes | NTags
+
+-- | A field of one loop's notes.
+data LoopField = LTitle | LKey | LTimbre | LUses | LNotes
 
 data Action
   = Initialize
@@ -77,13 +110,28 @@ data Action
   | EditDone String
   | SetTake String
   | SaveAll
+  | OpenPanel Panel
+  | RefreshTakes
+  | SetNote NoteField String
+  | SetLoopNote Int LoopField String
+  | SaveNotes
+  | RefreshSticks
+  | SetStick String
+  | SetBank String
+  | SetScene String
+  | SetOverwrite Boolean
+  | SetAllLayers Boolean
+  | RunHarvest Boolean
 
 component :: forall q o m. MonadAff m => H.Component q Face o m
 component =
   H.mkComponent
     { initialState: \face ->
         { face, looper: Nothing, status: Nothing, age: 0.0, focus: 0, peaks: Nothing
-        , peaksKey: "", local: Map.empty, editing: false, ackSeq: 0, log: [], take: "take" }
+        , peaksKey: "", local: Map.empty, panel: NoPanel, ackSeq: 0, log: [], take: "take"
+        , saved: [], notes: Http.emptyNotes, notesFor: "", notesStatus: ""
+        , sticks: [], stick: "", bank: "1", scene: "1_1", overwrite: false, allLayers: false
+        , harvestOut: "", harvestBusy: false }
     , render
     , eval: H.mkEval H.defaultEval { handleAction = handleAction, initialize = Just Initialize }
     }
@@ -113,6 +161,8 @@ handleAction = case _ of
         delay (Milliseconds 100.0)
         liftEffect (emit Poll)
       pure (Aff.launchAff_ (Aff.killFiber (Aff.error "poll stopped") fiber))
+    handleAction RefreshTakes
+    handleAction RefreshSticks
 
   Poll -> do
     status <- liftEffect Socket.status
@@ -128,7 +178,7 @@ handleAction = case _ of
       H.modify_ _ { looper = snap, status = Just status, age = age' }
       -- The Edit panel asks for its picture only when the picture would
       -- differ: the loop in focus, its layer count, its newest layer's birth.
-      when cur.editing $
+      when (cur.panel == EditPanel) $
         for_ snap \s -> for_ (Array.index s.loops cur.focus) \lp -> do
           let key = if lp.layers == 0 then ""
                     else show cur.focus <> ":" <> show lp.layers <> ":"
@@ -148,8 +198,8 @@ handleAction = case _ of
   Focus i -> H.modify_ _ { focus = i }
   ToggleEdit i -> do
     st <- H.get
-    let opening = not (st.editing && st.focus == i)
-    H.modify_ _ { focus = i, editing = opening, peaksKey = "" }
+    let opening = not (st.panel == EditPanel && st.focus == i)
+    H.modify_ _ { focus = i, panel = if opening then EditPanel else NoPanel, peaksKey = "" }
   SetLayer loop layer on -> duty loop (Duty.LayerOn layer on)
   WindowIn loop f -> do
     H.modify_ \s -> s { local = Map.insert "in" f s.local }
@@ -177,7 +227,58 @@ handleAction = case _ of
     st <- H.get
     let loops = maybe [] _.loops st.looper
     if Array.all (\lp -> lp.layers == 0) loops then H.modify_ (note "nothing to save: no loop has a layer")
-    else runAction (Machine.Command (Verb.render (Verb.ExportLayers (safeName st.take))))
+    else do
+      runAction (Machine.Command (Verb.render (Verb.ExportLayers (safeName st.take))))
+      -- The daemon writes on its own thread and the ack lands in the
+      -- snapshot; the folder is there a moment later. Ask the server then.
+      void $ H.fork do
+        H.liftAff (delay (Milliseconds 1500.0))
+        handleAction RefreshTakes
+
+  OpenPanel p -> do
+    H.modify_ _ { panel = p }
+    st <- H.get
+    when (p == NotesPanel && st.notesFor /= safeName st.take) do
+      r <- H.liftAff (attempt (toAffE (Http.loadNotes (safeName st.take))))
+      case r of
+        Right n -> H.modify_ _ { notes = n, notesFor = safeName st.take, notesStatus = "" }
+        Left e -> H.modify_ _ { notes = Http.emptyNotes, notesFor = safeName st.take, notesStatus = "could not load notes: " <> message e }
+    when (p == HarvestPanel) $ handleAction RefreshSticks
+  RefreshTakes -> do
+    r <- H.liftAff (attempt (toAffE Http.listTakes))
+    case r of
+      Right ts -> H.modify_ _ { saved = ts }
+      -- No server (the page is being served statically): nothing to list,
+      -- and nothing to say every second about it.
+      Left _ -> pure unit
+  SetNote f v -> H.modify_ \s -> s { notes = setNote f v s.notes }
+  SetLoopNote i f v -> H.modify_ \s -> s { notes = s.notes { loops = setLoopNote i f v s.notes.loops } }
+  SaveNotes -> do
+    st <- H.get
+    r <- H.liftAff (attempt (toAffE (Http.saveNotes (safeName st.take) st.notes)))
+    H.modify_ _ { notesStatus = case r of
+      Right _ -> "saved to ~/.itajara/takes/" <> safeName st.take <> "/notes.json"
+      Left e -> "could not save: " <> message e }
+  RefreshSticks -> do
+    r <- H.liftAff (attempt (toAffE Http.listSticks))
+    case r of
+      Right ss -> H.modify_ \s -> s { sticks = ss, stick = if s.stick == "" then fromMaybe "" (Array.head ss) else s.stick }
+      Left _ -> pure unit
+  SetStick v -> H.modify_ _ { stick = v }
+  SetBank v -> H.modify_ _ { bank = v }
+  SetScene v -> H.modify_ _ { scene = v }
+  SetOverwrite v -> H.modify_ _ { overwrite = v }
+  SetAllLayers v -> H.modify_ _ { allLayers = v }
+  RunHarvest dryRun -> do
+    st <- H.get
+    H.modify_ _ { harvestBusy = true, harvestOut = if dryRun then "dry run…" else "harvesting…" }
+    r <- H.liftAff (attempt (toAffE (Http.harvest
+      { take: safeName st.take, module: st.face.id, stick: st.stick, bank: st.bank, scene: st.scene
+      , overwrite: st.overwrite, allLayers: st.allLayers, dryRun })))
+    H.modify_ _ { harvestBusy = false, harvestOut = case r of
+      Right res -> res.output <> (if res.ok then "" else "\n(msm reported a failure)")
+      Left e -> "could not reach the server: " <> message e }
+    handleAction RefreshTakes
   where
   duty loop d = do
     st <- H.get
@@ -210,6 +311,34 @@ safeName s =
   in
     if cleaned == "" then "take" else cleaned
 
+setNote :: NoteField -> String -> Notes -> Notes
+setNote f v n = case f of
+  NTitle -> n { title = v }
+  NKey -> n { key = v }
+  NBpm -> n { bpm = v }
+  NTimbre -> n { timbre = v }
+  NUses -> n { uses = v }
+  NNotes -> n { notes = v }
+  NTags -> n { tags = v }
+
+-- | The loop's row, made if it has none yet. Loops are numbered from one
+-- | here, as the datasheet and the folders are.
+setLoopNote :: Int -> LoopField -> String -> Array LoopNote -> Array LoopNote
+setLoopNote i f v rows =
+  case Array.findIndex (\r -> r.loop == i) rows of
+    Just k -> fromMaybe rows (Array.modifyAt k (set) rows)
+    Nothing -> Array.snoc rows (set { loop: i, title: "", key: "", timbre: "", uses: "", notes: "" })
+  where
+  set r = case f of
+    LTitle -> r { title = v }
+    LKey -> r { key = v }
+    LTimbre -> r { timbre = v }
+    LUses -> r { uses = v }
+    LNotes -> r { notes = v }
+
+loopNote :: Int -> Array LoopNote -> LoopNote
+loopNote i rows = fromMaybe { loop: i, title: "", key: "", timbre: "", uses: "", notes: "" } (Array.find (\r -> r.loop == i) rows)
+
 render :: forall m. State -> H.ComponentHTML Action () m
 render st =
   HH.div [ HP.class_ (HH.ClassName "friend") ]
@@ -218,7 +347,11 @@ render st =
               Nothing -> [ noDaemon ]
               Just top -> [ shape top, loops top, controls top ])
         <> [ logView ]
-        <> (if st.editing then [ editModal ] else [])
+        <> (case st.panel of
+              NoPanel -> []
+              EditPanel -> [ editModal ]
+              NotesPanel -> [ notesModal ]
+              HarvestPanel -> [ harvestModal ])
     )
   where
   f = st.face
@@ -284,7 +417,7 @@ render st =
           , btn (if lp.state == "playing" then "Stop" else "Play") (Do (OnLoop i) Duty.Transport) false
           , btn "Undo" (Do (OnLoop i) Duty.Undo) false
           , btn "Clear" (Do (OnLoop i) Duty.ClearLoop) false
-          , btn "Edit" (ToggleEdit i) (st.editing && st.focus == i)
+          , btn "Edit" (ToggleEdit i) (st.panel == EditPanel && st.focus == i)
           ]
       ]
 
@@ -321,12 +454,19 @@ render st =
           , HP.value st.take
           , HE.onValueInput SetTake
           ]
-      , btn ("Save for " <> f.module_) SaveAll false
+      , btn "Save take" SaveAll false
+      , HH.span [ HP.class_ (HH.ClassName "friend-saved") ]
+          [ HH.text (if Array.elem (safeName st.take) st.saved then "saved ✓" else "") ]
+      , btn "Notes" (OpenPanel NotesPanel) (st.panel == NotesPanel)
+      , if f.harvest
+          then btn ("Harvest to " <> f.module_) (OpenPanel HarvestPanel) (st.panel == HarvestPanel)
+          else HH.text ""
       , HH.span [ HP.class_ (HH.ClassName "friend-note") ]
           [ HH.text
-              (if f.harvest
-                then "Writes " <> f.unit <> "s in the module's own layout."
-                else "Writes every loop's layers to ~/.itajara/takes/<take>/loop-<n>/, raw, with one manifest. The " <> f.module_ <> " layout is the next step.")
+              ("Save writes every loop's layers to ~/.itajara/takes/<take>/loop-<n>/, raw, with one manifest. "
+                <> (if f.harvest
+                      then "Harvest shapes that onto the stick: a loop is a library bank and a scene, and a datasheet goes with it."
+                      else "The " <> f.module_ <> " layout is the next step."))
           ]
       ]
 
@@ -345,6 +485,93 @@ render st =
               ]
           ]
       ]
+
+  modal klass title body =
+    HH.div [ HP.class_ (HH.ClassName "looper-modal-overlay") ]
+      [ HH.div [ HP.class_ (HH.ClassName "looper-modal-backdrop"), HE.onClick \_ -> OpenPanel NoPanel ] []
+      , HH.div [ HP.class_ (HH.ClassName ("looper-modal " <> klass)), HP.attr (HH.AttrName "role") "dialog" ]
+          [ HH.button [ HP.class_ (HH.ClassName "looper-modal-close"), HE.onClick \_ -> OpenPanel NoPanel ] [ HH.text "×" ]
+          , HH.div [ HP.class_ (HH.ClassName "looper-modal-body") ] ([ HH.h2_ [ HH.text title ] ] <> body)
+          ]
+      ]
+
+  field label value onV =
+    HH.label [ HP.class_ (HH.ClassName "friend-field") ]
+      [ HH.span_ [ HH.text label ]
+      , HH.input [ HP.type_ HP.InputText, HP.value value, HE.onValueInput onV ]
+      ]
+
+  -- **What only the player knows.** The daemon's facts — length, bars,
+  -- tempo, source — go on the datasheet by themselves; these are the rest.
+  notesModal =
+    modal "is-notes" ("Notes — " <> safeName st.take)
+      [ HH.div [ HP.class_ (HH.ClassName "friend-fields") ]
+          [ field "Title" st.notes.title (SetNote NTitle)
+          , field "Key" st.notes.key (SetNote NKey)
+          , field "BPM" st.notes.bpm (SetNote NBpm)
+          , field "Timbre" st.notes.timbre (SetNote NTimbre)
+          , field "Intended use" st.notes.uses (SetNote NUses)
+          , field "Tags" st.notes.tags (SetNote NTags)
+          ]
+      , HH.label [ HP.class_ (HH.ClassName "friend-field is-wide") ]
+          [ HH.span_ [ HH.text "Notes" ]
+          , HH.textarea [ HP.value st.notes.notes, HP.rows 3, HE.onValueInput (SetNote NNotes) ]
+          ]
+      , HH.table [ HP.class_ (HH.ClassName "friend-loop-notes") ]
+          [ HH.thead_ [ HH.tr_ [ HH.th_ [ HH.text "loop" ], HH.th_ [ HH.text "title" ], HH.th_ [ HH.text "key" ], HH.th_ [ HH.text "timbre" ], HH.th_ [ HH.text "use / notes" ] ] ]
+          , HH.tbody_ (map loopNoteRow (Array.range 1 (maybe 0 (Array.length <<< _.loops) st.looper)))
+          ]
+      , HH.div [ HP.class_ (HH.ClassName "looper-edit-actions") ]
+          [ btn "Save notes" SaveNotes false
+          , HH.span [ HP.class_ (HH.ClassName "looper-edit-note") ] [ HH.text st.notesStatus ]
+          ]
+      ]
+
+  loopNoteRow i =
+    let r = loopNote i st.notes.loops
+        cell fld v = HH.td_ [ HH.input [ HP.type_ HP.InputText, HP.value v, HE.onValueInput (SetLoopNote i fld) ] ]
+    in HH.tr_
+      [ HH.td_ [ HH.text (show i <> (if hasMaterial i then "" else " (empty)")) ]
+      , cell LTitle r.title
+      , cell LKey r.key
+      , cell LTimbre r.timbre
+      , cell LNotes r.notes
+      ]
+
+  hasMaterial i = maybe false (\top -> maybe false (\lp -> lp.layers > 0) (Array.index top.loops (i - 1))) st.looper
+
+  -- **The stick, and where on it.** A loop is a library bank and a scene;
+  -- the form says which bank and scene the first loop takes and the rest
+  -- follow. Dry run first is cheap and says exactly what would land where.
+  harvestModal =
+    modal "is-harvest" ("Harvest " <> safeName st.take <> " to the " <> f.module_)
+      ( (if Array.elem (safeName st.take) st.saved then []
+          else [ HH.p [ HP.class_ (HH.ClassName "friend-warn") ] [ HH.text "This take has not been saved yet — Save take first." ] ])
+      <> [ HH.div [ HP.class_ (HH.ClassName "friend-fields") ]
+            [ HH.label [ HP.class_ (HH.ClassName "friend-field") ]
+                [ HH.span_ [ HH.text "Stick" ]
+                , if Array.null st.sticks
+                    then HH.span [ HP.class_ (HH.ClassName "friend-warn") ] [ HH.text "no mounted volume has an _arbhar_library folder" ]
+                    else HH.select [ HE.onValueChange SetStick ]
+                      (map (\p -> HH.option [ HP.value p, HP.selected (p == st.stick) ] [ HH.text p ]) st.sticks)
+                ]
+            , field "First library bank (1–6)" st.bank SetBank
+            , field "First scene (1_1 … 6_6)" st.scene SetScene
+            , HH.label [ HP.class_ (HH.ClassName "friend-field is-check") ]
+                [ HH.input [ HP.type_ HP.InputCheckbox, HP.checked st.overwrite, HE.onChecked SetOverwrite ], HH.span_ [ HH.text "Overwrite slots already holding audio" ] ]
+            , HH.label [ HP.class_ (HH.ClassName "friend-field is-check") ]
+                [ HH.input [ HP.type_ HP.InputCheckbox, HP.checked st.allLayers, HE.onChecked SetAllLayers ], HH.span_ [ HH.text "Include layers switched off" ] ]
+            ]
+        , HH.div [ HP.class_ (HH.ClassName "looper-edit-actions") ]
+            [ btn "Refresh sticks" RefreshSticks false
+            , btn "Dry run" (RunHarvest true) false
+            , btn ("Harvest to " <> f.module_) (RunHarvest false) st.harvestBusy
+            , HH.span [ HP.class_ (HH.ClassName "looper-edit-note") ]
+                [ HH.text "Each loop takes one bank and one scene, ten seconds plus the three that follow, 24-bit at 48 kHz. The datasheet lands in the take and in _harvest/ on the stick." ]
+            ]
+        , HH.pre [ HP.class_ (HH.ClassName "friend-harvest-out") ] [ HH.text st.harvestOut ]
+        ]
+      )
 
   editHandlers =
     { windowIn: WindowIn

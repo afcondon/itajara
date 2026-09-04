@@ -7,4 +7,4 @@ bundle: build
 	spago bundle -p itajara-friend
 	cp ../surface/looper.css static/looper.css
 serve: bundle
-	cd static && python3 -m http.server 3029
+	node server.mjs

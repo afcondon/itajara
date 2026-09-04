@@ -6,9 +6,11 @@
         "core": {
           "dependencies": [
             "aff",
+            "aff-promise",
             "arrays",
             "console",
             "effect",
+            "either",
             "foldable-traversable",
             "halogen",
             "halogen-subscriptions",
@@ -707,6 +709,21 @@
         "tailrec",
         "transformers",
         "unsafe-coerce"
+      ]
+    },
+    "aff-promise": {
+      "type": "registry",
+      "version": "4.0.0",
+      "integrity": "sha256-Jgp3y+NWuuAmwz2V3LlWoX+AvxqfVglY77N5zTw8xnI=",
+      "dependencies": [
+        "aff",
+        "control",
+        "effect",
+        "either",
+        "exceptions",
+        "foreign",
+        "prelude",
+        "transformers"
       ]
     },
     "arrays": {

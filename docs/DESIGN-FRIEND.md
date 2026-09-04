@@ -103,44 +103,77 @@ problem (§7 step 11), not the Friend's.
 
 ---
 
-## 4. Saving, and what is not built yet
+## 4. Saving, harvesting, and the datasheet
 
-`Save for Arbhar` sends one verb, `exl<take>`, and the daemon writes
+Three buttons, in the order they are used.
+
+**Save take** sends one verb, `exl<take>`, and the daemon writes
 `~/.itajara/takes/<take>/loop-<n>/` for every loop that holds something —
 the layers raw, a version-1 `take.json` in each folder so it reloads as a
 plain take, and one `export.json` at version 2 for the set carrying the
-window, rotation, bars, tempo, source and per-layer gain and birth. That is
-exactly the material a scene is made of, with the edit recorded beside it
-rather than applied to it. The page says so under the button. The shaping
-into the module's own layout — 24-bit, `<bank>_<scene>_scene/1_…6_.wav`,
-the 10 s window with the loop's own first 3 s as tail, a `preset.txt` — is
-HARVEST §4's `msm harvest`, and `Face.harvest` is `false` on every face
-until it exists. When it does, the Friend needs a way to run it: the browser
-cannot spawn a process and the daemon must not, so the Friend grows a small
-Node server with `POST /harvest` (the pedalboard's `pwyf-store` is that seam
-there), and `make serve` stops being `python3 -m http.server`.
+window, rotation, bars, tempo, source and per-layer gain and birth. The
+edit is recorded beside the material rather than applied to it. A "saved ✓"
+appears when the server sees the folder.
 
-Also not built, in the order they are likely wanted:
+**Notes** is what only the player knows: title, key, BPM, timbre, intended
+use, tags, free text, and a row per loop. Saved as `notes.json` in the take.
+The daemon's facts — length, bars, tempo, source — are not asked for twice;
+the datasheet joins the two.
 
-1. `msm harvest` for Arbhar; then `Face.harvest = true` and the button means
-   what it says.
+**Harvest to Arbhar** runs `msm harvest`. The mapping, from the firmware 2.0
+manual: **a loop is a library bank** (`_arbhar_library/<bank>_<layer>_sample/`,
+six single-layer slots the panel loads one at a time, so scanning the Layer
+knob within a bank walks the takes that were played against each other) **and
+a scene** (`_arbhar_scenes/<bank>_<scene>_scene/`, up to six files loaded into
+the six layers in one action). Each file is ten seconds of the loop's pass
+followed by the three seconds that follow it — the wrap, which is the audio
+that does come next — at 24-bit, 48 kHz, stereo, named `<k>_<take>_loop<n>`
+so the leading digit keeps the layer order the module loads by. No
+configuration file is written: audio with no file *is* "Load Layers" by the
+manual's own definition. Layers switched off in the take are left out unless
+asked for; a slot already holding audio is kept unless `--overwrite`. The
+form takes the stick (auto-detected as the mounted volume with an
+`_arbhar_library`), the first bank and first scene, and offers a dry run.
+
+**The datasheet** is written twice: `datasheet.json` and `DATASHEET.md` in
+the take, and `_harvest/<take>.json` and `.md` on the stick, so the stick can
+be read back by something that was not there when it was written. It
+carries the notes, the daemon's facts per loop, every placement (loop,
+layer, slot, file, seconds, gain) and the remarks (what was left out, what
+was full). That file is the index a to-be-written **Arbhar archive manager**
+would read: one record per harvest, with enough in it to find "the D minor
+bowed thing in bank 3" without listening.
+
+**The seam.** The browser cannot spawn a process and the daemon must not, so
+`friend/server.mjs` — Node, zero dependencies, one file — serves the page
+and holds the two things the page cannot do: write `notes.json`, and run
+`msm harvest` (`MSM=` overrides the binary; `cargo install --path
+SamplesProject/msm` puts it on the path). Served statically instead, the
+page still loops and saves; Notes and Harvest simply cannot reach anything.
+
+Not built, in the order they are likely wanted:
+
+1. Morphagene, Rample and QD faces made real: one mapping each in
+   `msm::harvest`, on the Arbhar's pattern.
 2. Per-loop level and source on the card. The daemon has both; the page
    shows neither yet.
 3. Keyboard: number keys select a loop, space is Record. Recording with a
    mouse is a compromise, and the first thing a player will ask for.
 4. The Instruo skin, out of tree.
 5. The Twister, for those who have one.
-
----
+6. The archive manager: reads `_harvest/*.json` off any stick and the
+   `datasheet.json` in every take, and answers "what is on this stick" and
+   "where did that take go".
 
 ## 5. Running it
 
 ```
 cd daemon && cargo build --release
 ./target/release/itajara loop --device <device> --layers 6 --yes
-cd ../friend && make serve        # bundles, copies looper.css, serves static/ on :3029
+cd ../friend && make serve        # bundles, copies looper.css, node server.mjs on :3029
 open http://localhost:3029/?face=arbhar
 ```
 
 The page connects to `ws://127.0.0.1:3028` (the client's `defaultUrl`) and
-reconnects by itself; start the daemon in either order.
+reconnects by itself; start the daemon in either order. Harvesting needs
+`msm` on the path (`cargo install --path SamplesProject/msm`).
