@@ -218,7 +218,10 @@ fixedBody h v top lp n =
                 [ HH.div [ HP.class_ (HH.ClassName "looper-edit-row") ]
                     [ HH.span [ HP.class_ (HH.ClassName "looper-edit-label") ] [ HH.text "Whole" ]
                     , HH.span [ HP.class_ (HH.ClassName "looper-edit-word") ]
-                        [ HH.text (secs len <> " s, shorter than the " <> secs n <> " s the module holds: it plays whole, and the harvest fills the rest by letting it come round again.") ]
+                        [ HH.text
+                            (if len == n
+                              then secs len <> " s, exactly what the module holds: it plays whole and the harvest writes it as it is."
+                              else secs len <> " s, shorter than the " <> secs n <> " s the module holds: it plays whole, and the harvest fills the rest by letting it come round again.") ]
                     ]
                 ])
         <> [ HH.div [ HP.class_ (HH.ClassName "looper-edit-actions") ]
