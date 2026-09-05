@@ -4477,7 +4477,7 @@ fn place_at(sh: &Shared, li: usize, n: usize) -> String {
 /// anchor. The loop it makes is the one `r` already knows how to record into
 /// (`want > 0` in the arm branch arms `close_at`), so nothing downstream is
 /// new. On a loop with anything in it, the length is settled and this arms a
-/// **one-pass overdub** instead: the next `r` starts at the loop's zero and
+/// **one-pass overdub** instead: the next `r` starts on the press and
 /// closes itself a loop length later — "record another one" for a module that
 /// wants every layer the same length. Resizing material stays `len`'s job.
 fn fix_next(sh: &Shared, li: usize, sr: u32, secs: f64) -> String {
@@ -4494,7 +4494,7 @@ fn fix_next(sh: &Shared, li: usize, sr: u32, secs: f64) -> String {
         lp.one_pass.store(true, Ordering::Relaxed);
         let have = len as f64 / sr as f64;
         return format!(
-            "loop {}'s next record adds one layer of {:.3} s, from its start{}.",
+            "loop {}'s next record adds one layer of {:.3} s{}.",
             li,
             have,
             if (have - secs).abs() > 0.01 {
@@ -5247,25 +5247,19 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                         // exactly the loop that most needs to start on the
                         // boundary: it will be four bars long either way, and
                         // four bars starting off the grid is four bars wrong.
-                        let now = sh.out_frames.load(Ordering::Acquire) as i64;
+                        // A one-pass layer starts on the press, like any
+                        // overdub. It was first made to wait for the loop's
+                        // own zero so the stacked layers would read from one
+                        // start — and on a thirteen-second loop that was up to
+                        // thirteen seconds of nothing after the press, with no
+                        // sign of the wait. The layer spans the whole loop
+                        // either way, and what you play lands where you heard
+                        // it; the wait bought nothing the music could hear.
                         let one_pass = lp.one_pass.load(Ordering::Relaxed) && layer > 0;
-                        let boundary = if one_pass {
-                            // A one-pass layer starts where the loop does, so
-                            // the stacked layers all read from the same zero:
-                            // this loop's own next boundary, grid or no grid.
-                            let len = lp.loop_len.load(Ordering::Acquire) as i64;
-                            let origin = lp.origin.load(Ordering::Acquire);
-                            if len > 0 {
-                                let el = now - origin;
-                                let cycles = el.div_euclid(len) + if el.rem_euclid(len) == 0 { 0 } else { 1 };
-                                Some(origin + cycles * len)
-                            } else {
-                                None
-                            }
-                        } else if lp.quant.load(Ordering::Relaxed)
+                        let boundary = if lp.quant.load(Ordering::Relaxed)
                             && lp.n_layers.load(Ordering::Acquire) == 0
                         {
-                            sh.next_boundary(now)
+                            sh.next_boundary(sh.out_frames.load(Ordering::Acquire) as i64)
                         } else {
                             None
                         };
@@ -5275,20 +5269,11 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                                 lp.request.set(ARMED);
                                 let wait =
                                     (t - sh.out_frames.load(Ordering::Acquire) as i64).max(0);
-                                return if one_pass {
-                                    format!(
-                                        "loop {} adds layer {} from its start in {:.2} s, one pass.",
-                                        li,
-                                        layer + 1,
-                                        wait as f64 / sr as f64
-                                    )
-                                } else {
-                                    format!(
-                                        "loop {} starts on the grid in {:.2} s.",
-                                        li,
-                                        wait as f64 / sr as f64
-                                    )
-                                };
+                                return format!(
+                                    "loop {} starts on the grid in {:.2} s.",
+                                    li,
+                                    wait as f64 / sr as f64
+                                );
                             }
                             None => {
                                 lp.request_at.store(i64::MIN, Ordering::Release);
@@ -5306,6 +5291,12 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                                     // how a mode gets blamed for making the
                                     // thing it was told not to make.
                                     format!("loop {} over the tape.", li)
+                                } else if one_pass {
+                                    format!(
+                                        "loop {} adds layer {}, one pass, closing itself.",
+                                        li,
+                                        layer + 1
+                                    )
                                 } else if layer == 0 {
                                     format!("loop {} recording.", li)
                                 } else {
@@ -7599,7 +7590,7 @@ mod tests {
     /// **A copy lands whole, in phase, and only on an empty loop.**
     /// **A fixed next take.** `fix` leaves a length and no layers, which is
     /// the state the arm branch already turns into a self-closing first take;
-    /// on a loop with material it arms a one-pass layer from the loop's zero.
+    /// on a loop with material it arms a one-pass layer, starting on the press.
     /// It refuses a length past the arena, and nonsense.
     #[test]
     fn fixing_the_next_take_sizes_an_empty_loop_and_nothing_else() {
@@ -7617,10 +7608,10 @@ mod tests {
         assert!(ack.contains("adds one layer of 0.100 s") && ack.contains("not 0.5 s"), "{}", ack);
         assert_eq!(sh.lp(0).loop_len.load(Ordering::Acquire), 100, "untouched");
         assert!(sh.lp(0).one_pass.load(Ordering::Relaxed));
-        // The record that follows waits for the loop's own zero.
+        // The record that follows starts now, and says it will close itself.
         let ack = dispatch(&sh, 1000, "0r");
-        assert!(ack.contains("from its start") && ack.contains("one pass"), "{}", ack);
-        assert!(sh.lp(0).request_at.load(Ordering::Acquire) != i64::MIN, "scheduled, not now");
+        assert!(ack.contains("one pass"), "{}", ack);
+        assert_eq!(sh.lp(0).request_at.load(Ordering::Acquire), i64::MIN, "on the press, not at zero");
         // Not past the arena, and not nonsense.
         assert!(dispatch(&sh, 1000, "2fix2").contains("past --max-secs"));
         assert!(dispatch(&sh, 1000, "2fix").contains("wants a length"));
