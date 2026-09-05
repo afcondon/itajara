@@ -5457,6 +5457,22 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // rather than on `e`, because this file has been bitten twice by a
             // one-character guard silently eating a longer verb defined below
             // it, and `ex` costs nothing to be careful with.
+            // Copy: `cp<src>` every layer of loop src into this loop, `cp<src>l<k>`
+            // its k-th (from one, like `ly`). Onto an empty loop only. Two
+            // characters, ahead of every `c`: `"c"` is an exact match and
+            // cannot eat it, but the next `c` prefix someone adds could.
+            l if l.starts_with("cp") => {
+                let rest = &l[2..];
+                let (src, layer) = match rest.split_once('l') {
+                    Some((a, b)) => (a.trim().parse::<usize>(), Some(b.trim().parse::<usize>())),
+                    None => (rest.trim().parse::<usize>(), None),
+                };
+                return match (src, layer) {
+                    (Ok(sl), None) => copy_layers(sh, li, sl, None),
+                    (Ok(sl), Some(Ok(k))) if k >= 1 => copy_layers(sh, li, sl, Some(k - 1)),
+                    _ => format!("`{}` wants a source loop, and optionally `l<layer>` from one.", l),
+                };
+            }
             // Three characters, and ahead of `ex`: behind it, `exlriff` would
             // export the set as "lriff" and say so cheerfully.
             l if l.starts_with("exl") => return export_layers(sh, sr, &l[3..]),
@@ -6185,6 +6201,117 @@ fn write_layers(sh: &Shared, li: usize, sr: u32, dir: &std::path::Path) -> Resul
         });
     }
     Ok(out)
+}
+
+/// Copy loop `src`'s layers — all of them, or one — into loop `dst`, which must
+/// be empty.
+///
+/// ## Onto empty loops only
+///
+/// The copy defines the destination: its length is the source's, its layers
+/// are the source's, and it starts in phase with the source (same `origin`),
+/// so a copy is a second voice of the same take, not a stranger. What a copy
+/// onto a loop that already holds something would *mean* — reconcile two
+/// lengths, tile, crop — is a design question this refuses to answer by
+/// accident; the ack says so. A threaded blank (`--fixed-secs`, or `len` on
+/// an empty loop) counts as empty: it holds silence and a length, and the
+/// copy replaces both.
+///
+/// ## Whole layers, no window
+///
+/// The source's window and rotation are its own and are not copied: the
+/// layers land whole and the destination plays the whole of them, so the
+/// destination can be windowed to a *different* thirteen seconds. That is the
+/// point — one long take, copied to several empty loops, windowed
+/// differently in each, is several sources for a granular module.
+///
+/// Off the audio thread, like every command: nothing reads an empty loop's
+/// arena, so the copy can take its time.
+fn copy_layers(sh: &Shared, dst: usize, src: usize, layer: Option<usize>) -> String {
+    if src >= sh.n_loops {
+        return format!("there is no loop {}.", src);
+    }
+    if src == dst {
+        return format!("loop {} onto itself is nothing.", dst);
+    }
+    let from = sh.lp(src);
+    let to = sh.lp(dst);
+    if from.is_recording() || from.is_armed() {
+        return format!("loop {} is still recording — finish it before copying from it.", src);
+    }
+    if to.is_recording() || to.is_armed() {
+        return format!("loop {} is recording — a copy lands on an empty loop.", dst);
+    }
+    let n_from = from.n_layers.load(Ordering::Acquire);
+    let src_len = from.loop_len.load(Ordering::Acquire);
+    if n_from == 0 || src_len == 0 {
+        return format!("loop {} has nothing to copy.", src);
+    }
+    let blank = to.threaded.load(Ordering::Relaxed);
+    if !blank && (to.n_layers.load(Ordering::Acquire) > 0 || to.loop_len.load(Ordering::Acquire) > 0) {
+        return format!(
+            "loop {} is not empty — copies land on empty loops only; `{}c` first if you mean it.",
+            dst, dst
+        );
+    }
+    let chosen: Vec<usize> = match layer {
+        Some(k) if k >= n_from => return format!("loop {} has {} layer{}, not {}.", src, n_from, if n_from == 1 { "" } else { "s" }, k + 1),
+        Some(k) => vec![k],
+        None => (0..n_from).collect(),
+    };
+    let chosen: Vec<usize> = chosen.into_iter().filter(|&l| from.l_len[l].load(Ordering::Acquire) > 0).collect();
+    if chosen.is_empty() {
+        return format!("loop {} has nothing to copy.", src);
+    }
+    if chosen.len() > sh.max_layers {
+        return format!("loop {} has {} layers to copy and a loop here holds {}.", src, chosen.len(), sh.max_layers);
+    }
+
+    // Empty first, so nothing of a former take survives past a shorter copy.
+    to.n_layers.store(0, Ordering::Release);
+    for j in 0..sh.max_layers {
+        sh.zero_layer(dst, j);
+    }
+    for (j, &l) in chosen.iter().enumerate() {
+        let len = from.l_len[l].load(Ordering::Acquire);
+        for p in 0..len {
+            for ch in 0..CHANNELS {
+                sh.write(dst, j, p, ch, sh.read(src, l, p, ch));
+            }
+        }
+        to.set_layer_shape(j, Shape {
+            len,
+            tail: from.l_tail[l].load(Ordering::Relaxed),
+            born: from.l_born[l].load(Ordering::Relaxed),
+        });
+        to.l_period[j].store(from.l_period[l].load(Ordering::Relaxed), Ordering::Release);
+        to.l_phase[j].store(from.l_phase[l].load(Ordering::Relaxed), Ordering::Release);
+        to.l_on[j].store(true, Ordering::Release);
+        sh.rebuild_env(dst, j);
+    }
+    to.loop_len.store(src_len, Ordering::Release);
+    to.cycles.store(from.cycles.load(Ordering::Acquire), Ordering::Release);
+    to.quant.store(from.quant.load(Ordering::Relaxed), Ordering::Relaxed);
+    to.origin.store(from.origin.load(Ordering::Relaxed), Ordering::Release);
+    to.win_in.store(0, Ordering::Relaxed);
+    to.win_out.store(0, Ordering::Relaxed);
+    to.rot.store(0, Ordering::Relaxed);
+    to.pend_set.store(false, Ordering::Release);
+    to.threaded.store(false, Ordering::Relaxed);
+    to.n_layers.store(chosen.len(), Ordering::Release);
+    to.redo_to.store(chosen.len(), Ordering::Release);
+    to.state.set(PLAYING);
+
+    match layer {
+        Some(k) => format!(
+            "copied layer {} of loop {} onto loop {} ({:.3} s), whole and in phase; window it as you like.",
+            k + 1, src, dst, src_len as f64 / 48_000.0
+        ),
+        None => format!(
+            "copied {} layer{} of loop {} onto loop {}, whole and in phase; window it as you like.",
+            chosen.len(), if chosen.len() == 1 { "" } else { "s" }, src, dst
+        ),
+    }
 }
 
 /// Every loop that holds something, as a take each: `<name>/loop-<n>/` with
@@ -7098,6 +7225,39 @@ mod tests {
         // And `ex` still means the set: this must not have been eaten by `exl`.
         assert!(dispatch(&sh, 48_000, "exriff2").contains("exported 2 loops"));
         let _ = std::fs::remove_dir_all(&sh.takes_dir);
+    }
+
+    /// **A copy lands whole, in phase, and only on an empty loop.**
+    #[test]
+    fn copying_lands_whole_and_in_phase_on_an_empty_loop_only() {
+        let sh = rig(LEN);
+        one_layer_loop(&sh, 0, 100, 0.25);
+        lay(&sh, 0, 1, 100, 0.5);
+        sh.lp(0).n_layers.store(2, Ordering::Release);
+        sh.lp(0).origin.store(77, Ordering::Relaxed);
+        assert!(dispatch(&sh, 48_000, "0in10").contains("windows"));
+        settle(&sh, 0);
+
+        let ack = dispatch(&sh, 48_000, "2cp0");
+        assert!(ack.contains("copied 2 layers"), "{}", ack);
+        let to = sh.lp(2);
+        assert_eq!(to.n_layers.load(Ordering::Acquire), 2);
+        assert_eq!(to.loop_len.load(Ordering::Acquire), 100);
+        assert_eq!(to.origin.load(Ordering::Relaxed), 77, "in phase with the source");
+        assert_eq!(sh.read(2, 1, 50, 0), 0.5, "the audio came across");
+        assert!(to.window().is_none(), "the source's window stays its own");
+        // Not onto a loop that holds something.
+        assert!(dispatch(&sh, 48_000, "2cp0").contains("not empty"));
+        // One layer, from one.
+        assert!(dispatch(&sh, 48_000, "3cp0l2").contains("layer 2 of loop 0"));
+        assert_eq!(sh.lp(3).n_layers.load(Ordering::Acquire), 1);
+        assert_eq!(sh.read(3, 0, 50, 0), 0.5);
+        assert!(dispatch(&sh, 48_000, "4cp0l3").contains("not 3"));
+        // Nothing from nothing, and not onto itself.
+        assert!(dispatch(&sh, 48_000, "4cp5").contains("nothing to copy"));
+        assert!(dispatch(&sh, 48_000, "0cp0").contains("itself"));
+        // `c` is still clear: the two-character arm did not eat it.
+        assert!(!dispatch(&sh, 48_000, "3c").contains("wants a source"));
     }
 
     /// **Off is a switch, not a gain.** The layer stays whole and comes

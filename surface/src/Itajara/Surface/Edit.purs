@@ -46,6 +46,8 @@ type Handlers i r =
   , clearWindow :: Int -> i
   , shiftStart :: Int -> Int -> i
   , askPeaks :: Int -> i
+  -- | Both ends at once (loop, in, out): the fixed window's one slider.
+  , windowTo :: Int -> Int -> Int -> i
   , editDone :: String -> i
   | r
   }
@@ -58,6 +60,10 @@ type View =
   -- | hand's value until release. Without it the snapshot — which lags the
   -- | verb by a restart — snatches the thumb back under the pointer.
   , local :: Map String Int
+  -- | A window of one fixed length, in frames, when the destination holds
+  -- | exactly that much — an Arbhar layer's thirteen seconds. The panel is
+  -- | then one slider: where the window sits. `Nothing` is the free panel.
+  , fixedFrames :: Maybe Int
   }
 
 editPanel :: forall w i r. Handlers i r -> View -> Maybe LooperState -> HH.HTML w i
@@ -67,7 +73,9 @@ editPanel h v = case _ of
     Nothing -> HH.text ""
     Just lp
       | lp.loopFrames <= 0 -> HH.div_ [ HH.text "This loop has no length yet; record something first." ]
-      | otherwise -> editBody h v top lp
+      | otherwise -> case v.fixedFrames of
+          Just n -> fixedBody h v top lp n
+          Nothing -> editBody h v top lp
 
 editBody :: forall w i r. Handlers i r -> View -> LooperState -> LoopState -> HH.HTML w i
 editBody h v top lp =
@@ -130,39 +138,100 @@ editBody h v top lp =
       , HH.span [ HP.class_ (HH.ClassName "looper-edit-word") ] [ HH.text word ]
       ]
 
-  -- The picture: the whole loop, always, with the window shaded, the
-  -- start marked, and the playhead where the daemon says it is. Drawn from
-  -- the last `peaks` answer; a stale one for another loop is not drawn.
-  waveform = case v.peaks of
-    Just pk | pk.loop == li && pk.buckets > 0 ->
-      let
-        w = Int.toNumber pk.buckets
-        -- The picture spans `picFrom..picTo`, the same range the sliders
-        -- run, so a thumb and a line agree. The peaks were drawn over
-        -- their own range and are placed onto this one bucket by bucket.
-        x f = Int.toNumber (f - picFrom) / Int.toNumber (max 1 (picTo - picFrom)) * w
-        y val = 100.0 - Int.toNumber val / 10.0
-        pt i val = show (x (pk.from + i * (pk.to - pk.from) / max 1 pk.buckets)) <> "," <> show (y val)
-        top' = joinWith " " (Array.mapWithIndex pt pk.hi)
-        bot = joinWith " " (Array.reverse (Array.mapWithIndex pt pk.lo))
-      in
-        svgEl "svg"
-          [ sAttr "viewBox" ("0 0 " <> show pk.buckets <> " 200")
-          , sAttr "preserveAspectRatio" "none"
-          , sAttr "class" "looper-wave"
-          ]
-          -- Drawn in this order so the feedback is unmissable: the loop's
-          -- extent in white, the audio, then everything *outside* the
-          -- window dimmed hard on top of it, the two ends as lines, the
-          -- start in red, and the playhead — which only ever moves inside
-          -- the window, which is the other half of the feedback.
-          [ svgEl "rect" [ sAttr "x" (show (x 0)), sAttr "y" "0", sAttr "width" (show (x len - x 0)), sAttr "height" "200", sAttr "class" "looper-wave-loop" ] []
-          , svgEl "polygon" [ sAttr "points" (top' <> " " <> bot), sAttr "class" "looper-wave-body" ] []
-          , svgEl "rect" [ sAttr "x" "0", sAttr "y" "0", sAttr "width" (show (x winI)), sAttr "height" "200", sAttr "class" "looper-wave-outside" ] []
-          , svgEl "rect" [ sAttr "x" (show (x winO)), sAttr "y" "0", sAttr "width" (show (w - x winO)), sAttr "height" "200", sAttr "class" "looper-wave-outside" ] []
-          , svgEl "line" [ sAttr "x1" (show (x winI)), sAttr "x2" (show (x winI)), sAttr "y1" "0", sAttr "y2" "200", sAttr "class" "looper-wave-edge" ] []
-          , svgEl "line" [ sAttr "x1" (show (x winO)), sAttr "x2" (show (x winO)), sAttr "y1" "0", sAttr "y2" "200", sAttr "class" "looper-wave-edge" ] []
-          , svgEl "line" [ sAttr "x1" (show (x (winI + lp.rot))), sAttr "x2" (show (x (winI + lp.rot))), sAttr "y1" "0", sAttr "y2" "200", sAttr "class" "looper-wave-start" ] []
-          , svgEl "line" [ sAttr "x1" (show (x lp.pos)), sAttr "x2" (show (x lp.pos)), sAttr "y1" "0", sAttr "y2" "200", sAttr "class" "looper-wave-head" ] []
-          ]
-    _ -> HH.div [ HP.class_ (HH.ClassName "looper-wave-missing") ] [ HH.text "Waveform on its way…" ]
+  waveform = picture v lp { len, winI, winO, picFrom, picTo, showStart: true }
+
+-- | The picture: the whole loop, always, with the window shaded, the
+-- | start marked, and the playhead where the daemon says it is. Drawn from
+-- | the last `peaks` answer; a stale one for another loop is not drawn.
+picture :: forall w i. View -> LoopState -> { len :: Int, winI :: Int, winO :: Int, picFrom :: Int, picTo :: Int, showStart :: Boolean } -> HH.HTML w i
+picture v lp g = case v.peaks of
+  Just pk | pk.loop == v.focus && pk.buckets > 0 ->
+    let
+      w = Int.toNumber pk.buckets
+      -- The picture spans `picFrom..picTo`, the same range the sliders
+      -- run, so a thumb and a line agree. The peaks were drawn over
+      -- their own range and are placed onto this one bucket by bucket.
+      x f = Int.toNumber (f - g.picFrom) / Int.toNumber (max 1 (g.picTo - g.picFrom)) * w
+      y val = 100.0 - Int.toNumber val / 10.0
+      pt i val = show (x (pk.from + i * (pk.to - pk.from) / max 1 pk.buckets)) <> "," <> show (y val)
+      top' = joinWith " " (Array.mapWithIndex pt pk.hi)
+      bot = joinWith " " (Array.reverse (Array.mapWithIndex pt pk.lo))
+    in
+      svgEl "svg"
+        [ sAttr "viewBox" ("0 0 " <> show pk.buckets <> " 200")
+        , sAttr "preserveAspectRatio" "none"
+        , sAttr "class" "looper-wave"
+        ]
+        -- Drawn in this order so the feedback is unmissable: the loop's
+        -- extent in white, the audio, then everything *outside* the
+        -- window dimmed hard on top of it, the two ends as lines, the
+        -- start in red, and the playhead — which only ever moves inside
+        -- the window, which is the other half of the feedback.
+        [ svgEl "rect" [ sAttr "x" (show (x 0)), sAttr "y" "0", sAttr "width" (show (x g.len - x 0)), sAttr "height" "200", sAttr "class" "looper-wave-loop" ] []
+        , svgEl "polygon" [ sAttr "points" (top' <> " " <> bot), sAttr "class" "looper-wave-body" ] []
+        , svgEl "rect" [ sAttr "x" "0", sAttr "y" "0", sAttr "width" (show (x g.winI)), sAttr "height" "200", sAttr "class" "looper-wave-outside" ] []
+        , svgEl "rect" [ sAttr "x" (show (x g.winO)), sAttr "y" "0", sAttr "width" (show (w - x g.winO)), sAttr "height" "200", sAttr "class" "looper-wave-outside" ] []
+        , svgEl "line" [ sAttr "x1" (show (x g.winI)), sAttr "x2" (show (x g.winI)), sAttr "y1" "0", sAttr "y2" "200", sAttr "class" "looper-wave-edge" ] []
+        , svgEl "line" [ sAttr "x1" (show (x g.winO)), sAttr "x2" (show (x g.winO)), sAttr "y1" "0", sAttr "y2" "200", sAttr "class" "looper-wave-edge" ] []
+        , svgEl "line" [ sAttr "x1" (show (x (g.winI + lp.rot))), sAttr "x2" (show (x (g.winI + lp.rot))), sAttr "y1" "0", sAttr "y2" "200", sAttr "class" "looper-wave-start" ] []
+        , svgEl "line" [ sAttr "x1" (show (x lp.pos)), sAttr "x2" (show (x lp.pos)), sAttr "y1" "0", sAttr "y2" "200", sAttr "class" "looper-wave-head" ] []
+        ]
+  _ -> HH.div [ HP.class_ (HH.ClassName "looper-wave-missing") ] [ HH.text "Waveform on its way…" ]
+
+-- | One slider: where a window of a fixed length sits on the loop. The
+-- | destination holds exactly this much, so the two ends move together and
+-- | rotation has no meaning — position zero of a pass is the window's start.
+-- | A loop shorter than the window plays whole and is not windowed: the
+-- | harvest fills the module's length by letting it come round again, which
+-- | is what a loop does.
+fixedBody :: forall w i r. Handlers i r -> View -> LooperState -> LoopState -> Int -> HH.HTML w i
+fixedBody h v top lp n =
+  HH.div [ HP.class_ (HH.ClassName "looper-edit") ]
+    ( [ picture v lp { len, winI, winO, picFrom: 0, picTo: len, showStart: false } ]
+        <> (if len > n
+              then
+                [ HH.div [ HP.class_ (HH.ClassName "looper-edit-row") ]
+                    [ HH.span [ HP.class_ (HH.ClassName "looper-edit-label") ] [ HH.text "Window" ]
+                    , HH.input
+                        [ HP.type_ HP.InputRange
+                        , HP.class_ (HH.ClassName "looper-edit-slider")
+                        , HP.min 0.0
+                        , HP.max (Int.toNumber (len - n))
+                        , HP.step (HP.Step (Int.toNumber step))
+                        , HP.value (show (fromMaybe winI (Map.lookup "in" v.local)))
+                        , HE.onValueInput \raw -> let s = maybe winI identity (Int.fromString raw) in h.windowTo li s (s + n)
+                        , HE.onValueChange \_ -> h.editDone "in"
+                        ]
+                    , HH.span [ HP.class_ (HH.ClassName "looper-edit-word") ]
+                        [ HH.text (secs winI <> " – " <> secs winO <> " s of " <> secs len) ]
+                    ]
+                ]
+              else
+                [ HH.div [ HP.class_ (HH.ClassName "looper-edit-row") ]
+                    [ HH.span [ HP.class_ (HH.ClassName "looper-edit-label") ] [ HH.text "Whole" ]
+                    , HH.span [ HP.class_ (HH.ClassName "looper-edit-word") ]
+                        [ HH.text (secs len <> " s, shorter than the " <> secs n <> " s the module holds: it plays whole, and the harvest fills the rest by letting it come round again.") ]
+                    ]
+                ])
+        <> [ HH.div [ HP.class_ (HH.ClassName "looper-edit-actions") ]
+              [ HH.button [ HP.class_ (HH.ClassName "looper-help-btn"), HE.onClick \_ -> h.windowTo li (max 0 (winI - step)) (max 0 (winI - step) + n) ] [ HH.text ("⟵ " <> stepWord) ]
+              , HH.button [ HP.class_ (HH.ClassName "looper-help-btn"), HE.onClick \_ -> h.windowTo li (min (len - n) (winI + step)) (min (len - n) (winI + step) + n) ] [ HH.text (stepWord <> " ⟶") ]
+              , HH.button [ HP.class_ (HH.ClassName "looper-help-btn"), HE.onClick \_ -> h.clearWindow li ] [ HH.text "From the top" ]
+              , HH.button [ HP.class_ (HH.ClassName "looper-help-btn"), HE.onClick \_ -> h.askPeaks li ] [ HH.text "Redraw" ]
+              , HH.span [ HP.class_ (HH.ClassName "looper-edit-note") ]
+                  [ HH.text (if windowed then "What sounds is what the harvest writes." else "The first " <> secs (min n len) <> " s.") ]
+              ]
+           ]
+    )
+  where
+  li = v.focus
+  len = lp.loopFrames
+  windowed = lp.winOut > 0
+  winI = if windowed then lp.winIn else 0
+  winO = if windowed then lp.winOut else min len n
+  beat = if top.barFrames > 0 && top.linkQuantum > 0.0
+    then max 1 (Int.round (Int.toNumber top.barFrames / top.linkQuantum))
+    else max 1 (top.sampleRate / 10)
+  step = if lp.quant then beat else max 1 (top.sampleRate / 10)
+  stepWord = if lp.quant then "1 beat" else "0.1 s"
+  secs f = show (Int.toNumber (Int.round (Int.toNumber f / Int.toNumber top.sampleRate * 100.0)) / 100.0)

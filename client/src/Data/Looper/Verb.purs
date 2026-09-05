@@ -199,6 +199,13 @@ data Verb
   -- | matches it ahead of `ex` so the `l` cannot be read as a name.
   | ExportLayers String
 
+  -- | Copy another loop's layers onto this one — all of them, or one, by the
+  -- | number the slot shows (from one, like `LayerOn`). Onto an empty loop
+  -- | only; the daemon refuses otherwise and says so. The source loop is the
+  -- | wire's number (from zero), as every loop on the wire is.
+  | CopyLoop Int
+  | CopyLayer Int Int
+
   -- | Every loop that holds something, from the top, **together**.
   -- |
   -- | This was eight `Sounding true`s, and eight unmutes is not a start: mute
@@ -359,6 +366,8 @@ render = case _ of
   SaveTake name -> "w" <> name
   ExportSet name -> "ex" <> name
   ExportLayers name -> "exl" <> name
+  CopyLoop src -> "cp" <> show src
+  CopyLayer src k -> "cp" <> show src <> "l" <> show k
   StartAll -> "go"
   Playing on -> flag "play" on
 

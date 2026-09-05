@@ -228,6 +228,10 @@ perform rig subject = case _ of
   Duty.ClearWindow -> [ Command (cmd i Verb.ClearWindow) ]
   Duty.ShiftStart k -> [ Command (cmd i (Verb.Shift k)) ]
   Duty.AskPeaks n -> [ Command (cmd i (Verb.AskPeaks n)) ]
+  -- Onto an empty loop only, and said here as well as in the daemon, so a
+  -- surface can grey the drop before the drag ends rather than after.
+  Duty.CopyLoop s -> copyOnto s (Verb.CopyLoop s)
+  Duty.CopyLayer s k -> copyOnto s (Verb.CopyLayer s k)
   Duty.ClearLoop -> [ Command (cmd i Verb.Clear) ]
   -- **Read from the loop, not remembered** — the same shape as the click and
   -- the monitor since `Rig` started carrying the flags, and for the same
@@ -456,6 +460,13 @@ perform rig subject = case _ of
   -- say so themselves.
   Duty.Nothing_ -> [ Unavailable "nothing is on that control" ]
   where
+  copyOnto s verb
+    | s == i = [ Unavailable ("loop " <> show (i + 1) <> " onto itself is nothing") ]
+    | maybe true (\st -> st.layers == 0) (loopAt rig s) =
+        [ Unavailable ("loop " <> show (s + 1) <> " has nothing to copy") ]
+    | maybe false (\st -> st.layers > 0) (loopAt rig i) =
+        [ Unavailable ("loop " <> show (i + 1) <> " is not empty — copies land on empty loops only") ]
+    | otherwise = [ Command (cmd i verb), Focus i ]
   -- **Where the subject becomes an index, and the only place it does.**
   i = case subject of
     Focused -> rig.focus

@@ -225,6 +225,12 @@ data Duty
   | ClearWindow
   | ShiftStart Int
   | AskPeaks Int
+  -- | Copy the layers of another loop — all of them, or one — onto this one.
+  -- | A drag from one slot to another; the machine refuses unless the target
+  -- | is empty, because what a copy onto a loop that holds something would
+  -- | mean is a question to design, not to answer by accident.
+  | CopyLoop Int
+  | CopyLayer Int Int
   | Reverse
   | Pendulum
   -- | One pass per trigger, rather than turning for ever.
@@ -603,6 +609,8 @@ dutyLabel = case _ of
   ClearWindow -> "Whole"
   ShiftStart _ -> "Shift"
   AskPeaks _ -> "Peaks"
+  CopyLoop s -> "Copy L" <> show (s + 1)
+  CopyLayer s k -> "Copy L" <> show (s + 1) <> "/" <> show k
 
 -- | Twenty-four characters, for the device's long name and for reporting a
 -- | press the app did not expect as words rather than as a CC number.
@@ -683,6 +691,8 @@ dutyName = case _ of
   ClearWindow -> "The whole loop again"
   ShiftStart k -> "Start shifted by " <> show k <> " frames"
   AskPeaks n -> "Waveform in " <> show n <> " buckets"
+  CopyLoop s -> "Copy every layer of loop " <> show (s + 1) <> " here"
+  CopyLayer s k -> "Copy layer " <> show k <> " of loop " <> show (s + 1) <> " here"
 
 -- | A level in words. The daemon's own vocabulary — "full" and "silent" rather
 -- | than "0.0 dB" and "-60.0 dB", because those are things a meter says and not
