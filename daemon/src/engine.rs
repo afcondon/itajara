@@ -1147,6 +1147,29 @@ impl Loop {
         self.place(start, span, c)
     }
 
+    /// Where an input frame at cycle position `raw` lands in the arena: the
+    /// same slot the play head is reading at that moment — through the window
+    /// and the rotation, exactly as `place` puts it — or nowhere, when the
+    /// window reaches into the silence past an end, which has no slot.
+    ///
+    /// **This is what lets a windowed loop take an overdub.** The write head
+    /// used to follow the *cycle* (`rel % len`), which is the play head only
+    /// when there is no window and no rotation; with either set, what you
+    /// played would land somewhere you never heard it. Recording into a
+    /// windowed loop was refused for exactly that reason, and a rotated one
+    /// quietly got it wrong. Now both heads read the same map.
+    pub fn write_pos(&self, raw: i64, len: usize) -> Option<usize> {
+        if len == 0 {
+            return None;
+        }
+        let (start, span) = self.cycle(len);
+        let span_i = span.max(1) as i64;
+        let r = (self.rot.load(Ordering::Relaxed) as i64) % span_i;
+        let q = (raw.rem_euclid(span_i) + r) % span_i;
+        let a = start + q;
+        if a >= 0 && (a as usize) < len { Some(a as usize) } else { None }
+    }
+
     /// Adopt a new speed and pendulum without moving the audio.
     ///
     /// Called only from the output callback, at a frame it knows exactly. The
@@ -3278,7 +3301,10 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                                     - (slot as f64).max(lo))
                                     .max(0.0) as f32;
                                 if cover > 0.0 {
-                                    let p = slot.rem_euclid(loop_len as i64) as usize;
+                                    let Some(p) = lp.write_pos(slot, loop_len) else {
+                                        slot += 1;
+                                        continue;
+                                    };
                                     for ch in 0..CHANNELS {
                                         let v = data[f * in_channels + rec_src.ch[ch]];
                                         sh.add(li, layer, p, ch, v * cover);
@@ -3302,7 +3328,11 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
                             lp.rec_reached.fetch_max(out_frame + 1, Ordering::Relaxed);
                             continue;
                         }
-                        let pos = (rel % loop_len as i64) as usize;
+                        // Through the window and the rotation: the slot the
+                        // play head is on, or none, past an end.
+                        let Some(pos) = lp.write_pos(rel, loop_len) else {
+                            continue;
+                        };
                         // **Revox writes over the tape; everything else writes
                         // beside it.** In Revox mode there is one layer by
                         // construction and the overdub goes into *that*, not
@@ -4849,9 +4879,15 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
         // `t` is the claim-the-past verb, matched below by its first letter;
         // spelled the same way here so `tone` is not mistaken for it.
         let claims_past = rest.as_bytes().first() == Some(&b't') && rest.strip_prefix("tone").is_none();
-        if lp.window().is_some() && (rest == "r" || rest == "x" || claims_past) {
+        // An overdub may go into a windowed loop — the write head follows the
+        // play head through the window (`write_pos`), so what you play lands
+        // where you heard it and outside the window nothing is touched.
+        // Multiply changes the length the window is set against, and the
+        // claim writes from the ring against the cycle, so those two still
+        // want the whole loop.
+        if lp.window().is_some() && (rest == "x" || claims_past) {
             return format!(
-                "loop {} has a window; clear it with `win` before recording into it.",
+                "loop {} has a window; clear it with `win` before multiplying or claiming the past.",
                 li
             );
         }
@@ -7162,7 +7198,7 @@ mod tests {
         assert_eq!(out.len(), 40 * CHANNELS, "the render is the window");
         assert_eq!(out[0], 30.0, "start of the window, plus the rotation");
         assert_eq!(out[(40 - 1) * CHANNELS], 29.0, "and it wraps inside the window");
-        assert!(dispatch(&sh, 48_000, "0r").contains("window"), "no recording into a window");
+        assert!(dispatch(&sh, 48_000, "0x").contains("window"), "no multiplying a window; an overdub is allowed now");
         assert!(dispatch(&sh, 48_000, "0out201").contains("may reach"), "one loop of silence is the most");
         assert!(dispatch(&sh, 48_000, "0win").contains("whole loop"));
         settle(&sh, 0);
@@ -7225,6 +7261,41 @@ mod tests {
         // And `ex` still means the set: this must not have been eaten by `exl`.
         assert!(dispatch(&sh, 48_000, "exriff2").contains("exported 2 loops"));
         let _ = std::fs::remove_dir_all(&sh.takes_dir);
+    }
+
+    /// **The write head is the play head.** Through a window, a rotation,
+    /// both, and a window that reaches into silence: for every frame, where
+    /// an overdub would write is where the ear was — or nowhere.
+    #[test]
+    fn the_write_head_lands_where_the_play_head_is() {
+        let sh = rig(LEN);
+        one_layer_loop(&sh, 0, 100, 0.0);
+        let lp = sh.lp(0);
+        let check = |what: &str| {
+            for out_frame in 0..400i64 {
+                let heard = lp.play_pos(out_frame, 100);
+                let wrote = lp.write_pos(out_frame - lp.origin.load(Ordering::Relaxed), 100);
+                if heard >= 0.0 && heard < 100.0 {
+                    assert_eq!(wrote, Some(heard.floor() as usize), "{}: frame {}", what, out_frame);
+                } else {
+                    assert_eq!(wrote, None, "{}: frame {} heard silence at {}", what, out_frame, heard);
+                }
+            }
+        };
+        check("whole loop");
+        assert!(dispatch(&sh, 48_000, "0rot30").contains("starts"));
+        settle(&sh, 0);
+        check("rotated");
+        assert!(dispatch(&sh, 48_000, "0in20").contains("windows"));
+        assert!(dispatch(&sh, 48_000, "0out60").contains("windows"));
+        settle(&sh, 0);
+        check("windowed and rotated");
+        assert!(dispatch(&sh, 48_000, "0in-20").contains("with silence"));
+        settle(&sh, 0);
+        check("window into silence before the loop");
+        // And the refusal now names what it still refuses.
+        assert!(dispatch(&sh, 48_000, "0x").contains("multiplying"));
+        assert!(!dispatch(&sh, 48_000, "0r").contains("window"), "an overdub goes in");
     }
 
     /// **A copy lands whole, in phase, and only on an empty loop.**
