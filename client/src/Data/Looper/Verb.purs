@@ -314,6 +314,11 @@ data Verb
   -- | the loop has anything in it — resizing a loop with material in it would be
   -- | a trim, which this engine does not have.
   | Blank Number
+  -- | Fix the next take at this many seconds: the loop gets a length and no
+  -- | layers, so the first recording closes itself there. Empty loops only.
+  -- | Not a tape — `Blank` carries a silent layer so it can play, which makes
+  -- | the next take an overdub, and an overdub never closes itself.
+  | Fix Number
   -- | What a Revox pass leaves of what was under it, in decibels; 0 to -60.
   | Feedback Number
   -- | How much top a Revox pass keeps, in hertz; 200 to 20000, and 20000 is
@@ -400,6 +405,7 @@ render = case _ of
   Decay n -> "dec" <> show n
   ArmLevel n -> "arm" <> show n
   Blank n -> "blank" <> show n
+  Fix n -> "fix" <> show n
   Feedback n -> "fb" <> show n
   Tone n -> "tone" <> show n
   Level n -> "vol" <> show n

@@ -4444,6 +4444,45 @@ fn place_at(sh: &Shared, li: usize, n: usize) -> String {
     }
 }
 
+/// **Size an empty loop in seconds**, so its first take closes itself.
+///
+/// The same state `set_bars` leaves an empty loop in — a length, zero layers,
+/// `origin` at now — without the grid: no rounding to bars, no claim on the
+/// anchor. The loop it makes is the one `r` already knows how to record into
+/// (`want > 0` in the arm branch arms `close_at`), so nothing downstream is
+/// new. Refused on a loop with anything in it, threaded tapes included:
+/// resizing material is `len`'s job and a trim is a thing this engine does
+/// not have.
+fn fix_next(sh: &Shared, li: usize, sr: u32, secs: f64) -> String {
+    let lp = sh.lp(li);
+    if lp.is_recording() || lp.is_armed() {
+        return format!("loop {} is recording; finish that first.", li);
+    }
+    if lp.n_layers.load(Ordering::Acquire) > 0 {
+        return format!(
+            "loop {} has something in it; clear it before fixing its next take.",
+            li
+        );
+    }
+    let want = (secs * sr as f64).round() as usize;
+    if want > sh.max_frames {
+        return format!(
+            "{:.1} s is past --max-secs; the longest take here is {:.1} s.",
+            secs,
+            sh.max_frames as f64 / sr as f64
+        );
+    }
+    let now = sh.out_frames.load(Ordering::Acquire) as i64;
+    lp.origin.store(now, Ordering::Release);
+    lp.loop_len.store(want, Ordering::Release);
+    lp.threaded.store(false, Ordering::Relaxed);
+    format!(
+        "loop {} is set to {:.3} s; record and it closes itself.",
+        li,
+        want as f64 / sr as f64
+    )
+}
+
 /// **How many bars this loop is.** One verb, and which of its three jobs it is
 /// doing depends on what the loop already is — said out loud in the ack every
 /// time, because the difference is the whole of it.
@@ -5607,6 +5646,22 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     Ok(n) => format!("launch quantise wants -1 to 64 beats, not {}.", n),
                     Err(_) => format!("`{}` wants a number of beats.", rest),
                 };
+            }
+            // **The next take is this many seconds.** `fix13` on an empty loop
+            // gives it a length and no audio, so the first recording closes
+            // itself there instead of waiting for a second press — the
+            // `set_bars` state, reached in seconds rather than bars, for a
+            // face whose module wants a fixed length (Arbhar's thirteen) and a
+            // page that has promised to own no clock. Not a threaded tape:
+            // that carries a silent layer so it can *play*, which would make
+            // the next take an overdub, and an overdub never closes itself.
+            _ if rest.starts_with("fix") => {
+                let arg = rest[3..].trim();
+                let secs = match arg.parse::<f64>() {
+                    Ok(v) if v > 0.0 => v,
+                    _ => return format!("`{}` wants a length in seconds, as in `fix13`.", rest),
+                };
+                return fix_next(sh, li, sr, secs);
             }
             _ if rest.starts_with("len") => {
                 return match rest[3..].trim().parse::<usize>() {
@@ -7478,6 +7533,32 @@ mod tests {
     }
 
     /// **A copy lands whole, in phase, and only on an empty loop.**
+    /// **A fixed next take.** `fix` leaves a length and no layers, which is
+    /// the state the arm branch already turns into a self-closing first take;
+    /// it refuses a loop with material, a length past the arena, and nonsense.
+    #[test]
+    fn fixing_the_next_take_sizes_an_empty_loop_and_nothing_else() {
+        let sh = rig(LEN);
+        // A 1 kHz "sample rate", so half a second fits the test arena.
+        let ack = dispatch(&sh, 1000, "1fix0.5");
+        assert!(ack.contains("closes itself"), "{}", ack);
+        let lp = sh.lp(1);
+        assert_eq!(lp.loop_len.load(Ordering::Acquire), 500);
+        assert_eq!(lp.n_layers.load(Ordering::Acquire), 0, "sized, not threaded");
+        assert!(!lp.threaded.load(Ordering::Relaxed));
+        // Not onto material.
+        one_layer_loop(&sh, 0, 100, 0.25);
+        assert!(dispatch(&sh, 1000, "0fix0.5").contains("something in it"));
+        assert_eq!(sh.lp(0).loop_len.load(Ordering::Acquire), 100, "untouched");
+        // Not past the arena, and not nonsense.
+        assert!(dispatch(&sh, 1000, "2fix2").contains("past --max-secs"));
+        assert!(dispatch(&sh, 1000, "2fix").contains("wants a length"));
+        assert!(dispatch(&sh, 1000, "2fix0").contains("wants a length"));
+        assert_eq!(sh.lp(2).loop_len.load(Ordering::Acquire), 0);
+        // `f` itself is an exact match and still its own verb.
+        assert!(!dispatch(&sh, 1000, "2f").contains("wants a length"));
+    }
+
     #[test]
     fn copying_lands_whole_and_in_phase_on_an_empty_loop_only() {
         let sh = rig(LEN);

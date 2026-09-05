@@ -451,6 +451,11 @@ data Duty
   | Revox Boolean
   -- | Thread an empty tape of this many seconds.
   | Blank Number
+  -- | Record a take of exactly this many seconds into an empty loop: the loop
+  -- | is sized first, then `r`, and the daemon closes it there. The face's
+  -- | button for a module that wants one length (Arbhar's thirteen), so the
+  -- | page never holds a clock. On a loop with material it is `RecordLoop`.
+  | RecordFixed Number
   -- | What a Revox pass leaves of what was under it, in decibels.
   | Feedback Number
   -- | How much top a Revox pass keeps, in hertz.
@@ -601,6 +606,7 @@ dutyLabel = case _ of
   RevoxToggle -> "Revox"
   Revox _ -> "Revox"
   Blank _ -> "Tape"
+  RecordFixed secs -> "Rec " <> show (Int.round secs) <> " s"
   Feedback _ -> "Feedback"
   Tone _ -> "Tone"
   Layers _ -> "Layers"
@@ -686,6 +692,7 @@ dutyName = case _ of
   RevoxToggle -> "Tape mode, or layers"
   Revox on -> if on then "A tape: undo is gone" else "Record in layers again"
   Blank secs -> "Thread " <> show (Int.round secs) <> " s of tape"
+  RecordFixed secs -> "Record exactly " <> show (Int.round secs) <> " s"
   Feedback db -> "A pass leaves " <> levelWord db
   Tone hz -> if hz >= 20000.0 then "Every pass as bright"
              else "Keeps " <> show (Int.round (hz / 100.0) * 100) <> " Hz"
