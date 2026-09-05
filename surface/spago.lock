@@ -13,7 +13,8 @@
             "numbers",
             "ordered-collections",
             "prelude",
-            "strings"
+            "strings",
+            "web-uievents"
           ]
         },
         "test": {

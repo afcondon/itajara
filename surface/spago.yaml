@@ -17,6 +17,7 @@ package:
     - ordered-collections
     - prelude
     - strings
+    - web-uievents
   build:
     strict: true
 

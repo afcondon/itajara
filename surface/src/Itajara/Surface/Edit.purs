@@ -18,6 +18,8 @@
 module Itajara.Surface.Edit
   ( Handlers
   , View
+  , Drag
+  , WaveDrag
   , editPanel
   ) where
 
@@ -34,6 +36,7 @@ import Halogen.HTML as HH
 import Halogen.HTML.Events as HE
 import Halogen.HTML.Properties as HP
 import Itajara.Surface.Wave (sAttr, svgEl)
+import Web.UIEvent.MouseEvent (MouseEvent)
 
 -- | The panel's five, plus the release. Window in and out take (loop,
 -- | frames); the whole loop again takes the loop; a shift of the start takes
@@ -53,7 +56,32 @@ type Handlers i r =
   , layerWindowTo :: Int -> Int -> Int -> Int -> i
   , clearLayerWindow :: Int -> Int -> i
   , editDone :: String -> i
+  -- | Dragging the window along the picture, when the app offers it.
+  -- | `Nothing` leaves the sliders as the only hands.
+  , waveDrag :: Maybe (WaveDrag i)
   | r
+  }
+
+-- | The three moments of a drag. `down` carries what the app needs to turn
+-- | pixels into frames: the picture's span and the window's start, bounds and
+-- | step; the app reads the picture's width from the event, which is the one
+-- | thing a pure render cannot know. `move` and `up` carry the pointer.
+type WaveDrag i =
+  { down :: Drag -> MouseEvent -> i
+  , move :: MouseEvent -> i
+  , up :: i
+  }
+
+-- | What a drag is about: which loop and layer, where the window started,
+-- | how many frames the picture spans, and where the start may go.
+type Drag =
+  { loop :: Int
+  , layer :: Maybe Int
+  , win0 :: Int
+  , span :: Int
+  , lo :: Int
+  , hi :: Int
+  , step :: Int
   }
 
 -- | What the app holds for the panel.
@@ -146,13 +174,13 @@ editBody h v top lp =
       , HH.span [ HP.class_ (HH.ClassName "looper-edit-word") ] [ HH.text word ]
       ]
 
-  waveform = picture v lp { len, winI, winO, picFrom, picTo, showStart: true, head: lp.pos }
+  waveform = picture h v lp { len, winI, winO, picFrom, picTo, showStart: true, head: lp.pos, drag: Nothing }
 
 -- | The picture: the whole loop, always, with the window shaded, the
 -- | start marked, and the playhead where the daemon says it is. Drawn from
 -- | the last `peaks` answer; a stale one for another loop is not drawn.
-picture :: forall w i. View -> LoopState -> { len :: Int, winI :: Int, winO :: Int, picFrom :: Int, picTo :: Int, showStart :: Boolean, head :: Int } -> HH.HTML w i
-picture v lp g = case v.peaks of
+picture :: forall w i r. Handlers i r -> View -> LoopState -> { len :: Int, winI :: Int, winO :: Int, picFrom :: Int, picTo :: Int, showStart :: Boolean, head :: Int, drag :: Maybe Drag } -> HH.HTML w i
+picture h v lp g = case v.peaks of
   Just pk | pk.loop == v.focus && pk.buckets > 0 ->
     let
       w = Int.toNumber pk.buckets
@@ -166,10 +194,22 @@ picture v lp g = case v.peaks of
       bot = joinWith " " (Array.reverse (Array.mapWithIndex pt pk.lo))
     in
       svgEl "svg"
-        [ sAttr "viewBox" ("0 0 " <> show pk.buckets <> " 200")
-        , sAttr "preserveAspectRatio" "none"
-        , sAttr "class" "looper-wave"
-        ]
+        ( [ sAttr "viewBox" ("0 0 " <> show pk.buckets <> " 200")
+          , sAttr "preserveAspectRatio" "none"
+          , sAttr "class" (if hasDrag then "looper-wave is-draggable" else "looper-wave")
+          ]
+          -- The window follows the hand along the picture. The drag ends
+          -- on release or when the pointer leaves the picture, so a hand
+          -- that wanders off does not leave the window stuck to it.
+          <> case h.waveDrag, g.drag of
+               Just d, Just dr ->
+                 [ HE.onMouseDown (d.down dr)
+                 , HE.onMouseMove d.move
+                 , HE.onMouseUp (const d.up)
+                 , HE.onMouseLeave (const d.up)
+                 ]
+               _, _ -> []
+        )
         -- Drawn in this order so the feedback is unmissable: the loop's
         -- extent in white, the audio, then everything *outside* the
         -- window dimmed hard on top of it, the two ends as lines, the
@@ -185,54 +225,52 @@ picture v lp g = case v.peaks of
         , svgEl "line" [ sAttr "x1" (show (x g.head)), sAttr "x2" (show (x g.head)), sAttr "y1" "0", sAttr "y2" "200", sAttr "class" "looper-wave-head" ] []
         ]
   _ -> HH.div [ HP.class_ (HH.ClassName "looper-wave-missing") ] [ HH.text "Waveform on its way…" ]
+  where
+  hasDrag = case h.waveDrag, g.drag of
+    Just _, Just _ -> true
+    _, _ -> false
 
 -- | One slider: where a window of a fixed length sits on the loop. The
 -- | destination holds exactly this much, so the two ends move together and
 -- | rotation has no meaning — position zero of a pass is the window's start.
--- | A loop shorter than the window plays whole and is not windowed: the
--- | harvest fills the module's length by letting it come round again, which
+-- | The window may hang past either end of the layer, and the daemon fills
+-- | the overhang with silence — which is how a bum note at the front of a
+-- | thirteen-second layer is lost: slide the window half a second in, and
+-- | half a second of silence takes its place at the tail. The picture spans
+-- | a window's length either side of the layer, so the overhang has room to
+-- | be seen; drag the window along it, or use the slider beneath.
+-- | A loop shorter than the window, left alone, plays whole and is not
+-- | windowed: the harvest fills the module's length by letting it come round again, which
 -- | is what a loop does.
 fixedBody :: forall w i r. Handlers i r -> View -> LooperState -> LoopState -> Int -> HH.HTML w i
 fixedBody h v top lp n =
   HH.div [ HP.class_ (HH.ClassName "looper-edit") ]
-    ( [ picture v lp { len, winI, winO, picFrom: 0, picTo: len, showStart: false, head } ]
-        <> (if len > n
-              then
-                [ HH.div [ HP.class_ (HH.ClassName "looper-edit-row") ]
-                    [ HH.span [ HP.class_ (HH.ClassName "looper-edit-label") ] [ HH.text "Window" ]
-                    , HH.input
-                        [ HP.type_ HP.InputRange
-                        , HP.class_ (HH.ClassName "looper-edit-slider")
-                        , HP.min 0.0
-                        , HP.max (Int.toNumber (len - n))
-                        , HP.step (HP.Step (Int.toNumber step))
-                        , HP.value (show (fromMaybe winI (Map.lookup "in" v.local)))
-                        , HE.onValueInput \raw -> let s = maybe winI identity (Int.fromString raw) in setWin s
-                        , HE.onValueChange \_ -> h.editDone "in"
-                        ]
-                    , HH.span [ HP.class_ (HH.ClassName "looper-edit-word") ]
-                        [ HH.text (secs winI <> " – " <> secs winO <> " s of " <> secs len) ]
-                    ]
-                ]
-              else
-                [ HH.div [ HP.class_ (HH.ClassName "looper-edit-row") ]
-                    [ HH.span [ HP.class_ (HH.ClassName "looper-edit-label") ] [ HH.text "Whole" ]
-                    , HH.span [ HP.class_ (HH.ClassName "looper-edit-word") ]
-                        [ HH.text
-                            (if len == n
-                              then secs len <> " s, exactly what the module holds: it plays whole and the harvest writes it as it is."
-                              else secs len <> " s, shorter than the " <> secs n <> " s the module holds: it plays whole, and the harvest fills the rest by letting it come round again.") ]
-                    ]
-                ])
-        <> [ HH.div [ HP.class_ (HH.ClassName "looper-edit-actions") ]
-              [ HH.button [ HP.class_ (HH.ClassName "looper-help-btn"), HE.onClick \_ -> setWin (max 0 (winI - step)) ] [ HH.text ("⟵ " <> stepWord) ]
-              , HH.button [ HP.class_ (HH.ClassName "looper-help-btn"), HE.onClick \_ -> setWin (min (len - n) (winI + step)) ] [ HH.text (stepWord <> " ⟶") ]
-              , HH.button [ HP.class_ (HH.ClassName "looper-help-btn"), HE.onClick \_ -> clear ] [ HH.text "From the top" ]
-              , HH.button [ HP.class_ (HH.ClassName "looper-help-btn"), HE.onClick \_ -> h.askPeaks li ] [ HH.text "Redraw" ]
-              , HH.span [ HP.class_ (HH.ClassName "looper-edit-note") ]
-                  [ HH.text (if windowed then "What sounds is what the harvest writes." else "The first " <> secs (min n len) <> " s.") ]
+    ( [ picture h v lp
+          { len, winI, winO, picFrom: -n, picTo: len + n, showStart: false, head
+          , drag: Just { loop: li, layer: v.layer, win0: winI, span: len + 2 * n, lo, hi, step }
+          }
+      , HH.div [ HP.class_ (HH.ClassName "looper-edit-row") ]
+          [ HH.span [ HP.class_ (HH.ClassName "looper-edit-label") ] [ HH.text "Window" ]
+          , HH.input
+              [ HP.type_ HP.InputRange
+              , HP.class_ (HH.ClassName "looper-edit-slider")
+              , HP.min (Int.toNumber lo)
+              , HP.max (Int.toNumber hi)
+              , HP.step (HP.Step (Int.toNumber step))
+              , HP.value (show (fromMaybe winI (Map.lookup "in" v.local)))
+              , HE.onValueInput \raw -> let s = maybe winI identity (Int.fromString raw) in setWin s
+              , HE.onValueChange \_ -> h.editDone "in"
               ]
-           ]
+          , HH.span [ HP.class_ (HH.ClassName "looper-edit-word") ] [ HH.text windowWord ]
+          ]
+      , HH.div [ HP.class_ (HH.ClassName "looper-edit-actions") ]
+          [ HH.button [ HP.class_ (HH.ClassName "looper-help-btn"), HE.onClick \_ -> setWin (max lo (winI - step)) ] [ HH.text ("⟵ " <> stepWord) ]
+          , HH.button [ HP.class_ (HH.ClassName "looper-help-btn"), HE.onClick \_ -> setWin (min hi (winI + step)) ] [ HH.text (stepWord <> " ⟶") ]
+          , HH.button [ HP.class_ (HH.ClassName "looper-help-btn"), HE.onClick \_ -> clear ] [ HH.text "From the top" ]
+          , HH.button [ HP.class_ (HH.ClassName "looper-help-btn"), HE.onClick \_ -> h.askPeaks li ] [ HH.text "Redraw" ]
+          , HH.span [ HP.class_ (HH.ClassName "looper-edit-note") ] [ HH.text note ]
+          ]
+      ]
     )
   where
   li = v.focus
@@ -248,9 +286,23 @@ fixedBody h v top lp n =
     Nothing -> false
   winI = maybe 0 _.i win
   winO = maybe (min len n) _.o win
+  -- Where the window's start may go: at least one step of the layer stays
+  -- inside it at either extreme.
+  lo = -(n - step)
+  hi = max lo (len - step)
   setWin s = case v.layer of
     Just k -> h.layerWindowTo li k s (s + n)
     Nothing -> h.windowTo li s (s + n)
+  -- The window in words, with the silence named when it hangs past an end.
+  windowWord =
+    secs winI <> " – " <> secs winO <> " s of " <> secs len
+      <> (if winI < 0 then ", " <> secs (-winI) <> " s of silence first" else "")
+      <> (if winO > len then ", " <> secs (winO - len) <> " s of silence after" else "")
+  note
+    | windowed = "What sounds is what the harvest writes. Drag the window, or slide it."
+    | len < n = "The whole " <> secs len <> " s; the harvest lets it come round to fill " <> secs n <> " s."
+    | len == n = "The whole " <> secs len <> " s, exactly what the module holds."
+    | otherwise = "The first " <> secs n <> " s."
   clear = case v.layer of
     Just k -> h.clearLayerWindow li k
     Nothing -> h.clearWindow li

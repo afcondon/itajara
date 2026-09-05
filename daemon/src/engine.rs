@@ -5626,7 +5626,11 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     (Some(a), Some(b)) => {
                         let len = lp.l_len[l].load(Ordering::Acquire) as i64;
                         match (a.trim().parse::<i64>(), b.trim().parse::<i64>()) {
-                            (Ok(i), Ok(o)) if o > i && i >= -len && o <= 2 * len => {
+                            // Anywhere, so long as it overlaps the layer: the
+                            // read is a range check, so silence either side
+                            // costs nothing, and a thirteen-second window on a
+                            // five-second layer is exactly the Arbhar's case.
+                            (Ok(i), Ok(o)) if o > i && i < len && o > 0 && (o - i) as usize <= sh.max_frames => {
                                 lp.l_win_out[l].store(0, Ordering::Relaxed);
                                 lp.l_win_in[l].store(i, Ordering::Relaxed);
                                 lp.l_win_out[l].store(o, Ordering::Release);
@@ -5636,7 +5640,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                                     if i < 0 || o > len { ", with silence" } else { "" }
                                 );
                             }
-                            (Ok(_), Ok(_)) => return format!("loop {} layer {}: a window is in before out and may reach one layer of silence either side.", li, k),
+                            (Ok(_), Ok(_)) => return format!("loop {} layer {}: a window is in before out, overlaps the layer, and fits the arena.", li, k),
                             _ => return format!("`{}` wants two frame counts, as in `lw2:1000:625000`.", rest),
                         }
                     }
