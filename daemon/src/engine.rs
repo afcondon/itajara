@@ -577,6 +577,15 @@ pub struct Loop {
     /// fresh, because a new take that arrived silent would be the mute bug
     /// with a new name.
     l_on: Vec<AtomicBool>,
+    /// A window of the layer's own, in the layer's frames: `[in, out)`, or
+    /// `0, 0` for none. A layer with one plays that stretch, coming round
+    /// inside the loop's cycle, so six layers of one long take can each be a
+    /// different thirteen seconds of it — which is what a granular module's
+    /// scene is. The loop's window (`win_in`/`win_out`) is the pedalboard's
+    /// and still applies first; this applies inside it. Playback only: the
+    /// picture (`pk`) reads the arena raw so the window can be drawn on it.
+    l_win_in: Vec<AtomicI64>,
+    l_win_out: Vec<AtomicI64>,
     l_period: Vec<AtomicUsize>,
     l_phase: Vec<AtomicUsize>,
     /// The output frame at which this loop's position zero sits.
@@ -964,6 +973,8 @@ impl Loop {
             l_on: (0..max_layers).map(|_| AtomicBool::new(true)).collect(),
             env: Mutex::new((0..max_layers).map(|_| Vec::new()).collect()),
             l_period: (0..max_layers).map(|_| AtomicUsize::new(1)).collect(),
+            l_win_in: (0..max_layers).map(|_| AtomicI64::new(0)).collect(),
+            l_win_out: (0..max_layers).map(|_| AtomicI64::new(0)).collect(),
             l_phase: (0..max_layers).map(|_| AtomicUsize::new(0)).collect(),
             origin: AtomicI64::new(0),
             muted: AtomicBool::new(false),
@@ -1579,6 +1590,25 @@ impl Loop {
             }
         }
         Some(pos % len)
+    }
+
+    /// The layer's own window, or none.
+    pub fn layer_window(&self, layer: usize) -> Option<(i64, i64)> {
+        let i = self.l_win_in[layer].load(Ordering::Relaxed);
+        let o = self.l_win_out[layer].load(Ordering::Relaxed);
+        if o > i { Some((i, o)) } else { None }
+    }
+
+    /// Where a windowed layer is read at cycle position `pos`: its window's
+    /// start plus the position inside the window's span, coming round; or
+    /// nowhere, where the window reaches past the layer's audio. `None` when
+    /// the layer has no window — the caller falls back to `layer_pos`.
+    fn windowed_pos(&self, layer: usize, pos: usize) -> Option<Option<usize>> {
+        let (i, o) = self.layer_window(layer)?;
+        let len = self.l_len[layer].load(Ordering::Relaxed) as i64;
+        let span = (o - i).max(1);
+        let p = i + (pos as i64).rem_euclid(span);
+        Some(if p >= 0 && p < len { Some(p as usize) } else { None })
     }
 }
 
@@ -2264,7 +2294,7 @@ impl Shared {
         // Outside the arena is the silence a window added, not a read.
         let at = |pos: i64| -> [f32; CHANNELS] {
             if pos >= 0 && (pos as usize) < len {
-                self.mix_at(li, n, pos as usize)
+                self.mix_at(li, n, pos as usize, true)
             } else {
                 [0.0; CHANNELS]
             }
@@ -2323,7 +2353,10 @@ impl Shared {
     /// Split out because interpolation needs the same question asked at two
     /// neighbouring positions, and summing the layers first is the same number
     /// as interpolating each layer and summing after — for half the reads.
-    pub fn mix_at(&self, li: usize, n: usize, pos: usize) -> [f32; CHANNELS] {
+    /// `played` applies each layer's own window, as the output does; the
+    /// picture passes `false` and sees the arena as stored, so a window can
+    /// be drawn over it rather than baked into it.
+    pub fn mix_at(&self, li: usize, n: usize, pos: usize, played: bool) -> [f32; CHANNELS] {
         let lp = self.lp(li);
         let mut v = [0.0f32; CHANNELS];
         for l in 0..n {
@@ -2332,8 +2365,21 @@ impl Shared {
             // saves the arena read and the wrap fade's second read with it. The
             // audio is still there; only the reading of it stops.
             if g > 1.0e-4 && lp.layer_on(l) {
-                for ch in 0..CHANNELS {
-                    v[ch] += self.sample_at(li, l, pos, ch) * g;
+                match if played { lp.windowed_pos(l, pos) } else { None } {
+                    // A windowed layer: a plain read at its own place, no
+                    // placement and no wrap fade — the window's seam is a cut
+                    // the player chose.
+                    Some(Some(p)) => {
+                        for ch in 0..CHANNELS {
+                            v[ch] += self.read(li, l, p, ch) * g;
+                        }
+                    }
+                    Some(None) => {}
+                    None => {
+                        for ch in 0..CHANNELS {
+                            v[ch] += self.sample_at(li, l, pos, ch) * g;
+                        }
+                    }
                 }
             }
         }
@@ -4998,7 +5044,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     if pos < 0 || pos >= l {
                         continue;
                     }
-                    let v = sh.mix_at(li, n, pos as usize);
+                    let v = sh.mix_at(li, n, pos as usize, false);
                     for ch in 0..CHANNELS {
                         mn = mn.min(v[ch]);
                         mx = mx.max(v[ch]);
@@ -5451,6 +5497,87 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                         l
                     ),
                     Err(_) => format!("`{}` wants a layer number and then 1 or 0, as in `ly21`.", rest),
+                };
+            }
+            // A layer's own window: `lw<k>:<in>:<out>` sets it, `lw<k>` clears
+            // it. In the layer's frames, like `in`/`out` are in the loop's.
+            _ if rest.starts_with("lw") => {
+                let arg = rest[2..].trim();
+                let mut parts = arg.split(':');
+                let k = parts.next().unwrap_or("").trim().parse::<usize>();
+                let n = lp.n_layers.load(Ordering::Acquire);
+                let Ok(k) = k else {
+                    return format!("`{}` wants a layer number, as in `lw2:1000:625000` or `lw2`.", rest);
+                };
+                if k < 1 || k > n {
+                    return format!("loop {} has {} layer{}, not a layer {}.", li, n, if n == 1 { "" } else { "s" }, k);
+                }
+                let l = k - 1;
+                match (parts.next(), parts.next()) {
+                    (None, _) => {
+                        lp.l_win_in[l].store(0, Ordering::Relaxed);
+                        lp.l_win_out[l].store(0, Ordering::Relaxed);
+                        return format!("loop {} layer {} plays whole again.", li, k);
+                    }
+                    (Some(a), Some(b)) => {
+                        let len = lp.l_len[l].load(Ordering::Acquire) as i64;
+                        match (a.trim().parse::<i64>(), b.trim().parse::<i64>()) {
+                            (Ok(i), Ok(o)) if o > i && i >= -len && o <= 2 * len => {
+                                lp.l_win_out[l].store(0, Ordering::Relaxed);
+                                lp.l_win_in[l].store(i, Ordering::Relaxed);
+                                lp.l_win_out[l].store(o, Ordering::Release);
+                                return format!(
+                                    "loop {} layer {} plays {}..{} of {}{}.",
+                                    li, k, i, o, len,
+                                    if i < 0 || o > len { ", with silence" } else { "" }
+                                );
+                            }
+                            (Ok(_), Ok(_)) => return format!("loop {} layer {}: a window is in before out and may reach one layer of silence either side.", li, k),
+                            _ => return format!("`{}` wants two frame counts, as in `lw2:1000:625000`.", rest),
+                        }
+                    }
+                    _ => return format!("`{}` wants `lw<k>:<in>:<out>`, or `lw<k>` to clear.", rest),
+                }
+            }
+            // Duplicate a layer onto a new layer of this loop: `dp<k>`. The
+            // same audio twice, so the copy can carry a different window —
+            // six slices of one take in one loop. The window comes with it,
+            // to be moved.
+            _ if rest.starts_with("dp") => {
+                let n = lp.n_layers.load(Ordering::Acquire);
+                return match rest[2..].trim().parse::<usize>() {
+                    Ok(k) if k >= 1 && k <= n => {
+                        if n >= sh.max_layers {
+                            return format!("loop {} holds {} layers already; there is no room for another.", li, sh.max_layers);
+                        }
+                        if lp.is_recording() || lp.is_armed() {
+                            return format!("loop {} is recording — finish it first.", li);
+                        }
+                        let src = k - 1;
+                        let len = lp.l_len[src].load(Ordering::Acquire);
+                        sh.zero_layer(li, n);
+                        for p in 0..len {
+                            for ch in 0..CHANNELS {
+                                sh.write(li, n, p, ch, sh.read(li, src, p, ch));
+                            }
+                        }
+                        lp.set_layer_shape(n, Shape {
+                            len,
+                            tail: lp.l_tail[src].load(Ordering::Relaxed),
+                            born: lp.l_born[src].load(Ordering::Relaxed),
+                        });
+                        lp.l_period[n].store(lp.l_period[src].load(Ordering::Relaxed), Ordering::Release);
+                        lp.l_phase[n].store(lp.l_phase[src].load(Ordering::Relaxed), Ordering::Release);
+                        lp.l_win_in[n].store(lp.l_win_in[src].load(Ordering::Relaxed), Ordering::Relaxed);
+                        lp.l_win_out[n].store(lp.l_win_out[src].load(Ordering::Relaxed), Ordering::Relaxed);
+                        lp.l_on[n].store(true, Ordering::Release);
+                        sh.rebuild_env(li, n);
+                        lp.n_layers.store(n + 1, Ordering::Release);
+                        lp.redo_to.store(n + 1, Ordering::Release);
+                        format!("loop {} layer {} duplicated as layer {}.", li, k, n + 1)
+                    }
+                    Ok(k) => format!("loop {} has {} layer{}, not a layer {}.", li, n, if n == 1 { "" } else { "s" }, k),
+                    Err(_) => format!("`{}` wants a layer number, as in `dp2`.", rest),
                 };
             }
             _ if rest.starts_with("lq") => {
@@ -6153,6 +6280,7 @@ struct LayerFile {
     gain: f32,
     born: i64,
     on: bool,
+    window: Option<(i64, i64)>,
 }
 
 /// One loop's layers, raw, into `dir`: the audio and the version-1
@@ -6234,6 +6362,7 @@ fn write_layers(sh: &Shared, li: usize, sr: u32, dir: &std::path::Path) -> Resul
             gain: lp.layer_gain(l),
             born: lp.layer_born(l),
             on: lp.layer_on(l),
+            window: lp.layer_window(l),
         });
     }
     Ok(out)
@@ -6322,6 +6451,10 @@ fn copy_layers(sh: &Shared, dst: usize, src: usize, layer: Option<usize>) -> Str
         });
         to.l_period[j].store(from.l_period[l].load(Ordering::Relaxed), Ordering::Release);
         to.l_phase[j].store(from.l_phase[l].load(Ordering::Relaxed), Ordering::Release);
+        // A layer's own window is the slice the player chose of it, so it
+        // travels with the layer; the loop's window does not.
+        to.l_win_in[j].store(from.l_win_in[l].load(Ordering::Relaxed), Ordering::Relaxed);
+        to.l_win_out[j].store(from.l_win_out[l].load(Ordering::Relaxed), Ordering::Relaxed);
         to.l_on[j].store(true, Ordering::Release);
         sh.rebuild_env(dst, j);
     }
@@ -6431,8 +6564,12 @@ fn export_layers(sh: &Shared, sr: u32, name: &str) -> String {
             .iter()
             .map(|l| {
                 format!(
-                    r#"{{"file":"{}","len":{},"channels":{},"period":{},"phase":{},"gain":{:.5},"born":{},"on":{}}}"#,
-                    l.file, l.len, CHANNELS, l.period, l.phase, l.gain, l.born, l.on
+                    r#"{{"file":"{}","len":{},"channels":{},"period":{},"phase":{},"gain":{:.5},"born":{},"on":{},"window":{}}}"#,
+                    l.file, l.len, CHANNELS, l.period, l.phase, l.gain, l.born, l.on,
+                    match l.window {
+                        Some((i, o)) => format!(r#"{{"in":{},"out":{}}}"#, i, o),
+                        None => "null".to_string(),
+                    }
                 )
             })
             .collect();
@@ -7296,6 +7433,38 @@ mod tests {
         // And the refusal now names what it still refuses.
         assert!(dispatch(&sh, 48_000, "0x").contains("multiplying"));
         assert!(!dispatch(&sh, 48_000, "0r").contains("window"), "an overdub goes in");
+    }
+
+    /// **A layer's own window plays that stretch, and the picture ignores it.**
+    #[test]
+    fn a_layer_window_plays_its_slice_and_the_picture_sees_the_arena() {
+        let sh = rig(LEN);
+        one_layer_loop(&sh, 0, 100, 0.0);
+        for p in 0..100 {
+            for ch in 0..CHANNELS {
+                sh.write(0, 0, p, ch, p as f32);
+            }
+        }
+        assert!(dispatch(&sh, 48_000, "0lw1:20:60").contains("plays 20..60"));
+        assert_eq!(sh.mix_at(0, 1, 5, true)[0], 25.0, "the window's start plus the position");
+        assert_eq!(sh.mix_at(0, 1, 45, true)[0], 25.0, "and it comes round inside the span");
+        assert_eq!(sh.mix_at(0, 1, 5, false)[0], 5.0, "the picture reads the arena as stored");
+        assert!(dispatch(&sh, 48_000, "0lw1:-10:30").contains("with silence"));
+        assert_eq!(sh.mix_at(0, 1, 5, true)[0], 0.0, "silence where the window reaches before the layer");
+        assert!(dispatch(&sh, 48_000, "0lw1").contains("whole again"));
+        assert_eq!(sh.mix_at(0, 1, 5, true)[0], 5.0);
+        // Duplicate: the same audio as a new layer, window and all.
+        assert!(dispatch(&sh, 48_000, "0lw1:20:60").contains("plays"));
+        assert!(dispatch(&sh, 48_000, "0dp1").contains("duplicated as layer 2"));
+        assert_eq!(sh.lp(0).n_layers.load(Ordering::Acquire), 2);
+        assert_eq!(sh.read(0, 1, 50, 0), 50.0);
+        assert_eq!(sh.lp(0).layer_window(1), Some((20, 60)));
+        assert!(dispatch(&sh, 48_000, "0lw2:40:80").contains("plays 40..80"));
+        assert_eq!(sh.lp(0).layer_window(0), Some((20, 60)), "each layer keeps its own");
+        assert!(dispatch(&sh, 48_000, "0dp3").contains("not a layer 3"));
+        // The copy to another loop carries the layers' windows.
+        assert!(dispatch(&sh, 48_000, "1cp0").contains("copied 2 layers"));
+        assert_eq!(sh.lp(1).layer_window(1), Some((40, 80)));
     }
 
     /// **A copy lands whole, in phase, and only on an empty loop.**

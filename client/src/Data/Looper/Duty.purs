@@ -231,6 +231,14 @@ data Duty
   -- | mean is a question to design, not to answer by accident.
   | CopyLoop Int
   | CopyLayer Int Int
+  -- | One layer sounds and the rest are parked — the module's own way, the
+  -- | Layer knob. A lone layer stays on.
+  | SoloLayer Int
+  -- | A layer's own window (layer, in, out), its clearing, and a duplicate of
+  -- | it as a new layer of the same loop.
+  | LayerWindow Int Int Int
+  | ClearLayerWindow Int
+  | DupLayer Int
   | Reverse
   | Pendulum
   -- | One pass per trigger, rather than turning for ever.
@@ -611,6 +619,10 @@ dutyLabel = case _ of
   AskPeaks _ -> "Peaks"
   CopyLoop s -> "Copy L" <> show (s + 1)
   CopyLayer s k -> "Copy L" <> show (s + 1) <> "/" <> show k
+  SoloLayer k -> "Solo " <> show k
+  LayerWindow k _ _ -> "Win " <> show k
+  ClearLayerWindow k -> "Whole " <> show k
+  DupLayer k -> "Dup " <> show k
 
 -- | Twenty-four characters, for the device's long name and for reporting a
 -- | press the app did not expect as words rather than as a CC number.
@@ -693,6 +705,10 @@ dutyName = case _ of
   AskPeaks n -> "Waveform in " <> show n <> " buckets"
   CopyLoop s -> "Copy every layer of loop " <> show (s + 1) <> " here"
   CopyLayer s k -> "Copy layer " <> show k <> " of loop " <> show (s + 1) <> " here"
+  SoloLayer k -> "Layer " <> show k <> " alone"
+  LayerWindow k i o -> "Layer " <> show k <> " plays " <> show i <> " to " <> show o
+  ClearLayerWindow k -> "Layer " <> show k <> " plays whole"
+  DupLayer k -> "Duplicate layer " <> show k
 
 -- | A level in words. The daemon's own vocabulary — "full" and "silent" rather
 -- | than "0.0 dB" and "-60.0 dB", because those are things a meter says and not

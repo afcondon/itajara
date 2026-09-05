@@ -48,6 +48,10 @@ type Handlers i r =
   , askPeaks :: Int -> i
   -- | Both ends at once (loop, in, out): the fixed window's one slider.
   , windowTo :: Int -> Int -> Int -> i
+  -- | A layer's own window (loop, layer from one, in, out), and its clearing
+  -- | (loop, layer): the fixed panel's slider when a layer is in hand.
+  , layerWindowTo :: Int -> Int -> Int -> Int -> i
+  , clearLayerWindow :: Int -> Int -> i
   , editDone :: String -> i
   | r
   }
@@ -64,6 +68,10 @@ type View =
   -- | exactly that much — an Arbhar layer's thirteen seconds. The panel is
   -- | then one slider: where the window sits. `Nothing` is the free panel.
   , fixedFrames :: Maybe Int
+  -- | The layer in hand, from one, when the fixed window is a layer's own —
+  -- | one layer sounding, its window the thing edited. `Nothing` edits the
+  -- | loop's window.
+  , layer :: Maybe Int
   }
 
 editPanel :: forall w i r. Handlers i r -> View -> Maybe LooperState -> HH.HTML w i
@@ -138,12 +146,12 @@ editBody h v top lp =
       , HH.span [ HP.class_ (HH.ClassName "looper-edit-word") ] [ HH.text word ]
       ]
 
-  waveform = picture v lp { len, winI, winO, picFrom, picTo, showStart: true }
+  waveform = picture v lp { len, winI, winO, picFrom, picTo, showStart: true, head: lp.pos }
 
 -- | The picture: the whole loop, always, with the window shaded, the
 -- | start marked, and the playhead where the daemon says it is. Drawn from
 -- | the last `peaks` answer; a stale one for another loop is not drawn.
-picture :: forall w i. View -> LoopState -> { len :: Int, winI :: Int, winO :: Int, picFrom :: Int, picTo :: Int, showStart :: Boolean } -> HH.HTML w i
+picture :: forall w i. View -> LoopState -> { len :: Int, winI :: Int, winO :: Int, picFrom :: Int, picTo :: Int, showStart :: Boolean, head :: Int } -> HH.HTML w i
 picture v lp g = case v.peaks of
   Just pk | pk.loop == v.focus && pk.buckets > 0 ->
     let
@@ -174,7 +182,7 @@ picture v lp g = case v.peaks of
         , svgEl "line" [ sAttr "x1" (show (x g.winI)), sAttr "x2" (show (x g.winI)), sAttr "y1" "0", sAttr "y2" "200", sAttr "class" "looper-wave-edge" ] []
         , svgEl "line" [ sAttr "x1" (show (x g.winO)), sAttr "x2" (show (x g.winO)), sAttr "y1" "0", sAttr "y2" "200", sAttr "class" "looper-wave-edge" ] []
         , svgEl "line" [ sAttr "x1" (show (x (g.winI + lp.rot))), sAttr "x2" (show (x (g.winI + lp.rot))), sAttr "y1" "0", sAttr "y2" "200", sAttr "class" "looper-wave-start" ] []
-        , svgEl "line" [ sAttr "x1" (show (x lp.pos)), sAttr "x2" (show (x lp.pos)), sAttr "y1" "0", sAttr "y2" "200", sAttr "class" "looper-wave-head" ] []
+        , svgEl "line" [ sAttr "x1" (show (x g.head)), sAttr "x2" (show (x g.head)), sAttr "y1" "0", sAttr "y2" "200", sAttr "class" "looper-wave-head" ] []
         ]
   _ -> HH.div [ HP.class_ (HH.ClassName "looper-wave-missing") ] [ HH.text "Waveform on its way…" ]
 
@@ -187,7 +195,7 @@ picture v lp g = case v.peaks of
 fixedBody :: forall w i r. Handlers i r -> View -> LooperState -> LoopState -> Int -> HH.HTML w i
 fixedBody h v top lp n =
   HH.div [ HP.class_ (HH.ClassName "looper-edit") ]
-    ( [ picture v lp { len, winI, winO, picFrom: 0, picTo: len, showStart: false } ]
+    ( [ picture v lp { len, winI, winO, picFrom: 0, picTo: len, showStart: false, head } ]
         <> (if len > n
               then
                 [ HH.div [ HP.class_ (HH.ClassName "looper-edit-row") ]
@@ -199,7 +207,7 @@ fixedBody h v top lp n =
                         , HP.max (Int.toNumber (len - n))
                         , HP.step (HP.Step (Int.toNumber step))
                         , HP.value (show (fromMaybe winI (Map.lookup "in" v.local)))
-                        , HE.onValueInput \raw -> let s = maybe winI identity (Int.fromString raw) in h.windowTo li s (s + n)
+                        , HE.onValueInput \raw -> let s = maybe winI identity (Int.fromString raw) in setWin s
                         , HE.onValueChange \_ -> h.editDone "in"
                         ]
                     , HH.span [ HP.class_ (HH.ClassName "looper-edit-word") ]
@@ -214,9 +222,9 @@ fixedBody h v top lp n =
                     ]
                 ])
         <> [ HH.div [ HP.class_ (HH.ClassName "looper-edit-actions") ]
-              [ HH.button [ HP.class_ (HH.ClassName "looper-help-btn"), HE.onClick \_ -> h.windowTo li (max 0 (winI - step)) (max 0 (winI - step) + n) ] [ HH.text ("⟵ " <> stepWord) ]
-              , HH.button [ HP.class_ (HH.ClassName "looper-help-btn"), HE.onClick \_ -> h.windowTo li (min (len - n) (winI + step)) (min (len - n) (winI + step) + n) ] [ HH.text (stepWord <> " ⟶") ]
-              , HH.button [ HP.class_ (HH.ClassName "looper-help-btn"), HE.onClick \_ -> h.clearWindow li ] [ HH.text "From the top" ]
+              [ HH.button [ HP.class_ (HH.ClassName "looper-help-btn"), HE.onClick \_ -> setWin (max 0 (winI - step)) ] [ HH.text ("⟵ " <> stepWord) ]
+              , HH.button [ HP.class_ (HH.ClassName "looper-help-btn"), HE.onClick \_ -> setWin (min (len - n) (winI + step)) ] [ HH.text (stepWord <> " ⟶") ]
+              , HH.button [ HP.class_ (HH.ClassName "looper-help-btn"), HE.onClick \_ -> clear ] [ HH.text "From the top" ]
               , HH.button [ HP.class_ (HH.ClassName "looper-help-btn"), HE.onClick \_ -> h.askPeaks li ] [ HH.text "Redraw" ]
               , HH.span [ HP.class_ (HH.ClassName "looper-edit-note") ]
                   [ HH.text (if windowed then "What sounds is what the harvest writes." else "The first " <> secs (min n len) <> " s.") ]
@@ -225,10 +233,29 @@ fixedBody h v top lp n =
     )
   where
   li = v.focus
-  len = lp.loopFrames
-  windowed = lp.winOut > 0
-  winI = if windowed then lp.winIn else 0
-  winO = if windowed then lp.winOut else min len n
+  -- The window edited: a layer's own when one is in hand, the loop's
+  -- otherwise. A layer's window is in the layer's frames.
+  shape = v.layer >>= \k -> Array.index lp.shapes (k - 1)
+  win = case shape of
+    Just sh -> if sh.lwOut > 0 then Just { i: sh.lwIn, o: sh.lwOut } else Nothing
+    Nothing -> if lp.winOut > 0 then Just { i: lp.winIn, o: lp.winOut } else Nothing
+  len = maybe lp.loopFrames _.len shape
+  windowed = case win of
+    Just _ -> true
+    Nothing -> false
+  winI = maybe 0 _.i win
+  winO = maybe (min len n) _.o win
+  setWin s = case v.layer of
+    Just k -> h.layerWindowTo li k s (s + n)
+    Nothing -> h.windowTo li s (s + n)
+  clear = case v.layer of
+    Just k -> h.clearLayerWindow li k
+    Nothing -> h.clearWindow li
+  -- Where the ear is: a layer's window comes round inside the loop's cycle,
+  -- so the head inside it is the loop position folded into the span.
+  head = case v.layer of
+    Just _ | windowed -> winI + (lp.pos `mod` max 1 (winO - winI))
+    _ -> lp.pos
   beat = if top.barFrames > 0 && top.linkQuantum > 0.0
     then max 1 (Int.round (Int.toNumber top.barFrames / top.linkQuantum))
     else max 1 (top.sampleRate / 10)

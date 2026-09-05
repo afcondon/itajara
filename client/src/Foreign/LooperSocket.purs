@@ -396,6 +396,10 @@ type LayerShape =
   -- | layer whole and silent, and `gain` goes on reporting what decay has
   -- | done to it meanwhile. Set with `Verb.LayerOn`.
   , on :: Boolean
+  -- | The layer's own window, in its frames; both zero for none. A layer with
+  -- | one plays that stretch, coming round inside the loop's cycle.
+  , lwIn :: Int
+  , lwOut :: Int
   -- | The layer's shape, as peaks 0-255 across its own length.
   -- |
   -- | **Absolute and logarithmic, never normalised per layer.** The picture is

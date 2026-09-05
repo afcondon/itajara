@@ -219,7 +219,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                     // could be made from. Reported so the display can say a
                     // loop has it rather than leaving it invisible.
                     format!(
-                        r#"{{"len":{},"period":{},"phase":{},"tail":{},"gain":{:.5},"born":{},"on":{},"env":[{}]}}"#,
+                        r#"{{"len":{},"period":{},"phase":{},"tail":{},"gain":{:.5},"born":{},"on":{},"lwIn":{},"lwOut":{},"env":[{}]}}"#,
                         slen,
                         period,
                         phase,
@@ -227,6 +227,8 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                         lp.layer_gain(l),
                         lp.layer_born(l),
                         lp.layer_on(l),
+                        lp.layer_window(l).map(|w| w.0).unwrap_or(0),
+                        lp.layer_window(l).map(|w| w.1).unwrap_or(0),
                         // Forty-eight bytes, and only for layers that exist —
                         // small enough to ride here rather than needing a
                         // message of its own, a request to trigger it, and a
@@ -388,7 +390,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
         .map(|l| {
             let (len, period, phase) = cl.layer_shape(l);
             format!(
-                r#"{{"len":{},"period":{},"phase":{},"tail":{},"gain":{:.5},"born":{},"on":{},"env":[{}]}}"#,
+                r#"{{"len":{},"period":{},"phase":{},"tail":{},"gain":{:.5},"born":{},"on":{},"lwIn":{},"lwOut":{},"env":[{}]}}"#,
                 len,
                 period,
                 phase,
@@ -396,6 +398,8 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                 cl.layer_gain(l),
                 cl.layer_born(l),
                 cl.layer_on(l),
+                cl.layer_window(l).map(|w| w.0).unwrap_or(0),
+                cl.layer_window(l).map(|w| w.1).unwrap_or(0),
                 cl.layer_env(l)
                     .iter()
                     .map(|v| v.to_string())
@@ -526,5 +530,5 @@ fn db(x: f32) -> f64 {
 /// waveform. Spelled the way `dispatch` spells them, after the loop digits.
 fn is_edit(cmd: &str) -> bool {
     let rest = cmd.trim().trim_start_matches(|c: char| c.is_ascii_digit());
-    ["in", "out", "win", "rot", "pk", "ly"].iter().any(|v| rest.starts_with(v))
+    ["in", "out", "win", "rot", "pk", "ly", "lw", "dp"].iter().any(|v| rest.starts_with(v))
 }

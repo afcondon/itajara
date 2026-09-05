@@ -232,6 +232,18 @@ perform rig subject = case _ of
   -- surface can grey the drop before the drag ends rather than after.
   Duty.CopyLoop s -> copyOnto s (Verb.CopyLoop s)
   Duty.CopyLayer s k -> copyOnto s (Verb.CopyLayer s k)
+  -- One on, the rest off: set, never flipped, from what the daemon reports,
+  -- so a dropped command leaves the picture wrong for a snapshot and not
+  -- for ever. A lone layer stays on.
+  Duty.SoloLayer k -> case loopAt rig i of
+    Nothing -> [ notInSnapshot i ]
+    Just st
+      | st.layers <= 1 -> [ Handled ("loop " <> show (i + 1) <> " has one layer; it sounds") ]
+      | otherwise ->
+          map (\j -> Command (cmd i (Verb.LayerOn j (j == k)))) (Array.range 1 st.layers)
+  Duty.LayerWindow k a b -> [ Command (cmd i (Verb.LayerWindow k a b)) ]
+  Duty.ClearLayerWindow k -> [ Command (cmd i (Verb.ClearLayerWindow k)) ]
+  Duty.DupLayer k -> [ Command (cmd i (Verb.DupLayer k)) ]
   Duty.ClearLoop -> [ Command (cmd i Verb.Clear) ]
   -- **Read from the loop, not remembered** — the same shape as the click and
   -- the monitor since `Rig` started carrying the flags, and for the same

@@ -206,6 +206,14 @@ data Verb
   | CopyLoop Int
   | CopyLayer Int Int
 
+  -- | A layer's own window (layer from one; in and out in the layer's
+  -- | frames), and its clearing; and a duplicate of a layer as a new layer
+  -- | of the same loop, window and all, so the copy can be moved to a
+  -- | different stretch.
+  | LayerWindow Int Int Int
+  | ClearLayerWindow Int
+  | DupLayer Int
+
   -- | Every loop that holds something, from the top, **together**.
   -- |
   -- | This was eight `Sounding true`s, and eight unmutes is not a start: mute
@@ -368,6 +376,9 @@ render = case _ of
   ExportLayers name -> "exl" <> name
   CopyLoop src -> "cp" <> show src
   CopyLayer src k -> "cp" <> show src <> "l" <> show k
+  LayerWindow k i o -> "lw" <> show k <> ":" <> show i <> ":" <> show o
+  ClearLayerWindow k -> "lw" <> show k
+  DupLayer k -> "dp" <> show k
   StartAll -> "go"
   Playing on -> flag "play" on
 
