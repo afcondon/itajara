@@ -189,12 +189,13 @@ perform rig subject = case _ of
       <> (if Array.elem n rig.grab then gridded rig n <> sourced rig n else [])
 
   Duty.RecordLoop -> gridded rig i <> onRecord i (loopAt rig i)
-  -- Sized first, then the same record as any other, so every guard in
-  -- `onRecord` still applies. Only an empty, idle loop takes the size; the
-  -- daemon refuses it anywhere else, and sending it there would be a refusal
-  -- in the log for every overdub.
+  -- `fix` first, then the same record as any other, so every guard in
+  -- `onRecord` still applies. On an empty loop the daemon sizes it and the
+  -- take closes itself; on a loop with material it arms one pass from the
+  -- loop's zero, a layer of the loop's own length. Writing or armed, the
+  -- press is the close or the cancel, and nothing is fixed.
   Duty.RecordFixed secs -> case loopAt rig i of
-    Just st | st.layers == 0 && not (Looper.isWriting st) && not st.armed && secs > 0.0 ->
+    Just st | not (Looper.isWriting st) && not st.armed && secs > 0.0 ->
       gridded rig i <> [ Command (cmd i (Verb.Fix secs)) ] <> onRecord i (Just st)
     other -> gridded rig i <> onRecord i other
   Duty.OverdubLoop -> gridded rig i <> onOverdub i (loopAt rig i)

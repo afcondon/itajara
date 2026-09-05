@@ -451,10 +451,11 @@ data Duty
   | Revox Boolean
   -- | Thread an empty tape of this many seconds.
   | Blank Number
-  -- | Record a take of exactly this many seconds into an empty loop: the loop
-  -- | is sized first, then `r`, and the daemon closes it there. The face's
-  -- | button for a module that wants one length (Arbhar's thirteen), so the
-  -- | page never holds a clock. On a loop with material it is `RecordLoop`.
+  -- | Record a take of exactly this many seconds into an empty loop — the loop
+  -- | is sized first, then `r`, and the daemon closes it there — or, on a loop
+  -- | with material, add one layer of the loop's own length, from its zero,
+  -- | closing itself. The face's button for a module that wants every layer
+  -- | one length (Arbhar's thirteen); the page never holds a clock.
   | RecordFixed Number
   -- | What a Revox pass leaves of what was under it, in decibels.
   | Feedback Number
