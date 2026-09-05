@@ -175,3 +175,22 @@ touches the callbacks and deserves a quiet day with the rig off. 6 and 7 an
 afternoon. Roughly a working week, none of it blocking the Friends or the
 pedalboard, all of it landing behind 43 daemon tests and two checkers that
 already exist because the debt was felt before it was named.
+
+## Addendum: Glassbox
+
+Andrew floated dogfooding Glassbox (`purescript-hylograph-libs/
+purescript-glassbox`: a state machine as a data artifact, run and drawn
+from the same value, with a conformance runner whose claim is "same events
+→ same state, same effects, same refusal tag") when the Add-layer wait
+looked like a confused front end. It was not the front end that day, but it
+is the right tool for **step 5**. The loop's phase machine is implemented
+twice already — in Rust (`state.set` at 17 sites) and in PureScript
+(`Socket.phaseOf`, `Machine.perform`'s guards) — and the two agree only by
+care. Authored once as a Glassbox artifact, the machine becomes the spec
+both sides are checked against: the PureScript side runs it directly; the
+Rust side is driven through the enumerated (state × event × guard) table by
+a test, the way `check-verbs` and `check-snapshot` already hold the two
+sides together from outside. The refusal tags are the daemon's acks. That
+would turn "one `transition` function" from a discipline into a checked
+property, and the diagram would be the daemon's first honest picture of
+itself.
