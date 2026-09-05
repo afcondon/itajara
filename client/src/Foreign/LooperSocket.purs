@@ -337,6 +337,9 @@ type LoopState =
   -- | pending. What lets the display say "starts in 1.4 s" rather than leaving
   -- | a deliberate wait looking like a dead button.
   , pendingAt :: Int
+  -- | Frames a first take (or multiply) has laid so far; zero otherwise. An
+  -- | overdub's progress is `pos`.
+  , recFrames :: Int
   , shapes :: Array LayerShape
   }
 

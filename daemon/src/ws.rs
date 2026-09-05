@@ -249,7 +249,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                     r#""speed":{:.4},"pendulum":{},"oneShot":{},"levelArm":{},"#,
                     r#""firing":{},"chance":{:.4},"skipping":{},"fadeMs":{:.1},"decayDb":{:.2},"#,
                     r#""volDb":{:.2},"revox":{},"fbDb":{:.2},"toneHz":{:.0},"cycles":{},"winIn":{},"winOut":{},"rot":{},"#,
-                    r#""src":{},"mono":{},"pendingAt":{},"recEnv":[{}],"shapes":[{}]}}"#
+                    r#""src":{},"mono":{},"pendingAt":{},"recFrames":{},"recEnv":[{}],"shapes":[{}]}}"#
                 ),
                 li,
                 lp.state_name(),
@@ -336,6 +336,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                 sh.src_of(li) + 1,
                 lp.mono.load(Ordering::Relaxed),
                 lp.pending_in(cur),
+                lp.rec_frames(),
                 // **The take in hand, drawn while it is being played.** Empty
                 // whenever nothing is recording, so the display has one test
                 // rather than having to work the state out for itself — and so

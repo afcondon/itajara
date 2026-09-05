@@ -1399,6 +1399,16 @@ impl Loop {
     pub fn is_recording(&self) -> bool {
         matches!(self.state.get(), FIRST | OVERDUB | MULTIPLY)
     }
+    /// How far a first take (or a multiply) has got, in frames: what a
+    /// progress bar is drawn from while the loop has no length yet. Zero
+    /// when nothing linear is being written — an overdub's progress is the
+    /// play position, which the snapshot already carries.
+    pub fn rec_frames(&self) -> usize {
+        match self.state.get() {
+            FIRST | MULTIPLY => self.reached.load(Ordering::Relaxed),
+            _ => 0,
+        }
+    }
     /// True when this loop wants the input — armed counts, because arming is a
     /// claim on the one converter the rig has.
     pub fn wants_input(&self) -> bool {
