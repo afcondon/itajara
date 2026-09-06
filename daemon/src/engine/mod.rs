@@ -40,6 +40,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
+mod callbacks;
 mod commit;
 mod control;
 mod copy;
