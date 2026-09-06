@@ -9,6 +9,7 @@
 use std::sync::atomic::Ordering;
 
 use super::{
+    Ack,
     ARM_REACH_MS,
     ARMED,
     CHANNELS,
@@ -24,14 +25,17 @@ use super::{
     thresh_words,
     tone_words,
     vol_words,
+    Job,
 };
-use super::commit::{commit, draw_layer, take};
+use super::commit::{close_take, draw_layer, take, Closed};
+#[cfg(test)]
+use super::commit::settle;
 use super::copy::copy_layers;
 use super::cycle::{
     dense,
+    end_multiply,
     fix_next,
     free_length,
-    multiply_end,
     multiply_start,
     place_at,
     rotate,
@@ -43,12 +47,73 @@ use super::cycle::{
 use super::edit::{schedule_restart, thread_blank};
 use super::export::{export_layers, export_set, save_take};
 use super::guards::{busy_elsewhere, not_plain, not_writable, still_recording};
+use super::lane::Caller;
 use super::shared::Shared;
 use super::verb::tokenize;
+
+/// What a close has to say now. A take that has flipped and is draining
+/// says nothing yet: its ack is the finish's, and the lane says it when the
+/// input has drained (or `dispatch` does, having waited).
+fn closing(c: Closed) -> String {
+    match c {
+        Closed::Said(s) | Closed::Filed(s) => s,
+        Closed::Draining => String::new(),
+    }
+}
 
 /// The ack for a line that is not a command, in the words it has always used.
 fn unknown(rest: &str) -> String {
     format!("unknown command {:?}", rest)
+}
+
+/// One command, from wherever it came, carried through: the ack, with any
+/// work it deferred done here and now, and any close it began settled —
+/// blocking through the boundary and the drain, as this function always
+/// did. For the callers that have no lane: the tests, the conformance
+/// replay. The daemon's own road is `dispatch_ack`, on the lane; the
+/// self-test closes through `commit` and `multiply_end`, which block the
+/// same way.
+#[cfg(test)]
+pub(crate) fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
+    let mut ack = match dispatch_ack(sh, sr, line, Caller::Engine) {
+        Ack::Now(s) => s,
+        Ack::Later(job) => job(sh),
+    };
+    for li in 0..sh.n_loops {
+        if let Some(said) = settle(sh, li, sr) {
+            if ack.is_empty() {
+                ack = said;
+            } else {
+                println!("  {}", said);
+            }
+        }
+    }
+    ack
+}
+
+/// One command, from wherever it came: what `perform` decides, as an `Ack`
+/// — said now, or a `Job` for the slow thread. What the lane calls; nothing
+/// in it waits. `from` is who sent it, so a close it begins can say its ack
+/// the same way when the drain is done.
+pub(crate) fn dispatch_ack(sh: &Shared, sr: u32, line: &str, from: Caller) -> Ack {
+    let mut later = None;
+    let now = perform(sh, sr, line, from, &mut later);
+    match later {
+        Some(job) => Ack::Later(job),
+        None => Ack::Now(now),
+    }
+}
+
+/// Leave the slow part of a verb for later, and say nothing until it is
+/// done: the ack is the job's.
+fn defer(later: &mut Option<Job>, ack: Ack) -> String {
+    match ack {
+        Ack::Now(s) => s,
+        Ack::Later(job) => {
+            *later = Some(job);
+            String::new()
+        }
+    }
 }
 
 /// One command, from wherever it came.
@@ -58,8 +123,9 @@ fn unknown(rest: &str) -> String {
 /// detail still goes to stdout — waveforms and level readings are for the
 /// person sitting at the daemon — and what comes back is the short
 /// acknowledgement a remote caller needs. Remote clients render from the state
-/// snapshot rather than from these strings.
-pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
+/// snapshot rather than from these strings. A verb whose work takes real time
+/// and decides nothing leaves it in `later` (see `Ack`).
+fn perform(sh: &Shared, sr: u32, line: &str, from: Caller, later: &mut Option<Job>) -> String {
     // A leading digit picks the loop: `3r` records loop 3 whatever is selected,
     // `3s2` spreads it. Every command can therefore address a loop explicitly,
     // which is what the footswitch path needs — the MC6 sends one fixed message
@@ -239,53 +305,60 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 }
                 let buckets: usize = arg.parse().unwrap_or(600).clamp(16, 4000);
                 let (i, o) = lp.window().unwrap_or((0, 0));
+                let rot = lp.rot.load(Ordering::Relaxed);
                 // The picture spans the loop and whatever silence the window
                 // reaches into, so a window that extends past an end is drawn
                 // where it is rather than off the edge.
                 let l = len as i64;
                 let (from_all, to_all) = (i.min(0), o.max(l));
-                let total = (to_all - from_all) as usize;
-                let mut lo = Vec::with_capacity(buckets);
-                let mut hi = Vec::with_capacity(buckets);
-                for b in 0..buckets {
-                let from = b * total / buckets;
-                let to = ((b + 1) * total / buckets).max(from + 1).min(total);
-                let (mut mn, mut mx) = (0.0f32, 0.0f32);
-                for p in from..to {
-                    let pos = from_all + p as i64;
-                    if pos < 0 || pos >= l {
-                        continue;
+                // Drawn off the lane: a picture of the loop as it was when
+                // asked for, read from the arena, which nothing here waits
+                // on. A layer laid meanwhile is in the next picture.
+                *later = Some(Box::new(move |sh: &Shared| {
+                    let total = (to_all - from_all) as usize;
+                    let mut lo = Vec::with_capacity(buckets);
+                    let mut hi = Vec::with_capacity(buckets);
+                    for b in 0..buckets {
+                        let from = b * total / buckets;
+                        let to = ((b + 1) * total / buckets).max(from + 1).min(total);
+                        let (mut mn, mut mx) = (0.0f32, 0.0f32);
+                        for p in from..to {
+                            let pos = from_all + p as i64;
+                            if pos < 0 || pos >= l {
+                                continue;
+                            }
+                            let v = sh.mix_at(li, n, pos as usize, false);
+                            for ch in 0..CHANNELS {
+                                mn = mn.min(v[ch]);
+                                mx = mx.max(v[ch]);
+                            }
+                        }
+                        lo.push(((mn * 1000.0).round() as i32).clamp(-1000, 1000));
+                        hi.push(((mx * 1000.0).round() as i32).clamp(-1000, 1000));
                     }
-                    let v = sh.mix_at(li, n, pos as usize, false);
-                    for ch in 0..CHANNELS {
-                        mn = mn.min(v[ch]);
-                        mx = mx.max(v[ch]);
+                    let json = format!(
+                        r#"{{"peaks":{{"loop":{},"frames":{},"from":{},"to":{},"buckets":{},"winIn":{},"winOut":{},"rot":{},"lo":[{}],"hi":[{}]}}}}"#,
+                        li,
+                        len,
+                        from_all,
+                        to_all,
+                        buckets,
+                        i,
+                        o,
+                        rot,
+                        lo.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
+                        hi.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
+                    );
+                    if let Ok(mut slot) = sh.peaks.lock() {
+                        *slot = json;
                     }
-                }
-                lo.push(((mn * 1000.0).round() as i32).clamp(-1000, 1000));
-                hi.push(((mx * 1000.0).round() as i32).clamp(-1000, 1000));
-                }
-                let json = format!(
-                r#"{{"peaks":{{"loop":{},"frames":{},"from":{},"to":{},"buckets":{},"winIn":{},"winOut":{},"rot":{},"lo":[{}],"hi":[{}]}}}}"#,
-                li,
-                len,
-                from_all,
-                to_all,
-                buckets,
-                i,
-                o,
-                lp.rot.load(Ordering::Relaxed),
-                lo.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
-                hi.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
-                );
-                if let Ok(mut slot) = sh.peaks.lock() {
-                *slot = json;
-                }
-                sh.peaks_seq.fetch_add(1, Ordering::Release);
-                return format!("peaks for loop {}: {} buckets over {:.3} s.", li, buckets, len as f64 / sr as f64);
+                    sh.peaks_seq.fetch_add(1, Ordering::Release);
+                    format!("peaks for loop {}: {} buckets over {:.3} s.", li, buckets, len as f64 / sr as f64)
+                }));
+                return String::new();
             }
             "x" => match lp.phase() {
-                Phase::Multiply => return multiply_end(sh, li, sr),
+                Phase::Multiply => return closing(end_multiply(sh, li, sr, from)),
                 Phase::First | Phase::Overdub => return format!("loop {} is still recording — finish that first.", li),
                 _ => {
                     // A loop listening for a sound, or waiting for the bar,
@@ -304,8 +377,14 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 }
             },
             "r" => match lp.phase() {
-                Phase::Multiply => return multiply_end(sh, li, sr),
-                Phase::First | Phase::Overdub => return commit(sh, li, sr, late),
+                Phase::Multiply => return closing(end_multiply(sh, li, sr, from)),
+                // As of the press: the frame the foot went down on, which is
+                // `late` frames ago. The close decides the rest without
+                // waiting here; see `commit`.
+                Phase::First | Phase::Overdub => {
+                    let closed_at = sh.out_frames.load(Ordering::Acquire) as i64 - late.max(0);
+                    return closing(close_take(sh, li, sr, closed_at, late, from));
+                }
                 // A second press while the loop is waiting for a sound takes the
                 // arm back. There has to be a way out: the sound may never come,
                 // and a loop holding the input for a recording that will never
@@ -858,9 +937,9 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // The three name verbs. A name runs straight into its verb on the
             // wire (`exlriff`), and `tokenize` reads it back by the longest
             // name-verb, so `exl` and `ex` no longer care which is first.
-            "exl" => return export_layers(sh, sr, arg),
-            "ex" => return export_set(sh, sr, arg),
-            "w" => return save_take(sh, li, sr, arg),
+            "exl" => return defer(later, export_layers(sh, sr, arg)),
+            "ex" => return defer(later, export_set(sh, sr, arg)),
+            "w" => return defer(later, save_take(sh, li, sr, arg)),
             // Take back an undo. Free, now that undo does not destroy what it
             // removes: the layer is still there with its shape intact, so this
             // is one number going back up.

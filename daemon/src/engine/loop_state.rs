@@ -12,6 +12,10 @@ use std::sync::atomic::{
     AtomicUsize,
     Ordering,
 };
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
+
+use super::commit::{Closing, Filed, Stage, Take};
 use super::{
     AtomicU8Wrapper,
     ENV_BUCKETS,
@@ -61,9 +65,20 @@ pub struct Loop {
     /// of it: the second press exists because the engine did not know how long
     /// you meant, and as soon as it does, asking for it is ceremony.
     ///
-    /// Read by `closer`, not by the callback, because closing a recording draws
-    /// a layer and sleeps and neither belongs in an audio thread.
+    /// Read by the lane's tick, not by the callback, because closing a
+    /// recording draws a layer and neither that nor the drain before it
+    /// belongs in an audio thread. Since step 7 a quantised close and a
+    /// multiply end are filed here too, for their boundary, instead of being
+    /// slept through on the command thread.
     pub close_at: AtomicI64,
+    /// Where this loop's close stands, if one is under way: filed for the
+    /// frame on `close_at`, with the press that filed it; or flipped and
+    /// draining, with everything the finish needs. See `commit::Closing`.
+    ///
+    /// A mutex rather than atomics because it is one value with six fields
+    /// and the audio thread never reads it — the lane files it, fires it and
+    /// finishes it, and `cleared` drops it.
+    pub(crate) closing: Mutex<Option<Closing>>,
     /// The length a running **first** recording was told to be, or zero for
     /// "whatever gets captured".
     ///
@@ -445,6 +460,7 @@ impl Loop {
             loop_len: AtomicUsize::new(0),
             cycles: AtomicUsize::new(0),
             close_at: AtomicI64::new(i64::MIN),
+            closing: Mutex::new(None),
             rec_len: AtomicUsize::new(0),
             n_layers: AtomicUsize::new(0),
             layers: (0..max_layers).map(|_| Layer::new()).collect(),
@@ -793,6 +809,7 @@ impl Loop {
         // is a timer pointed at a take nobody has played yet.
         self.cycles.store(0, Ordering::Release);
         self.close_at.store(i64::MIN, Ordering::Release);
+        *self.closing() = None;
         self.rec_len.store(0, Ordering::Release);
         // And the plan for the next take, whole: a request still pending, its
         // frame, a one-pass, a back-date. A cleared loop has no next take.
@@ -904,6 +921,69 @@ impl Loop {
             || self.threaded.load(Ordering::Relaxed);
         self.enter(if held { Phase::Playing } else { Phase::Idle }, at);
         self.next.clear();
+    }
+
+    /// The close slot, poisoning ignored: nothing it holds can be half
+    /// written, and a panic on the lane has already taken the daemon down.
+    fn closing(&self) -> MutexGuard<'_, Option<Closing>> {
+        self.closing.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// File a close for output frame `at`: `close_at` says when, `filed`
+    /// says what pressed. The lane's tick fires it there.
+    pub(crate) fn file_close(&self, at: i64, filed: Filed) {
+        *self.closing() = Some(Closing::Filed(filed));
+        self.close_at.store(at, Ordering::Release);
+    }
+
+    /// The phase has flipped; hold what the finish needs until the input has
+    /// drained.
+    pub(crate) fn drain(&self, take: Take) {
+        *self.closing() = Some(Closing::Draining(take));
+    }
+
+    /// Take the filed press, if the close under way was filed by one. A
+    /// close the callback armed alone — a sized take, a one-pass overdub —
+    /// has none.
+    pub(crate) fn take_filed(&self) -> Option<Filed> {
+        let mut slot = self.closing();
+        match *slot {
+            Some(Closing::Filed(f)) => {
+                *slot = None;
+                Some(f)
+            }
+            _ => None,
+        }
+    }
+
+    /// Take the draining take if its drain is due by `now`.
+    pub(crate) fn take_drained(&self, now: Instant) -> Option<Take> {
+        let mut slot = self.closing();
+        match &*slot {
+            Some(Closing::Draining(t)) if t.due <= now => match slot.take() {
+                Some(Closing::Draining(t)) => Some(t),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Where the close stands: the frame it is filed for, the instant its
+    /// drain is due, or nothing under way.
+    pub(crate) fn closing_stage(&self) -> Option<Stage> {
+        match &*self.closing() {
+            Some(Closing::Filed(_)) => Some(Stage::Filed(self.close_at.load(Ordering::Acquire))),
+            Some(Closing::Draining(t)) => Some(Stage::Draining(t.due)),
+            None => None,
+        }
+    }
+
+    /// Drop a filed close: the take it was filed for is gone.
+    pub(crate) fn drop_filed(&self) {
+        let mut slot = self.closing();
+        if matches!(*slot, Some(Closing::Filed(_))) {
+            *slot = None;
+        }
     }
 
     pub fn state_name(&self) -> &'static str {

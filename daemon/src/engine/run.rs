@@ -18,7 +18,8 @@ use crate::measure::{Width, choose_input, choose_output};
 
 use super::{ARM_REACH_MS, CHANNELS, db_to_mag, MAX_FADE_MS, NO_ANCHOR, Opts, Phase, Source};
 use super::callbacks;
-use super::control::{control_loop, spawn_closer};
+use super::control::control_loop;
+use super::lane::Lane;
 use super::edit::thread_blank;
 use super::loop_state::Loop;
 use super::selftest::selftest;
@@ -378,14 +379,17 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     in_stream.play()?;
     std::thread::sleep(Duration::from_millis(300));
 
-    spawn_closer(sh.clone(), sr);
+    // The one control lane: every command from the console and the socket,
+    // and the closer's tick. Before the self-test, which records a sized
+    // take and needs the close fired at its frame.
+    let lane = Lane::spawn(sh.clone(), sr);
 
     if let Some(port) = opts.link_port {
         crate::link::spawn_listener(sh.clone(), sr, port);
     }
 
     if let Some(port) = opts.ws_port {
-        crate::ws::serve(sh.clone(), sr, port);
+        crate::ws::serve(sh.clone(), sr, port, lane.clone());
     }
 
     if let Some(secs) = opts.selftest {
@@ -402,16 +406,17 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     // console closed, which is precisely backwards.
     if opts.ws_port.is_some() {
         let sh_console = sh.clone();
+        let lane = lane.clone();
         std::thread::spawn(move || {
             // `q` means stop the daemon, not stop this thread. EOF means the
             // console was never there, and the socket carries on regardless.
-            if control_loop(&sh_console, sr) {
+            if control_loop(&sh_console, &lane) {
                 std::process::exit(0);
             }
             println!("(console closed; still serving the socket and watching the device)");
         });
     } else {
-        let _ = control_loop(&sh, sr);
+        let _ = control_loop(&sh, &lane);
     }
 
     // stdin closing is not a reason to stop.
@@ -552,6 +557,10 @@ pub(super) fn drop_takes(sh: &Shared) {
     }
     for li in 0..sh.n_loops {
         sh.lp(li).next.clear();
+        // A close filed for a boundary is a close of the take just dropped.
+        // A take already draining is finished as it was: the flip came
+        // before the outage.
+        sh.lp(li).drop_filed();
     }
 }
 

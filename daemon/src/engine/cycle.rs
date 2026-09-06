@@ -4,11 +4,12 @@
 //!
 //! Split out of `engine.rs` on 2026-09-06 (REVIEW-daemon-debt step 1).
 
-use std::time::Duration;
+use std::time::Instant;
 use std::sync::atomic::Ordering;
 
 use super::{FIRE, MAX_BARS, MAX_PERIOD, Phase, Shape};
-use super::commit::{draw_layer, fill_from_ring};
+use super::commit::{draw_layer, fill_from_ring, settle, Closed, Filed, Take, DRAIN};
+use super::lane::Caller;
 use super::guards::still_recording;
 use super::shared::Shared;
 
@@ -76,62 +77,113 @@ pub(crate) fn multiply_start(sh: &Shared, li: usize, sr: u32) -> String {
 /// Rounding rather than truncating, because at nine tenths of the way through
 /// the fourth cycle you meant four. Which means sometimes waiting for the
 /// boundary to arrive rather than cutting the loop short at the press.
+///
+/// Blocking through the boundary and the drain, as it always did: the fast
+/// half, `end_multiply`, then `commit::settle`. For callers with no lane.
 pub(crate) fn multiply_end(sh: &Shared, li: usize, sr: u32) -> String {
+    match end_multiply(sh, li, sr, Caller::Engine) {
+        Closed::Said(s) => s,
+        Closed::Filed(_) | Closed::Draining => settle(sh, li, sr).unwrap_or_default(),
+    }
+}
+
+/// The fast half of ending a multiply: count the cycles, and either stop at
+/// the ceiling, file the end for a boundary still ahead, or flip now.
+///
+/// If the rounding went up, the last cycle has not finished yet. Wait for it
+/// rather than hand back a loop that is short by however late the press was
+/// — filed on `close_at` for the lane to fire, not slept through here. The
+/// count is decided now, from this press, and carried to the frame.
+pub(crate) fn end_multiply(sh: &Shared, li: usize, sr: u32, from: Caller) -> Closed {
     let lp = sh.lp(li);
     let loop_len = lp.loop_len.load(Ordering::Acquire);
-    let from = lp.rec_from.load(Ordering::Acquire);
+    let began = lp.rec_from.load(Ordering::Acquire);
     let cur = sh.out_frames.load(Ordering::Acquire) as i64;
-    let elapsed = (cur - from).max(0) as f64;
+    let elapsed = (cur - began).max(0) as f64;
 
     let n = ((elapsed / loop_len as f64).round() as usize).max(1);
     let new_len = n * loop_len;
     if new_len > sh.max_frames {
         lp.enter(Phase::Playing, cur);
-        return format!(
+        return Closed::Said(format!(
             "loop {}: {} cycles would be {:.1} s, past the --max-secs ceiling of {:.1} s. \
              Stopping at the old length.",
             li,
             n,
             new_len as f64 / sr as f64,
             sh.max_frames as f64 / sr as f64
-        );
+        ));
     }
 
-    // If the rounding went up, the last cycle has not finished yet. Wait for it
-    // rather than hand back a loop that is short by however late the press was.
-    let target = from + new_len as i64;
-    // Said in the ACK rather than only here, and after the fact rather than
-    // before it: this call blocks until the boundary arrives, so a message sent
-    // now could not reach the app before the outcome does anyway. It matters
-    // because a press that appears to do nothing for half a cycle is exactly
-    // the kind of pause that gets pressed again.
-    let rounded = if target > cur {
+    let target = began + new_len as i64;
+    if target > cur {
+        lp.file_close(target, Filed { pressed: cur, late: 0, cycles: n, from });
+        return Closed::Filed(format!(
+            "loop {} x{} ends on the boundary in {:.2} s.",
+            li,
+            n,
+            (target - cur) as f64 / sr as f64
+        ));
+    }
+    flip_multiply(sh, li, n, 0, from);
+    Closed::Draining
+}
+
+/// A filed multiply end, at its boundary: what the lane does at `close_at`
+/// when the loop is still multiplying. `at` is the boundary; how long the
+/// press waited for it goes in the ack.
+pub(crate) fn multiply_fired(sh: &Shared, li: usize, filed: Filed, at: i64) {
+    flip_multiply(sh, li, filed.cycles, at - filed.pressed, filed.from);
+}
+
+/// Stop the recording, and let the input drain past it, since it trails by
+/// K — the same drain a take gets, and the same finish waits on it.
+fn flip_multiply(sh: &Shared, li: usize, n: usize, waited: i64, from: Caller) {
+    let lp = sh.lp(li);
+    let now = sh.out_frames.load(Ordering::Acquire) as i64;
+    lp.enter(Phase::Playing, now);
+    lp.drain(Take {
+        was: Phase::Multiply,
+        closed_at: now,
+        late: 0,
+        quantised_len: None,
+        cycles: n,
+        waited,
+        due: Instant::now() + DRAIN,
+        from,
+    });
+}
+
+/// The slow half of ending a multiply: the input has drained, so grow the
+/// loop to the cycles counted and lay the multiplied layer.
+///
+/// "With the original repeating underneath" now costs nothing. Every existing
+/// layer keeps its own length at `period = 1`, and the mix wraps it inside
+/// the longer cycle by itself. This used to copy the audio n times, which
+/// worked and threw away the structure: afterwards there was no one-bar thing
+/// to make sparse, alternate or move, because it had been smeared across four
+/// bars of buffer. The multiply began on a cycle boundary, so each layer's
+/// position zero still lands where it did.
+pub(crate) fn finish_multiply(sh: &Shared, li: usize, sr: u32, t: &Take) -> String {
+    let lp = sh.lp(li);
+    let loop_len = lp.loop_len.load(Ordering::Acquire);
+    let began = lp.rec_from.load(Ordering::Acquire);
+    let n = t.cycles;
+    let new_len = n * loop_len;
+    // Said in the ACK rather than only on the console, and after the fact
+    // rather than before it: a press that appears to do nothing for half a
+    // cycle is exactly the kind of pause that gets pressed again.
+    let rounded = if t.waited > 0 {
         format!(
             " (rounded up, waited {:.2} s for the boundary)",
-            (target - cur) as f64 / sr as f64
+            t.waited as f64 / sr as f64
         )
     } else {
         String::new()
     };
-    if target > cur {
-        while (sh.out_frames.load(Ordering::Acquire) as i64) < target {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-    // And let the input drain past it, since it trails by K.
-    lp.enter(Phase::Playing, sh.out_frames.load(Ordering::Acquire) as i64);
-    std::thread::sleep(Duration::from_millis(60));
-
-    // "With the original repeating underneath" now costs nothing. Every existing
-    // layer keeps its own length at `period = 1`, and the mix wraps it inside
-    // the longer cycle by itself. This used to copy the audio n times, which
-    // worked and threw away the structure: afterwards there was no one-bar thing
-    // to make sparse, alternate or move, because it had been smeared across four
-    // bars of buffer. The multiply began on a cycle boundary, so each layer's
-    // position zero still lands where it did.
 
     // The new loop's position zero is where the multiply began.
-    lp.origin.store(from, Ordering::Release);
+    lp.origin.store(began, Ordering::Release);
     lp.loop_len.store(new_len, Ordering::Release);
 
     let layer = lp.n_layers.load(Ordering::Acquire);

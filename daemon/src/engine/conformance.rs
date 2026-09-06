@@ -77,8 +77,9 @@
 //!
 //! Every event is followed by `stamp` at now, which is the buffer the
 //! callback would have run after the press. `multiplying` is closed with
-//! the clock at exactly one cycle, since `multiply_end` waits for the
-//! boundary on the calling thread.
+//! the clock at exactly one cycle, since the test-side `dispatch` settles a
+//! close by waiting for its boundary on the calling thread (the lane does
+//! not; step 7).
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;

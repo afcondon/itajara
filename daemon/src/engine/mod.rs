@@ -49,6 +49,7 @@ mod dispatch;
 mod edit;
 mod export;
 mod guards;
+mod lane;
 mod layer;
 mod loop_state;
 mod next_take;
@@ -58,7 +59,9 @@ mod selftest;
 mod shared;
 mod verb;
 
-pub use dispatch::dispatch;
+#[cfg(test)]
+pub(crate) use dispatch::dispatch;
+pub(crate) use lane::{Caller, Lane};
 pub use loop_state::Loop;
 pub(crate) use layer::Layer;
 pub(crate) use next_take::NextTake;
@@ -148,6 +151,22 @@ pub(crate) struct Shape {
     /// The pass the layer was laid on: where its decay counts from.
     born: i64,
 }
+
+/// What a command has to say, and when.
+///
+/// Most verbs answer as they return. Four do work that decides nothing about
+/// any loop's state and takes real time — writing a take to disk, rendering
+/// a set, drawing a waveform — and those hand the work back as a `Job` to
+/// run off the lane, with the ack it produces said when it is done, through
+/// the same path as every other. A command that says nothing at all is the
+/// failure the ack path exists to refuse.
+pub(crate) enum Ack {
+    Now(String),
+    Later(Job),
+}
+
+/// Work a verb has left for the slow thread, and the ack it will give.
+pub(crate) type Job = Box<dyn FnOnce(&Shared) -> String + Send>;
 
 /// How many buckets a layer's envelope is drawn with.
 ///

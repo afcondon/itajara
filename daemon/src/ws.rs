@@ -26,13 +26,13 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::engine::{dispatch, Layer, Shared};
+use crate::engine::{Caller, Lane, Layer, Shared};
 
 /// How often the snapshot goes out. Fast enough for a position readout to look
 /// continuous, slow enough to be free.
 const PUSH_HZ: u64 = 30;
 
-pub fn serve(sh: Arc<Shared>, sr: u32, port: u16) {
+pub fn serve(sh: Arc<Shared>, sr: u32, port: u16, lane: Lane) {
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
         Err(e) => {
@@ -47,8 +47,9 @@ pub fn serve(sh: Arc<Shared>, sr: u32, port: u16) {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let sh = sh.clone();
+            let lane = lane.clone();
             std::thread::spawn(move || {
-                if let Err(e) = talk(sh, sr, stream) {
+                if let Err(e) = talk(sh, sr, stream, lane) {
                     // A browser tab closing is the ordinary case, not a fault.
                     let msg = e.to_string();
                     if !msg.contains("Connection closed") && !msg.contains("reset") {
@@ -64,6 +65,7 @@ fn talk(
     sh: Arc<Shared>,
     sr: u32,
     stream: std::net::TcpStream,
+    lane: Lane,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The read timeout is what lets one thread do both jobs: it turns a blocking
     // read into "check for a command, then push the state", at the push rate.
@@ -77,29 +79,15 @@ fn talk(
     // was unplugged mid-session, and it cost an afternoon of looking for a MIDI
     // fault. Watching the output frame counter makes the failure visible from
     // the app instead.
-    // **Edits run in order, on one worker per connection.** Every command
-    // used to run on a thread of its own, so that the ones that block on
-    // purpose — ending a multiply waits for the cycle boundary — would not
-    // hold up the snapshot. That also let a burst of edits from a slider
-    // execute out of order: a straggler landing after the restart had fired
-    // re-applied an older window and restarted the loop again, which was
-    // "it keeps restarting after I stop". So the editing verbs go through a
-    // channel and run in the order they were sent; everything else keeps its
-    // own thread, because a press must not queue behind a multiply.
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    {
-        let sh = sh.clone();
-        std::thread::spawn(move || {
-            for cmd in rx {
-                let ack = dispatch(&sh, sr, &cmd);
-                if !ack.is_empty() {
-                    println!("  [app] {}", ack);
-                    sh.note_ack(&ack);
-                }
-            }
-        });
-    }
-
+    // **Every command goes on the one lane** (step 7, 2026-09-06). Each
+    // used to run on a thread of its own, so that the ones that blocked on
+    // purpose — ending a multiply waited for the cycle boundary — would not
+    // hold up the snapshot; then the editing verbs went through a channel
+    // so a slider's burst could not execute out of order. Nothing in
+    // `dispatch` waits any more, so there is one channel for everything,
+    // shared with the console, and this thread is a producer on it. The
+    // snapshot keeps flowing whatever the engine is busy doing, because
+    // this thread never does the engine's work.
     let mut last_frames = sh.out_frames.load(Ordering::Acquire);
     let mut still = 0u32;
     // Peaks go out once per answer, as their own message before the next
@@ -127,27 +115,9 @@ fn talk(
                 // place that knows a command arrived rather than what it
                 // meant, and that is exactly the fact worth keeping.
                 println!("  [cmd] {}", cmd.trim());
-                // On its own thread, because some commands block on purpose.
-                // Ending a multiply waits for the cycle boundary to arrive —
-                // up to half a cycle — and committing waits for the input to
-                // drain. Running those here would freeze the state push for
-                // exactly as long, which is precisely when the display most
-                // needs to be moving. The snapshot must keep flowing whatever
-                // the engine is busy doing.
-                if is_edit(&cmd) {
-                    // A closed worker means this connection is on its way out.
-                    if tx.send(cmd.to_string()).is_err() {
-                        return Ok(());
-                    }
-                } else {
-                    let sh = sh.clone();
-                    std::thread::spawn(move || {
-                        let ack = dispatch(&sh, sr, &cmd);
-                        if !ack.is_empty() {
-                            println!("  [app] {}", ack);
-                            sh.note_ack(&ack);
-                        }
-                    });
+                // A closed lane means the daemon is on its way out.
+                if !lane.send(Caller::App, cmd.to_string()) {
+                    return Ok(());
                 }
             }
             Ok(tungstenite::Message::Close(_)) => {
@@ -505,13 +475,6 @@ fn db(x: f32) -> f64 {
     // Floored rather than -inf, because JSON has no infinity and a meter with a
     // bottom is more useful than one without.
     (20.0 * (x.max(1e-9) as f64).log10()).max(-120.0)
-}
-
-/// The verbs that must keep their order: the window, the rotation and the
-/// waveform. Spelled the way `dispatch` spells them, after the loop digits.
-fn is_edit(cmd: &str) -> bool {
-    let rest = cmd.trim().trim_start_matches(|c: char| c.is_ascii_digit());
-    ["in", "out", "win", "rot", "pk", "ly", "lw", "dp"].iter().any(|v| rest.starts_with(v))
 }
 
 #[cfg(test)]

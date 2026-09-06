@@ -2,14 +2,123 @@
 //! the front from — and `take`, which is a commit of the past.
 //!
 //! Split out of `engine.rs` on 2026-09-06 (REVIEW-daemon-debt step 1).
+//!
+//! **A close is two halves since step 7 (2026-09-06)**, and nothing in
+//! between blocks the lane. `close_take` is the fast half: it decides the
+//! frame the take closes as of, flips the phase to `Playing` — which is what
+//! stops the input writing — and files a `Closing` on the loop. `finish_take`
+//! is the slow half: once the input has drained past the flip it reads what
+//! was captured, shapes the layer and draws it. Between them the loop is
+//! `Playing` with its newest layer not yet counted, for the sixty
+//! milliseconds the drain takes; the lane holds any command addressed to
+//! that loop until the finish has run, so nothing can touch the layer that
+//! is being shaped. A quantised close whose boundary is still ahead is not a
+//! wait either: it is *filed* for the frame, on `close_at`, the road a sized
+//! take has always taken, and the lane's tick fires it there with the frame
+//! and lateness the press had. `commit` is the two halves in one blocking
+//! call — what it always was — for the callers that have no lane: the tests,
+//! the conformance replay and the self-test.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::sync::atomic::Ordering;
 
 use super::{CHANNELS, Phase, Shape};
+use super::cycle::{finish_multiply, multiply_fired};
+use super::lane::Caller;
 use super::shared::Shared;
 
+/// How long the input is given to drain past the flip before the layer is
+/// shaped: it trails the output by K, and a callback already in flight when
+/// the phase flipped may still be writing the last frames of the take.
+/// Without this the tail of every recording is missing, which is exactly the
+/// kind of fault that sounds like "feel". Sixty milliseconds is nearly three
+/// buffers at 1024 frames, which is more than one in flight could need.
+pub(crate) const DRAIN: Duration = Duration::from_millis(60);
+
+/// A close a press has filed for a frame still to come: a quantised first
+/// take waiting for its bar, or a multiply waiting for its cycle boundary.
+/// `close_at` on the loop says *when*; this says what the press was, so the
+/// close fires with the press's own frame and lateness — the layer is born on
+/// the pass the foot went down on, as it was when the press slept through
+/// the wait itself.
+#[derive(Clone, Copy)]
+pub(crate) struct Filed {
+    /// The output frame the press happened at, lateness already taken off.
+    pub(crate) pressed: i64,
+    /// How late the press was, in frames.
+    pub(crate) late: i64,
+    /// A multiply's whole cycles; zero for a take.
+    pub(crate) cycles: usize,
+    /// Who pressed, for the ack.
+    pub(crate) from: Caller,
+}
+
+/// A take that has flipped to `Playing` and is waiting for the input to
+/// drain before its layer is shaped. Everything `finish_take` needs to know
+/// that it could not read from the loop afterwards.
+pub(crate) struct Take {
+    /// The phase it was in: `First`, `Overdub` or `Multiply`.
+    pub(crate) was: Phase,
+    /// The frame the foot went down on: what the take closes as of.
+    pub(crate) closed_at: i64,
+    /// How late the press was, in frames; nought for a close nobody pressed.
+    pub(crate) late: i64,
+    /// A quantised first take's length, a whole number of grid cycles,
+    /// decided at the close and not measured afterwards.
+    pub(crate) quantised_len: Option<usize>,
+    /// A multiply's whole cycles, and how long its press waited for the
+    /// boundary, in frames.
+    pub(crate) cycles: usize,
+    pub(crate) waited: i64,
+    /// When the input will have drained.
+    pub(crate) due: Instant,
+    /// Who pressed, for the ack.
+    pub(crate) from: Caller,
+}
+
+/// Where a loop's close has got to. On `Loop` under a mutex the lane alone
+/// takes; the audio thread never reads it.
+pub(crate) enum Closing {
+    Filed(Filed),
+    Draining(Take),
+}
+
+/// What `close_take` and `end_multiply` answer.
+pub(crate) enum Closed {
+    /// Answered outright: a refusal, or a multiply stopped at the ceiling.
+    Said(String),
+    /// Filed for a frame still ahead, with what to say meanwhile.
+    Filed(String),
+    /// Flipped; the finish says the rest when the input has drained.
+    Draining,
+}
+
+/// Close loop `li`'s take, blocking through the boundary and the drain as
+/// this function always did: the fast half, then `settle`. For callers with
+/// no lane.
 pub(crate) fn commit(sh: &Shared, li: usize, sr: u32, late: i64) -> String {
+    // The frame the foot went down on.
+    let closed_at = sh.out_frames.load(Ordering::Acquire) as i64 - late.max(0);
+    match close_take(sh, li, sr, closed_at, late, Caller::Engine) {
+        Closed::Said(s) => s,
+        Closed::Filed(_) | Closed::Draining => settle(sh, li, sr).unwrap_or_default(),
+    }
+}
+
+/// The fast half of a close: decide the frame, flip the phase, file the rest.
+///
+/// `closed_at` is the frame the take closes as of — the press, less its
+/// lateness — and `late` is that lateness, which the finish spends: a free
+/// first take keeps what was played rather than what was captured, and an
+/// overdub unwraps what landed after the press. Neither sleeps here.
+pub(crate) fn close_take(
+    sh: &Shared,
+    li: usize,
+    sr: u32,
+    closed_at: i64,
+    late: i64,
+    from: Caller,
+) -> Closed {
     let lp = sh.lp(li);
     let state = lp.phase();
     if state != Phase::First && state != Phase::Overdub {
@@ -17,12 +126,8 @@ pub(crate) fn commit(sh: &Shared, li: usize, sr: u32, late: i64) -> String {
         // rather than a path — but it answers anyway. Returning nothing is how
         // fourteen verbs became invisible, and a guard is exactly the sort of
         // thing that stops being unreachable without anyone noticing.
-        return format!("loop {} is not recording.", li);
+        return Closed::Said(format!("loop {} is not recording.", li));
     }
-
-    // The frame the foot went down on. Taken before anything below sleeps —
-    // the quantised path waits for a boundary, which would move it.
-    let closed_at = sh.out_frames.load(Ordering::Acquire) as i64 - late.max(0);
 
     // A quantised first recording gets a length that is a whole number of grid
     // cycles, decided here rather than taken from what happened to be captured.
@@ -33,47 +138,162 @@ pub(crate) fn commit(sh: &Shared, li: usize, sr: u32, late: i64) -> String {
     //
     // The wait happens BEFORE the state flips, so the loop keeps recording up
     // to the boundary. Flipping first and waiting after would hand back a loop
-    // whose last fraction of a cycle is silence.
-    let quantised_len = if state == Phase::First && lp.quant.load(Ordering::Relaxed) {
+    // whose last fraction of a cycle is silence. **The wait is not a sleep**:
+    // the close is filed on `close_at` for the boundary frame, with this
+    // press's frame and lateness beside it, and the lane fires it there —
+    // through this function again, which then finds the boundary behind it.
+    let quantised = if state == Phase::First && lp.quant.load(Ordering::Relaxed) {
         sh.grid().and_then(|(_, glen)| {
             let from = lp.origin.load(Ordering::Acquire);
-            let cur = closed_at;
-            let elapsed = (cur - from).max(0) as f64;
+            let elapsed = (closed_at - from).max(0) as f64;
             let n = ((elapsed / glen as f64).round() as usize).max(1);
             let len = n * glen;
             if len > sh.max_frames {
                 println!("  {} grid cycles would exceed --max-secs; closing free.", n);
                 return None;
             }
-            let target = from + len as i64;
-            if target > cur {
-                println!(
-                    "  waiting {:.2} s for the grid boundary ({} cycle{}).",
-                    (target - cur) as f64 / sr as f64,
-                    n,
-                    if n == 1 { "" } else { "s" }
-                );
-                while (sh.out_frames.load(Ordering::Acquire) as i64) < target {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-            }
-            Some(len)
+            Some((n, len, from + len as i64))
         })
     } else {
         None
     };
+    if let Some((n, _, target)) = quantised {
+        let now = sh.out_frames.load(Ordering::Acquire) as i64;
+        if target > now {
+            lp.file_close(target, Filed { pressed: closed_at, late, cycles: 0, from });
+            return Closed::Filed(format!(
+                "loop {} closes on the bar in {:.2} s ({} cycle{}).",
+                li,
+                (target - now) as f64 / sr as f64,
+                n,
+                if n == 1 { "" } else { "s" }
+            ));
+        }
+    }
+
+    // The flip is what stops the input writing; the layer is shaped once the
+    // input has drained past it.
+    lp.enter(Phase::Playing, sh.out_frames.load(Ordering::Acquire) as i64);
+    lp.drain(Take {
+        was: state,
+        closed_at,
+        late,
+        quantised_len: quantised.map(|(_, len, _)| len),
+        cycles: 0,
+        waited: 0,
+        due: Instant::now() + DRAIN,
+        from,
+    });
+    Closed::Draining
+}
+
+/// Fire loop `li`'s close if its frame has come: what the closer thread did
+/// on every tick, now the lane's tick. Returns whether one fired.
+///
+/// **It re-checks before it acts, and that is the cancellation.** A foot that
+/// closes the take early leaves the phase at `Playing`; a clear leaves
+/// `close_at` unset; a new recording moves `rec_from`. Any of those and this
+/// finds the world it was told about is gone, and does nothing. There is no
+/// flag to forget to clear.
+pub(crate) fn fire_due(sh: &Shared, li: usize, sr: u32, now: i64) -> bool {
+    let lp = sh.lp(li);
+    let at = lp.close_at.load(Ordering::Acquire);
+    if at == i64::MIN || now < at {
+        return false;
+    }
+    // Taken before the check, so two ticks cannot both close one take.
+    if lp
+        .close_at
+        .compare_exchange(at, i64::MIN, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return false;
+    }
+    let filed = lp.take_filed();
+    match lp.phase() {
+        // A first take with a length, a one-pass overdub, or a quantised
+        // close a press filed: the first two set `close_at` alone and close
+        // as of the frame, as they always have — `late` is how far past it
+        // this tick woke, so the take closes at the length it was asked for
+        // rather than at the length the poll happened to notice. The third
+        // closes as of the press that filed it.
+        Phase::First | Phase::Overdub => {
+            let (closed_at, late, from) = match filed {
+                Some(f) => (f.pressed, f.late, f.from),
+                None => {
+                    let late = now - at;
+                    (sh.out_frames.load(Ordering::Acquire) as i64 - late.max(0), late, Caller::Engine)
+                }
+            };
+            if let Closed::Said(msg) = close_take(sh, li, sr, closed_at, late, from) {
+                println!("  {}", msg);
+            }
+            true
+        }
+        // A multiply a press filed for its cycle boundary.
+        Phase::Multiply => {
+            if let Some(f) = filed {
+                multiply_fired(sh, li, f, at);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Carry loop `li`'s close through, blocking: poll for a filed frame the way
+/// the old `commit` polled for its boundary, sleep the drain, finish. What
+/// the lane does without blocking, for callers that have no lane. The
+/// finish's ack, if there was a take to finish.
+pub(crate) fn settle(sh: &Shared, li: usize, sr: u32) -> Option<String> {
+    let lp = sh.lp(li);
+    loop {
+        match lp.closing_stage() {
+            None => return None,
+            Some(Stage::Filed(at)) => {
+                while (sh.out_frames.load(Ordering::Acquire) as i64) < at {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let now = sh.out_frames.load(Ordering::Acquire) as i64;
+                if !fire_due(sh, li, sr, now) {
+                    return None;
+                }
+            }
+            Some(Stage::Draining(due)) => {
+                let now = Instant::now();
+                if due > now {
+                    std::thread::sleep(due - now);
+                }
+                return lp.take_drained(Instant::now()).map(|t| finish_take(sh, li, sr, t));
+            }
+        }
+    }
+}
+
+/// Where a loop's close stands, for `settle` and the lane: the frame it is
+/// filed for, or the instant its drain is due.
+pub(crate) enum Stage {
+    Filed(i64),
+    Draining(Instant),
+}
+
+/// The slow half of a close: the input has drained, so read what was
+/// captured, shape the layer and draw it. The ack the press gets.
+pub(crate) fn finish_take(sh: &Shared, li: usize, sr: u32, t: Take) -> String {
+    if t.was == Phase::Multiply {
+        return finish_multiply(sh, li, sr, &t);
+    }
+    let lp = sh.lp(li);
+    let state = t.was;
+    let closed_at = t.closed_at;
+    let late = t.late;
+    let quantised_len = t.quantised_len;
 
     // Frames of continuation past this layer's end, filled in by whichever
     // branch below runs and handed to `set_layer_shape` at the bottom — one
     // place that decides a layer's shape, rather than two that each remember to
     // set part of it.
     let mut tail = 0usize;
-
-    // Let the input drain: it trails the output by K, so the last frames of the
-    // loop have not arrived yet. Without this the tail of every recording is
-    // missing, which is exactly the kind of fault that sounds like "feel".
-    lp.enter(Phase::Playing, sh.out_frames.load(Ordering::Acquire) as i64);
-    std::thread::sleep(Duration::from_millis(60));
 
     if state == Phase::First {
         let reached = lp.reached.load(Ordering::Acquire);

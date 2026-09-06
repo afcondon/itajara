@@ -4,7 +4,7 @@
 
 use std::sync::atomic::Ordering;
 
-use super::CHANNELS;
+use super::{Ack, CHANNELS};
 use super::cycle::tempo_of;
 use super::loop_state::Loop;
 use super::shared::Shared;
@@ -24,29 +24,34 @@ use super::shared::Shared;
 /// amphora, which keys an artefact by the hash of its content — a clock reading
 /// baked into the payload would make every save a different artefact and throw
 /// that away. When it was written is the filesystem's business.
-pub(crate) fn save_take(sh: &Shared, li: usize, sr: u32, name: &str) -> String {
+///
+/// The guards and the name are decided now; the writing is a `Job` for the
+/// slow thread (step 7), which reads the arena — nothing writes a loop that
+/// is not recording, and recording was refused above.
+pub(crate) fn save_take(sh: &Shared, li: usize, sr: u32, name: &str) -> Ack {
     let lp = sh.lp(li);
     if lp.is_recording() || lp.is_armed() {
-        return "finish the recording first — a layer still being written is half a thing.".into();
+        return Ack::Now("finish the recording first — a layer still being written is half a thing.".into());
     }
     if lp.n_layers.load(Ordering::Acquire) == 0 || lp.loop_len.load(Ordering::Acquire) == 0 {
-        return "nothing to save yet.".into();
+        return Ack::Now("nothing to save yet.".into());
     }
 
     let name = safe_name(name);
     let dir = sh.takes_dir.join(&name);
-    let (written, loop_len) = match write_take(sh, li, sr, &dir) {
-        Ok(w) => w,
-        Err(e) => return e,
-    };
-
-    format!(
-        "saved {} layer{} ({:.3} s) to {}",
-        written,
-        if written == 1 { "" } else { "s" },
-        loop_len as f64 / sr as f64,
-        dir.display()
-    )
+    Ack::Later(Box::new(move |sh: &Shared| {
+        let (written, loop_len) = match write_take(sh, li, sr, &dir) {
+            Ok(w) => w,
+            Err(e) => return e,
+        };
+        format!(
+            "saved {} layer{} ({:.3} s) to {}",
+            written,
+            if written == 1 { "" } else { "s" },
+            loop_len as f64 / sr as f64,
+            dir.display()
+        )
+    }))
 }
 
 /// One layer as it will be written: the file it goes to and what the
@@ -174,24 +179,30 @@ fn write_layers(sh: &Shared, li: usize, sr: u32, dir: &std::path::Path) -> Resul
 /// window, bars, tempo, source and the three things the render leaves out;
 /// per layer its gain, birth and whether it is in the mix. The per-loop
 /// `take.json` stays at version 1 so each folder reloads as a plain take.
-pub(crate) fn export_layers(sh: &Shared, sr: u32, name: &str) -> String {
+pub(crate) fn export_layers(sh: &Shared, sr: u32, name: &str) -> Ack {
     // Checked across every loop before anything is written, as `ex` does.
     for li in 0..sh.n_loops {
         let lp = sh.lp(li);
         if lp.is_recording() || lp.is_armed() {
-            return format!(
+            return Ack::Now(format!(
                 "loop {} is still recording — finish it before exporting the layers.",
                 li
-            );
+            ));
         }
     }
 
     let name = safe_name(name);
     let dir = sh.takes_dir.join(&name);
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        return format!("could not make {}: {}", dir.display(), e);
+        return Ack::Now(format!("could not make {}: {}", dir.display(), e));
     }
+    // The rest is reads of the arena and writes to disk: the slow thread's.
+    Ack::Later(Box::new(move |sh: &Shared| write_layer_set(sh, sr, dir)))
+}
 
+/// The writing half of `exl`: every loop that holds something, as a take
+/// each, and the set manifest.
+fn write_layer_set(sh: &Shared, sr: u32, dir: std::path::PathBuf) -> String {
     let quantum = f64::from_bits(sh.link_quantum.load(Ordering::Relaxed));
     let beats_per_bar = if quantum >= 1.0 { quantum } else { 4.0 };
 
@@ -319,26 +330,31 @@ pub(crate) fn export_layers(sh: &Shared, sr: u32, name: &str) -> String {
 /// what a Morphagene wants and what an Arbhar wants, and it should stay the one
 /// place that does. What only this daemon can supply is honest audio with its
 /// bar count attached, so that is all it supplies.
-pub(crate) fn export_set(sh: &Shared, sr: u32, name: &str) -> String {
+pub(crate) fn export_set(sh: &Shared, sr: u32, name: &str) -> Ack {
     // Checked across every loop before anything is written, rather than per
     // loop as it goes: a half-written folder that stopped at loop 5 because
     // loop 5 was recording is worse than one that never started.
     for li in 0..sh.n_loops {
         let lp = sh.lp(li);
         if lp.is_recording() || lp.is_armed() {
-            return format!(
+            return Ack::Now(format!(
                 "loop {} is still recording — finish it before exporting the set.",
                 li
-            );
+            ));
         }
     }
 
     let name = safe_name(name);
     let dir = sh.takes_dir.join(&name);
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        return format!("could not make {}: {}", dir.display(), e);
+        return Ack::Now(format!("could not make {}: {}", dir.display(), e));
     }
+    // The renders and the writes are the slow thread's.
+    Ack::Later(Box::new(move |sh: &Shared| write_set(sh, sr, dir)))
+}
 
+/// The rendering-and-writing half of `ex`.
+fn write_set(sh: &Shared, sr: u32, dir: std::path::PathBuf) -> String {
     let quantum = f64::from_bits(sh.link_quantum.load(Ordering::Relaxed));
     let beats_per_bar = if quantum >= 1.0 { quantum } else { 4.0 };
 

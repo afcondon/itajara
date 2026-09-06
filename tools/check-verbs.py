@@ -31,9 +31,10 @@ so the shadow check is gone and what is left is two comparisons:
       (reproduced below, short enough to keep in step), lands on a word in
       `VERBS`, both bare and with an argument — letters for the spellings
       `render` follows with a name, since only a name can run into its word;
-  (b) every word in `VERBS` has an arm in `dispatch`, and every arm is a word
-      in `VERBS` — the daemon's own unit test `the_table_and_the_match_agree`
-      holds the same thing from inside.
+  (b) every word in `VERBS` has an arm in `dispatch` (the `match` is in
+      `perform`, which `dispatch` calls), and every arm is a word in `VERBS`
+      — the daemon's own unit test `the_table_and_the_match_agree` holds the
+      same thing from inside.
 
 Run: make check-verbs   (or python3 tools/check-verbs.py)
 Exit 0 if every verb we can send has somewhere to land.
@@ -91,7 +92,9 @@ def arms():
     `""`, which is why only words made of letters count.
     """
     src = DISPATCH_RS.read_text()
-    start = src.index("pub fn dispatch(")
+    # The match lives in `perform` since step 7 (2026-09-06): `dispatch`
+    # and `dispatch_ack` are the two roads into it, and neither has arms.
+    start = src.index("fn perform(")
     end = re.search(r"\n(?:pub )?fn ", src[start + 1 :])
     body = src[start : start + 1 + end.start()] if end else src[start:]
     body = re.sub(r"//[^\n]*", lambda m: " " * len(m.group(0)), body)
