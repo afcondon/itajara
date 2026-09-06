@@ -16,7 +16,7 @@ use rand::SeedableRng;
 
 use crate::measure::{Width, choose_input, choose_output};
 
-use super::{ARM_REACH_MS, CHANNELS, db_to_mag, IDLE, MAX_FADE_MS, NO_ANCHOR, Opts, PLAYING, Source};
+use super::{ARM_REACH_MS, CHANNELS, db_to_mag, MAX_FADE_MS, NO_ANCHOR, Opts, Phase, Source};
 use super::callbacks;
 use super::control::{control_loop, spawn_closer};
 use super::edit::thread_blank;
@@ -274,7 +274,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         ring_len,
         in_peak: (0..sources.len()).map(|_| AtomicU32::new(0)).collect(),
         sources,
-        loops: (0..opts.loops).map(|_| Loop::new(opts.layers)).collect(),
+        loops: (0..opts.loops).map(|i| Loop::new(i, opts.layers)).collect(),
         selected: AtomicUsize::new(0),
         anchor: AtomicUsize::new(NO_ANCHOR),
         out_frames: AtomicUsize::new(0),
@@ -493,11 +493,14 @@ fn supervise<F>(
             let lp = sh.lp(li);
             let n = lp.n_layers.load(Ordering::Acquire);
             sh.zero_layer(li, n);
-            lp.state.set(if lp.loop_len.load(Ordering::Acquire) > 0 {
-                PLAYING
-            } else {
-                IDLE
-            });
+            lp.enter(
+                if lp.loop_len.load(Ordering::Acquire) > 0 {
+                    Phase::Playing
+                } else {
+                    Phase::Idle
+                },
+                sh.out_frames.load(Ordering::Acquire) as i64,
+            );
             eprintln!("  the recording in progress on loop {} was dropped — it would have had a gap", li);
         }
         for li in 0..sh.n_loops {

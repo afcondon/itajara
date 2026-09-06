@@ -7,7 +7,7 @@
 use std::time::Duration;
 use std::sync::atomic::Ordering;
 
-use super::{FIRE, IDLE, MAX_BARS, MAX_PERIOD, MULTIPLY, PLAYING, Shape};
+use super::{FIRE, MAX_BARS, MAX_PERIOD, Phase, Shape};
 use super::commit::{draw_layer, fill_from_ring};
 use super::shared::Shared;
 
@@ -43,7 +43,7 @@ pub(crate) fn multiply_start(sh: &Shared, li: usize, sr: u32) -> String {
     sh.zero_layer(li, layer);
     lp.rec_from.store(from, Ordering::Release);
     lp.reached.store(0, Ordering::Release);
-    lp.state.set(MULTIPLY);
+    lp.enter(Phase::Multiply, cur);
 
     // The part of this cycle already played is in the pre-roll; claim it, so
     // the multiply really does begin on the boundary.
@@ -85,7 +85,7 @@ pub(crate) fn multiply_end(sh: &Shared, li: usize, sr: u32) -> String {
     let n = ((elapsed / loop_len as f64).round() as usize).max(1);
     let new_len = n * loop_len;
     if new_len > sh.max_frames {
-        lp.state.set(PLAYING);
+        lp.enter(Phase::Playing, cur);
         return format!(
             "loop {}: {} cycles would be {:.1} s, past the --max-secs ceiling of {:.1} s. \
              Stopping at the old length.",
@@ -118,7 +118,7 @@ pub(crate) fn multiply_end(sh: &Shared, li: usize, sr: u32) -> String {
         }
     }
     // And let the input drain past it, since it trails by K.
-    lp.state.set(PLAYING);
+    lp.enter(Phase::Playing, sh.out_frames.load(Ordering::Acquire) as i64);
     std::thread::sleep(Duration::from_millis(60));
 
     // "With the original repeating underneath" now costs nothing. Every existing
@@ -676,7 +676,7 @@ pub(crate) fn free_length(sh: &Shared, li: usize, sr: u32) -> String {
     }
     lp.loop_len.store(0, Ordering::Release);
     lp.reached.store(0, Ordering::Release);
-    lp.state.set(IDLE);
+    lp.enter(Phase::Idle, sh.out_frames.load(Ordering::Acquire) as i64);
     // A take planned for the length just forgotten is no longer the take
     // that was planned; the ack promises the next recording sets a length,
     // and one still waiting for the grid would have recorded open-ended.

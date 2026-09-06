@@ -4,7 +4,7 @@
 
 use std::sync::atomic::Ordering;
 
-use super::{CHANNELS, PLAYING, Shape};
+use super::{CHANNELS, Phase, Shape};
 use super::shared::Shared;
 
 /// Copy loop `src`'s layers — all of them, or one — into loop `dst`, which must
@@ -108,7 +108,7 @@ pub(crate) fn copy_layers(sh: &Shared, dst: usize, src: usize, layer: Option<usi
     to.threaded.store(false, Ordering::Relaxed);
     to.n_layers.store(chosen.len(), Ordering::Release);
     to.redo_to.store(chosen.len(), Ordering::Release);
-    to.state.set(PLAYING);
+    to.enter(Phase::Playing, sh.out_frames.load(Ordering::Acquire) as i64);
 
     match layer {
         Some(k) => format!(

@@ -10,7 +10,7 @@ use rand::rngs::SmallRng;
 
 use crate::measure::signed_secs;
 
-use super::{ARMED, CHANNELS, ENV_BUCKETS, FIRE, FIRST, IDLE, MULTIPLY, OVERDUB, PLAYING};
+use super::{ARMED, CHANNELS, ENV_BUCKETS, FIRE, PLAYING, Phase};
 use super::shared::Shared;
 
 /// The output callback: mix every loop into one buffer, and stamp every
@@ -135,7 +135,7 @@ pub(super) fn output(
                         lp.rec_from.store(stamp, Ordering::Release);
                         lp.clear_rec_env();
                         lp.threaded.store(false, Ordering::Relaxed);
-                        lp.state.set(FIRST);
+                        lp.enter(Phase::First, stamp);
                         // If the length was known before a note was
                         // played, the close is known too. Arm it here
                         // and let `closer` do the work — an audio
@@ -170,11 +170,11 @@ pub(super) fn output(
                             },
                             Ordering::Release,
                         );
-                        lp.state.set(OVERDUB);
+                        lp.enter(Phase::Overdub, stamp);
                     }
                 }
             }
-            PLAYING => lp.state.set(PLAYING),
+            PLAYING => lp.enter(Phase::Playing, stamp),
             // **The one place `origin` moves.**
             //
             // Everywhere else in this engine a loop's zero is fixed
@@ -209,7 +209,6 @@ pub(super) fn output(
                     lp.muted.store(false, Ordering::Relaxed);
                 }
             }
-            IDLE => {}
             _ => {}
         }
     }
@@ -481,7 +480,7 @@ pub(super) fn input(
         return;
     };
     let lp = sh.lp(li);
-    let state = lp.state.get();
+    let state = lp.phase();
 
     let k = sh.k.load(Ordering::Acquire);
     let origin = lp.rec_from.load(Ordering::Acquire);
@@ -520,7 +519,7 @@ pub(super) fn input(
         if rel < 0 {
             continue;
         }
-        if state == FIRST || state == MULTIPLY {
+        if state == Phase::First || state == Phase::Multiply {
             // Linear. Its length becomes the cycle, so it must not
             // wrap — and it stops rather than overwriting.
             let pos = rel as usize;

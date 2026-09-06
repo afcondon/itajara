@@ -13,19 +13,17 @@ use std::sync::atomic::{
     Ordering,
 };
 use super::{
-    ARMED,
     AtomicU8Wrapper,
     ENV_BUCKETS,
-    FIRST,
-    IDLE,
     Layer,
-    MULTIPLY,
     NextTake,
-    OVERDUB,
-    PLAYING,
+    Phase,
     Shape,
     to_byte,
 };
+use super::phase::legal;
+#[cfg(not(test))]
+use super::phase::note_illegal;
 
 /// One loop: its layers, its cycle, and where it stands in it.
 ///
@@ -229,7 +227,11 @@ pub struct Loop {
     /// per frame — six loops times two `cos` calls is nothing at buffer rate and
     /// wasteful at sample rate.
     pub pan: AtomicUsize,
-    pub(crate) state: AtomicU8Wrapper,
+    /// Which loop this is, for the one log line `enter` can write.
+    pub(crate) index: usize,
+    /// The phase, as its byte. Private: `enter` is the only writer and
+    /// `phase` the reader, so the table in `phase.rs` sees every move.
+    state: AtomicU8Wrapper,
     /// The plan for the next recording and the transition that starts it:
     /// the phase asked for and its frame, a one-pass overdub, a level
     /// crossing's back-date. Set by the control thread, taken once by the
@@ -438,7 +440,7 @@ pub struct Loop {
 }
 
 impl Loop {
-    pub(crate) fn new(max_layers: usize) -> Self {
+    pub(crate) fn new(index: usize, max_layers: usize) -> Self {
         Loop {
             loop_len: AtomicUsize::new(0),
             cycles: AtomicUsize::new(0),
@@ -465,7 +467,8 @@ impl Loop {
             cfg_pend: AtomicBool::new(false),
             cfg_armed: AtomicBool::new(false),
             pan: AtomicUsize::new(64),
-            state: AtomicU8Wrapper::new(IDLE),
+            index,
+            state: AtomicU8Wrapper::new(Phase::Idle.as_u8()),
             next: NextTake::new(),
             quant: AtomicBool::new(false),
             reached: AtomicUsize::new(0),
@@ -735,8 +738,8 @@ impl Loop {
     ///
     /// Audio-side clearing — layer shapes, the envelope, the anchor — stays
     /// with the caller, which is the only thing holding `Shared`.
-    pub(crate) fn cleared(&self) {
-        self.state.set(IDLE);
+    pub(crate) fn cleared(&self, at: i64) {
+        self.enter(Phase::Idle, at);
         // An empty loop that is still silenced would refuse to record audibly
         // for a reason nothing on screen could explain.
         self.muted.store(false, Ordering::Relaxed);
@@ -853,33 +856,53 @@ impl Loop {
         }
     }
 
-    pub fn state_name(&self) -> &'static str {
-        match self.state.get() {
-            ARMED => "armed",
-            FIRST => "recordingFirst",
-            OVERDUB => "overdubbing",
-            MULTIPLY => "multiplying",
-            PLAYING => "playing",
-            _ => "idle",
+    /// The phase: one Acquire load of the byte, as the audio thread has
+    /// always read it.
+    pub(crate) fn phase(&self) -> Phase {
+        Phase::from_u8(self.state.get())
+    }
+
+    /// **The one place the phase is stored.** `at` is the output frame the
+    /// transition belongs to — the callback's stamp, or the control thread's
+    /// `out_frames` read at that moment — passed rather than read here, so
+    /// the callback remains the only stamper. A pair outside `phase::LEGAL`
+    /// is stored anyway and logged once, so behaviour is what it was and
+    /// the log names what the table missed; under test it panics, which is
+    /// how the table is enforced.
+    pub(crate) fn enter(&self, to: Phase, at: i64) {
+        let from = self.phase();
+        if !legal(from, to) {
+            #[cfg(test)]
+            panic!(
+                "loop {}: phase {} -> {} at frame {} is not in the table",
+                self.index, from, to, at
+            );
+            #[cfg(not(test))]
+            note_illegal(self.index, from, to, at);
         }
+        self.state.set(to.as_u8());
+    }
+
+    pub fn state_name(&self) -> &'static str {
+        self.phase().wire_word()
     }
     pub fn is_armed(&self) -> bool {
-        self.state.get() == ARMED
+        self.phase() == Phase::Armed
     }
     pub fn is_recording(&self) -> bool {
-        matches!(self.state.get(), FIRST | OVERDUB | MULTIPLY)
+        matches!(self.phase(), Phase::First | Phase::Overdub | Phase::Multiply)
     }
     /// How far a first take (or a multiply) has got, in frames: what a
     /// progress bar is drawn from while the loop has no length yet. Zero
     /// when nothing linear is being written — an overdub's progress is the
     /// play position, which the snapshot already carries.
     pub fn rec_frames(&self, now: i64) -> usize {
-        match self.state.get() {
-            FIRST | MULTIPLY => self.reached.load(Ordering::Relaxed),
+        match self.phase() {
+            Phase::First | Phase::Multiply => self.reached.load(Ordering::Relaxed),
             // A one-pass overdub knows its close, so how far it has come is
             // the loop's length less what is left. Any other overdub has no
             // "how far": it goes round until told to stop, and reports zero.
-            OVERDUB => match self.close_at.load(Ordering::Acquire) {
+            Phase::Overdub => match self.close_at.load(Ordering::Acquire) {
                 i64::MIN => 0,
                 at => {
                     let len = self.loop_len.load(Ordering::Acquire) as i64;

@@ -29,7 +29,7 @@ fn rig(max_frames: usize) -> Shared {
         ring_len: 1,
         in_peak: vec![AtomicU32::new(0)],
         sources: vec![Source::mono("test", 0)],
-        loops: (0..DEFAULT_LOOPS).map(|_| Loop::new(DEFAULT_LAYERS)).collect(),
+        loops: (0..DEFAULT_LOOPS).map(|i| Loop::new(i, DEFAULT_LAYERS)).collect(),
         selected: AtomicUsize::new(0),
         anchor: AtomicUsize::new(NO_ANCHOR),
         out_frames: AtomicUsize::new(0),
@@ -516,7 +516,7 @@ fn nothing_recorded_renders_to_nothing() {
 
 /// A loop with its position zero at output frame zero.
 fn at_origin() -> Loop {
-    let lp = Loop::new(DEFAULT_LAYERS);
+    let lp = Loop::new(0, DEFAULT_LAYERS);
     lp.origin.store(0, Ordering::Relaxed);
     lp
 }
@@ -576,7 +576,7 @@ fn a_loop_that_ran_long_gives_back_a_slower_tempo() {
 /// was recorded rather than inventing one.
 #[test]
 fn a_stereo_loop_is_balanced_and_a_folded_one_is_panned() {
-    let lp = Loop::new(DEFAULT_LAYERS);
+    let lp = Loop::new(0, DEFAULT_LAYERS);
 
     // Centre. A balance leaves both sides alone; a pan is 3 dB down on each
     // because it is spending the difference on placing a mono signal.
@@ -624,14 +624,14 @@ fn a_one_channel_source_reads_the_same_input_twice() {
 
 #[test]
 fn clearing_forgets_the_length_and_the_bar_count_together() {
-    let lp = Loop::new(DEFAULT_LAYERS);
+    let lp = Loop::new(0, DEFAULT_LAYERS);
     // Sized and empty, as `len<n>` leaves it: four bars of a two-second bar.
     lp.loop_len.store(4 * 96_000, Ordering::Release);
     lp.cycles.store(4, Ordering::Release);
     lp.rec_len.store(4 * 96_000, Ordering::Release);
     lp.close_at.store(1_234_567, Ordering::Release);
 
-    lp.cleared();
+    lp.cleared(0);
 
     assert_eq!(lp.loop_len.load(Ordering::Acquire), 0, "kept its length");
     assert_eq!(
@@ -648,7 +648,7 @@ fn clearing_forgets_the_length_and_the_bar_count_together() {
     );
     // And is indistinguishable from one that was never touched, on every
     // field that describes a length.
-    let fresh = Loop::new(DEFAULT_LAYERS);
+    let fresh = Loop::new(0, DEFAULT_LAYERS);
     assert_eq!(
         lp.loop_len.load(Ordering::Acquire),
         fresh.loop_len.load(Ordering::Acquire)
@@ -785,7 +785,7 @@ fn a_cleared_slot_has_nobody_s_habits() {
     lp.n_layers.store(3, Ordering::Release);
     lp.loop_len.store(LEN, Ordering::Release);
 
-    lp.cleared();
+    lp.cleared(0);
 
     assert_eq!(lp.speed(), 1.0, "speed");
     assert!(!lp.pendulum.load(Ordering::Relaxed), "pendulum");
@@ -1287,3 +1287,4 @@ fn a_blank_tape_does_not_survive_a_clear() {
     // And recording into the cleared slot is a first take, open-ended.
     assert_eq!(dispatch(&sh, 1000, "0r"), "loop 0 recording.");
 }
+

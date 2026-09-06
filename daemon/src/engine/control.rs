@@ -8,7 +8,7 @@ use std::time::Duration;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use super::{FIRST, OVERDUB};
+use super::Phase;
 use super::commit::commit;
 use super::dispatch::dispatch;
 use super::shared::Shared;
@@ -101,7 +101,7 @@ pub(crate) fn spawn_closer(sh: Arc<Shared>, sr: u32) {
             }
             // A first take with a length, or a one-pass overdub: both set
             // `close_at`, nothing else does.
-            if !matches!(lp.state.get(), FIRST | OVERDUB) {
+            if !matches!(lp.phase(), Phase::First | Phase::Overdub) {
                 continue;
             }
             // `late` is how far past the target we woke, so `commit` closes the

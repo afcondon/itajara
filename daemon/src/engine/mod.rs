@@ -52,6 +52,7 @@ mod guards;
 mod layer;
 mod loop_state;
 mod next_take;
+mod phase;
 mod run;
 mod selftest;
 mod shared;
@@ -61,6 +62,7 @@ pub use dispatch::dispatch;
 pub use loop_state::Loop;
 pub(crate) use layer::Layer;
 pub(crate) use next_take::NextTake;
+pub(crate) use phase::Phase;
 pub use run::run;
 pub use shared::Shared;
 pub(crate) use run::resolve_residual;
@@ -101,31 +103,14 @@ pub const MAX_BARS: usize = 32;
 
 pub const MAX_PERIOD: usize = 32;
 
-/// Transport states, as a `u8` because the audio thread reads it every buffer.
-const IDLE: u8 = 0;
+/// Transport states are `Phase` (`phase.rs`), stored as its byte because the
+/// audio thread reads it every buffer. The two below are the byte as a
+/// *request* — the value `NextTake` carries until the output callback turns
+/// it into a phase — where `FIRE` also lives, which is a request and never a
+/// state. Same values as the phases they name.
+const ARMED: u8 = Phase::Armed as u8;
 
-/// Waiting for the output callback to stamp the exact frame recording begins.
-///
-/// Also, and for a long time only nominally, the state a **level-armed** loop
-/// sits in while it listens. `ARMED` was written as a request value and never
-/// once set as a state — `is_armed()` could not return true, and the `armed`
-/// field has been going out in every snapshot reading `false` since the socket
-/// existed. Level-arm is what it was always describing: the loop has claimed
-/// the input and is not yet writing to it.
-const ARMED: u8 = 1;
-
-/// Recording the first loop: linear, and its length becomes the cycle.
-const FIRST: u8 = 2;
-
-/// Recording an overdub: modular, into a buffer one cycle long.
-const OVERDUB: u8 = 3;
-
-/// Playing, not recording.
-const PLAYING: u8 = 4;
-
-/// Recording across several cycles, to make the loop an integer multiple longer
-/// with what is already there repeating underneath. The EDP's `Multiply`.
-const MULTIPLY: u8 = 5;
+const PLAYING: u8 = Phase::Playing as u8;
 
 /// A request only, never a state: play one pass from the top and stop.
 const FIRE: u8 = 6;

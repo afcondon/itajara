@@ -17,13 +17,9 @@ use super::{
     fade_words,
     fb_words,
     FIRE,
-    FIRST,
-    IDLE,
     MAX_FADE_MS,
-    MULTIPLY,
     odds_words,
-    OVERDUB,
-    PLAYING,
+    Phase,
     Shape,
     thresh_words,
     tone_words,
@@ -288,9 +284,9 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 sh.peaks_seq.fetch_add(1, Ordering::Release);
                 return format!("peaks for loop {}: {} buckets over {:.3} s.", li, buckets, len as f64 / sr as f64);
             }
-            "x" => match lp.state.get() {
-                MULTIPLY => return multiply_end(sh, li, sr),
-                FIRST | OVERDUB => return format!("loop {} is still recording — finish that first.", li),
+            "x" => match lp.phase() {
+                Phase::Multiply => return multiply_end(sh, li, sr),
+                Phase::First | Phase::Overdub => return format!("loop {} is still recording — finish that first.", li),
                 _ => {
                     if let Some(other) = busy_elsewhere(sh, li) {
                         return other;
@@ -301,16 +297,16 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     return multiply_start(sh, li, sr);
                 }
             },
-            "r" => match lp.state.get() {
-                MULTIPLY => return multiply_end(sh, li, sr),
-                FIRST | OVERDUB => return commit(sh, li, sr, late),
+            "r" => match lp.phase() {
+                Phase::Multiply => return multiply_end(sh, li, sr),
+                Phase::First | Phase::Overdub => return commit(sh, li, sr, late),
                 // A second press while the loop is waiting for a sound takes the
                 // arm back. There has to be a way out: the sound may never come,
                 // and a loop holding the input for a recording that will never
                 // begin locks out all five others. Asked before the claim checks
                 // below, because it is this loop's own claim being released.
-                ARMED => {
-                    lp.state.set(IDLE);
+                Phase::Armed => {
+                    lp.enter(Phase::Idle, sh.out_frames.load(Ordering::Acquire) as i64);
                     // The whole plan goes, not just the back-date: a crossing
                     // found a buffer ago may already have set the request,
                     // and a cancelled arm that still recorded would be the
@@ -358,7 +354,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                         if lp.level_arm.load(Ordering::Relaxed) {
                             lp.started_late.store(0, Ordering::Release);
                             lp.next.listen();
-                            lp.state.set(ARMED);
+                            lp.enter(Phase::Armed, sh.out_frames.load(Ordering::Acquire) as i64);
                             return format!(
                                 "loop {} is listening — it starts when something goes over {}.",
                                 li,
@@ -1134,7 +1130,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 // the wait, or the loop keeps the input for a recording that can
                 // no longer begin.
                 if !on && lp.is_armed() {
-                    lp.state.set(IDLE);
+                    lp.enter(Phase::Idle, sh.out_frames.load(Ordering::Acquire) as i64);
                     lp.next.clear();
                 }
                 return if on {
@@ -1334,7 +1330,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 );
             }
             "c" => {
-                lp.cleared();
+                lp.cleared(sh.out_frames.load(Ordering::Acquire) as i64);
                 lp.win_in.store(0, Ordering::Relaxed);
                 lp.win_out.store(0, Ordering::Relaxed);
                 lp.rot.store(0, Ordering::Relaxed);
@@ -1416,11 +1412,11 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     lp.n_layers.load(Ordering::Acquire),
                     len,
                     len as f64 / sr as f64,
-                    match lp.state.get() {
-                        FIRST => "recording first",
-                        OVERDUB => "overdubbing",
-                        MULTIPLY => "multiplying",
-                        PLAYING => "playing",
+                    match lp.phase() {
+                        Phase::First => "recording first",
+                        Phase::Overdub => "overdubbing",
+                        Phase::Multiply => "multiplying",
+                        Phase::Playing => "playing",
                         _ => "idle",
                     },
                     sh.k.load(Ordering::Acquire),

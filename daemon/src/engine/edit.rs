@@ -5,7 +5,7 @@
 
 use std::sync::atomic::Ordering;
 
-use super::{PLAYING, Shape};
+use super::{Phase, Shape};
 use super::shared::Shared;
 
 /// Thread an empty tape of `len` frames onto loop `li`: one blank layer,
@@ -20,7 +20,7 @@ pub fn thread_blank(sh: &Shared, li: usize, len: usize) {
     lp.set_layer_shape(0, Shape { len, tail: 0, born: 0 });
     lp.n_layers.store(1, Ordering::Release);
     lp.threaded.store(true, Ordering::Relaxed);
-    lp.state.set(PLAYING);
+    lp.enter(Phase::Playing, now);
     sh.rebuild_env(li, 0);
 }
 

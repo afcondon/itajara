@@ -6,13 +6,13 @@
 use std::time::Duration;
 use std::sync::atomic::Ordering;
 
-use super::{CHANNELS, FIRST, OVERDUB, PLAYING, Shape};
+use super::{CHANNELS, Phase, Shape};
 use super::shared::Shared;
 
 pub(crate) fn commit(sh: &Shared, li: usize, sr: u32, late: i64) -> String {
     let lp = sh.lp(li);
-    let state = lp.state.get();
-    if state != FIRST && state != OVERDUB {
+    let state = lp.phase();
+    if state != Phase::First && state != Phase::Overdub {
         // The callers only reach here from FIRST or OVERDUB, so this is a guard
         // rather than a path — but it answers anyway. Returning nothing is how
         // fourteen verbs became invisible, and a guard is exactly the sort of
@@ -34,7 +34,7 @@ pub(crate) fn commit(sh: &Shared, li: usize, sr: u32, late: i64) -> String {
     // The wait happens BEFORE the state flips, so the loop keeps recording up
     // to the boundary. Flipping first and waiting after would hand back a loop
     // whose last fraction of a cycle is silence.
-    let quantised_len = if state == FIRST && lp.quant.load(Ordering::Relaxed) {
+    let quantised_len = if state == Phase::First && lp.quant.load(Ordering::Relaxed) {
         sh.grid().and_then(|(_, glen)| {
             let from = lp.origin.load(Ordering::Acquire);
             let cur = closed_at;
@@ -72,10 +72,10 @@ pub(crate) fn commit(sh: &Shared, li: usize, sr: u32, late: i64) -> String {
     // Let the input drain: it trails the output by K, so the last frames of the
     // loop have not arrived yet. Without this the tail of every recording is
     // missing, which is exactly the kind of fault that sounds like "feel".
-    lp.state.set(PLAYING);
+    lp.enter(Phase::Playing, sh.out_frames.load(Ordering::Acquire) as i64);
     std::thread::sleep(Duration::from_millis(60));
 
-    if state == FIRST {
+    if state == Phase::First {
         let reached = lp.reached.load(Ordering::Acquire);
         // **Asked for beats counted.** Taken rather than read, so a take that is
         // closed by a foot instead of by `closer` cannot leave it armed for the
@@ -251,7 +251,7 @@ pub(crate) fn commit(sh: &Shared, li: usize, sr: u32, late: i64) -> String {
     // the end, as the continuation, the same place a first recording keeps it.
     // The material is not discarded, because it is the thing a seamless loop is
     // made of.
-    if state == OVERDUB && late > 0 {
+    if state == Phase::Overdub && late > 0 {
         let layer = lp.n_layers.load(Ordering::Acquire);
         let len = lp.loop_len.load(Ordering::Acquire);
         let k = sh.k.load(Ordering::Acquire);
@@ -305,7 +305,7 @@ pub(crate) fn commit(sh: &Shared, li: usize, sr: u32, late: i64) -> String {
     // has to be redrawn because the audio under it moved, which is the one
     // thing this branch still owes.
     if lp.revox.load(Ordering::Relaxed) {
-        lp.state.set(PLAYING);
+        lp.enter(Phase::Playing, sh.out_frames.load(Ordering::Acquire) as i64);
         sh.rebuild_env(li, 0);
         return format!(
             "loop {} over the tape: {:.3} s, one layer.",
@@ -502,7 +502,7 @@ pub(crate) fn take(sh: &Shared, li: usize, sr: u32, secs: f64, late: i64) -> Str
         // rest fits around. A compare-exchange, so later calls are no-ops.
         sh.claim_anchor(li);
         lp.origin.store(from_out, Ordering::Release);
-        lp.state.set(PLAYING);
+        lp.enter(Phase::Playing, sh.out_frames.load(Ordering::Acquire) as i64);
         headline = format!(
             "loop {} took the last {:.3} s as the {}: {} frames, {:.1} bpm if that is one bar of 4/4",
             li,
