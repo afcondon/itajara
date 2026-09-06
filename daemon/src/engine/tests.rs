@@ -6,6 +6,8 @@ use rand::{Rng, SeedableRng};
 
 use super::*;
 use super::cycle::tempo_of;
+use super::dispatch::dispatch_ack;
+use super::lane::Caller;
 
 const LEN: usize = 1000;
 
@@ -1515,4 +1517,160 @@ fn every_store_site_pair_is_in_the_table_and_the_table_has_no_more() {
 fn an_illegal_transition_panics_under_test() {
     let lp = Loop::new(0, DEFAULT_LAYERS);
     lp.enter(Phase::Overdub, 0);
+}
+
+/// **A quantised close fires at the same frame, as of the same press.**
+///
+/// Until step 7 the press slept in `commit` until the boundary and then
+/// flipped, with `closed_at` taken *before* the sleep. So, by hand from that
+/// code: a loop on a 400-frame bar whose take began at 400 and whose press
+/// came at 1100 measured 700 frames, rounded to 2 cycles, a length of 800,
+/// and a boundary at 1200; it flipped on the first 5 ms poll past 1200; the
+/// layer was 800 long with the 100 frames the input had gone on to write
+/// as its tail, born on pass 0 — `pass_index(1100, 800)` — and counted as
+/// two bars. This drives the new road — file, fire at the frame, drain,
+/// finish — and pins every one of those numbers. A press after the boundary
+/// (1250) closes now, as it did, and is born on pass 1, as it was.
+#[test]
+fn a_quantised_close_fires_at_the_frame_the_sleep_would_have_woken_on() {
+    use std::time::Instant;
+    let sh = rig(2000);
+    let sr = 1000;
+    sh.link_bar_frames.store(400, Ordering::Relaxed);
+    sh.link_bar_origin.store(0, Ordering::Relaxed);
+    sh.out_frames.store(50, Ordering::Release);
+    for li in [0, 1] {
+        assert!(dispatch(&sh, sr, &format!("{}g1", li)).contains("follows the grid"));
+    }
+    // Loop 0: the press before the boundary.
+    assert!(dispatch(&sh, sr, "0r").contains("starts on the grid"));
+    callbacks::stamp(&sh, 0, 400, 16);
+    let lp = sh.lp(0);
+    assert_eq!(lp.phase(), Phase::First);
+    assert_eq!(lp.origin.load(Ordering::Acquire), 400);
+    lp.reached.store(900, Ordering::Release);
+    sh.out_frames.store(1100, Ordering::Release);
+    let ack = match dispatch_ack(&sh, sr, "0r@0", Caller::Engine) {
+        Ack::Now(s) => s,
+        Ack::Later(_) => panic!("a close is not a job"),
+    };
+    assert_eq!(ack, "loop 0 closes on the bar in 0.10 s (2 cycles).");
+    assert_eq!(lp.phase(), Phase::First, "still recording up to the boundary");
+    assert_eq!(lp.close_at.load(Ordering::Acquire), 1200, "filed for the boundary");
+    assert!(matches!(lp.closing_stage(), Some(commit::Stage::Filed(1200))));
+    // A press again while it waits files the same close again, and a
+    // tick before the frame does nothing.
+    assert!(!commit::fire_due(&sh, 0, sr, 1199));
+    assert_eq!(lp.phase(), Phase::First);
+    // The tick that finds the frame gone by: the closer woke 3 frames late.
+    sh.out_frames.store(1203, Ordering::Release);
+    assert!(commit::fire_due(&sh, 0, sr, 1203));
+    assert_eq!(lp.phase(), Phase::Playing, "flipped at the boundary");
+    assert_eq!(lp.close_at.load(Ordering::Acquire), i64::MIN);
+    assert_eq!(lp.n_layers.load(Ordering::Acquire), 0, "the layer waits for the drain");
+    let t = lp
+        .take_drained(Instant::now() + commit::DRAIN)
+        .expect("a take draining");
+    assert_eq!(t.closed_at, 1100, "as of the press, not the boundary");
+    assert_eq!(t.quantised_len, Some(800));
+    assert_eq!(t.was, Phase::First);
+    assert_eq!(commit::finish_take(&sh, 0, sr, t), "loop 0 committed: 0.800 s, 1 layer playing.");
+    assert_eq!(lp.loop_len.load(Ordering::Acquire), 800);
+    assert_eq!(lp.n_layers.load(Ordering::Acquire), 1);
+    assert_eq!(lp.layers[0].len.load(Ordering::Acquire), 800);
+    assert_eq!(lp.layers[0].tail.load(Ordering::Acquire), 100);
+    assert_eq!(lp.layers[0].born.load(Ordering::Acquire), 0, "born on the press's pass");
+    assert_eq!(lp.origin.load(Ordering::Acquire), 400, "no pre-roll on a quantised take");
+    assert_eq!(lp.cycles.load(Ordering::Acquire), 2);
+    assert!(lp.closing_stage().is_none());
+
+    // Loop 1: the press after the boundary closes now, born a pass on.
+    sh.out_frames.store(50, Ordering::Release);
+    assert!(dispatch(&sh, sr, "1r").contains("starts on the grid"));
+    callbacks::stamp(&sh, 1, 400, 16);
+    let lp = sh.lp(1);
+    lp.reached.store(900, Ordering::Release);
+    sh.out_frames.store(1250, Ordering::Release);
+    assert!(matches!(dispatch_ack(&sh, sr, "1r@0", Caller::Engine), Ack::Now(s) if s.is_empty()), "nothing to say until the drain");
+    assert_eq!(lp.phase(), Phase::Playing);
+    assert!(matches!(lp.closing_stage(), Some(commit::Stage::Draining(_))));
+    let t = lp.take_drained(Instant::now() + commit::DRAIN).unwrap();
+    assert_eq!(t.closed_at, 1250);
+    assert_eq!(commit::finish_take(&sh, 1, sr, t), "loop 1 committed: 0.800 s, 1 layer playing.");
+    assert_eq!(lp.layers[0].born.load(Ordering::Acquire), 1);
+}
+
+/// **A clear cancels a filed close**, where it used to race a sleeping
+/// commit: the frame comes, and nothing fires.
+#[test]
+fn clearing_a_loop_drops_the_close_it_had_filed() {
+    let sh = rig(2000);
+    let sr = 1000;
+    sh.link_bar_frames.store(400, Ordering::Relaxed);
+    sh.out_frames.store(50, Ordering::Release);
+    dispatch(&sh, sr, "0g1");
+    dispatch(&sh, sr, "0r");
+    callbacks::stamp(&sh, 0, 400, 16);
+    sh.out_frames.store(1100, Ordering::Release);
+    dispatch_ack(&sh, sr, "0r", Caller::Engine);
+    assert_eq!(sh.lp(0).close_at.load(Ordering::Acquire), 1200);
+    assert!(dispatch(&sh, sr, "0c").contains("cleared"));
+    assert_eq!(sh.lp(0).close_at.load(Ordering::Acquire), i64::MIN);
+    assert!(sh.lp(0).closing_stage().is_none());
+    assert!(!commit::fire_due(&sh, 0, sr, 1300));
+    assert_eq!(sh.lp(0).phase(), Phase::Idle);
+}
+
+/// **A multiply ends at the same boundary, with the cycles the press
+/// counted.** By hand from the old `multiply_end`: a 400-frame loop
+/// multiplied from 800, pressed at 1500, measured 700, rounded to 2, waited
+/// for 1600, flipped on the first poll past it, then set `origin` to 800
+/// and the length to 800 and laid the layer 800 long, born on pass 0, with
+/// the wait in the ack. Same numbers, new road.
+#[test]
+fn a_multiply_ends_at_the_boundary_the_sleep_would_have_woken_on() {
+    use std::time::Instant;
+    let sh = rig(2000);
+    let sr = 1000;
+    one_layer_loop(&sh, 0, 400, 0.25);
+    let lp = sh.lp(0);
+    lp.enter(Phase::Playing, 0);
+    sh.out_frames.store(850, Ordering::Release);
+    assert!(dispatch(&sh, sr, "0x").contains("multiplying"));
+    assert_eq!(lp.phase(), Phase::Multiply);
+    assert_eq!(lp.rec_from.load(Ordering::Acquire), 800);
+    sh.out_frames.store(1500, Ordering::Release);
+    let ack = match dispatch_ack(&sh, sr, "0x", Caller::Engine) {
+        Ack::Now(s) => s,
+        Ack::Later(_) => panic!("a multiply end is not a job"),
+    };
+    assert_eq!(ack, "loop 0 x2 ends on the boundary in 0.10 s.");
+    assert_eq!(lp.phase(), Phase::Multiply, "still recording up to the boundary");
+    assert_eq!(lp.close_at.load(Ordering::Acquire), 1600);
+    assert!(!commit::fire_due(&sh, 0, sr, 1599));
+    sh.out_frames.store(1604, Ordering::Release);
+    assert!(commit::fire_due(&sh, 0, sr, 1604));
+    assert_eq!(lp.phase(), Phase::Playing);
+    assert_eq!(lp.loop_len.load(Ordering::Acquire), 400, "the length waits for the drain");
+    let t = lp.take_drained(Instant::now() + commit::DRAIN).unwrap();
+    assert_eq!(t.was, Phase::Multiply);
+    assert_eq!(t.cycles, 2);
+    assert_eq!(t.waited, 100);
+    assert_eq!(
+        commit::finish_take(&sh, 0, sr, t),
+        "loop 0 x2: now 0.800 s (2 cycles of 0.400 s) (rounded up, waited 0.10 s for the boundary) — 2 layers playing."
+    );
+    assert_eq!(lp.loop_len.load(Ordering::Acquire), 800);
+    assert_eq!(lp.origin.load(Ordering::Acquire), 800);
+    assert_eq!(lp.n_layers.load(Ordering::Acquire), 2);
+    assert_eq!(lp.layer_shape(1), (800, 1, 0));
+    assert_eq!(lp.layers[1].born.load(Ordering::Acquire), 0);
+    // And the same press past the boundary: no wait, no note.
+    sh.out_frames.store(2450, Ordering::Release);
+    assert!(dispatch(&sh, sr, "0x").contains("multiplying"));
+    sh.out_frames.store(2450 + 800 + 50, Ordering::Release);
+    assert!(matches!(dispatch_ack(&sh, sr, "0x", Caller::Engine), Ack::Now(s) if s.is_empty()));
+    let t = lp.take_drained(Instant::now() + commit::DRAIN).unwrap();
+    assert_eq!(t.waited, 0);
+    assert!(commit::finish_take(&sh, 0, sr, t).ends_with("(1 cycles of 0.800 s) — 3 layers playing."));
 }
