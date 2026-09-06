@@ -424,6 +424,40 @@ net; none changes behaviour; each can land alone.
    `state` still carries the byte's word, not the artifact's id.
 6. **One serialiser per type, and drop the top-level duplication** once the
    pedalboard reads `loops[i]` (it already can).
+
+   **Step 6 — done 2026-09-06**, branch `daemon/snapshot`. Three emitters
+   in `ws.rs`, one per type on the wire, each called once per instance:
+   `layer_json(&Layer) -> String` (step 3's, untouched), `loop_json(sh:
+   &Shared, li: usize, sr: u32, cur: i64) -> String` for one entry of
+   `loops`, and `rig_json(sh: &Shared, sr: u32, alive: bool) -> String`
+   for the top level — rig-level fields and `loops` only. `snapshot` is
+   `rig_json` by its old name, for `talk` and the tests. **Removed from the
+   top level**, the nine fields that repeated the selected loop's: `state`,
+   `layers`, `loopFrames`, `loopSecs`, `pos`, `phase`, `armed`,
+   `recording`, `shapes`. Every retained field keeps its name, order and
+   number formatting; `selected` stays, as the loop a console verb with no
+   loop digit addresses (no surface reads it). Nothing per-loop or
+   per-layer moved: `a_loop_is_written_as_it_always_was` holds `loop_json`
+   to loop 2 of the fixture and to an empty slot, both captured from the
+   old emitter at c6b52b2, beside `a_layer_is_written_as_it_always_was`;
+   `the_rig_is_only_the_rig` holds the top level's key set, refuses the
+   nine, and checks `loops` is `loop_json` once per loop in order. The
+   snapshot hash moved, deliberately and in its own commit,
+   `5753937055540615430` → `3623273475480213597`, because the top level
+   shrank; the render hash `1122269442957771175` did not. Readers:
+   `LooperState` in `client/src/Foreign/LooperSocket.purs` lost the nine
+   (`phaseOf` stays row-polymorphic, its comment now history); the surface
+   needed no change (Edit and Wave already read `loops[focus]`);
+   `check-snapshot.py` lost its `top-level shapes[0]` location, three
+   places now; the pedalboard's `Component.Looper.Page` — `transport`,
+   `readout`, `nextPress`, `phaseBar` — takes the focused loop from `loops`
+   where it read the top level (its hand-written stubs in `Twister.purs`
+   and `test/Main.purs` are `LoopState` values and lost nothing); the
+   Friends needed no source change and was rebundled. Against the running
+   daemon, still on the old wire, `check-snapshot.py` prints OK with the
+   nine listed as "sent but not declared". 65 tests, both checkers, zero
+   warnings. Deploy order: pages first — they read only what both wires
+   carry — the daemon after.
 7. **One control lane.** `dispatch` runs on three threads unlocked. It is
    probably safe because everything is atomic, but "probably" is the word;
    the edit worker already exists — route presses through a second worker
