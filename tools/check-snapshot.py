@@ -46,18 +46,20 @@ DEFAULT_URL = "ws://127.0.0.1:23028"
 
 # One entry per PLACE the type appears on the wire, which is not the same as one
 # entry per type — and getting that wrong made the first version of this tool
-# useless. `LayerShape` describes two objects: the selected loop's shapes
+# useless. `LayerShape` used to describe two objects: the selected loop's shapes
 # repeated at the top level, and each loop's own. Those were serialised by two
 # different pieces of Rust, which is the entire bug this exists to catch, and a
 # check that looked only at the per-loop copy passed happily while the top-level
 # one was missing three fields. Verified by breaking the daemon on purpose: with
 # one location the check said OK, with both it fails.
 #
-# So: every location, named, and a type that appears in N places is checked N
-# times. If a new array of these ever appears in the snapshot, add it here.
+# The top-level copy went on 2026-09-06 (review step 6): the rig object now
+# carries rig-level fields and `loops` only, and each type has one emitter in
+# `ws.rs`. So there are three places again — but the rule stands: every
+# location, named, and a type that appears in N places is checked N times. If a
+# new array of these ever appears in the snapshot, add it here.
 LOCATIONS = [
     ("LooperState", "top level", lambda s: s),
-    ("LayerShape", "top-level shapes[0]", lambda s: s["shapes"][0]),
     ("LoopState", "loops[0]", lambda s: s["loops"][0]),
     ("LayerShape", "loops[0].shapes[0]", lambda s: s["loops"][0]["shapes"][0]),
 ]

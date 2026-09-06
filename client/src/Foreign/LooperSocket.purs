@@ -50,7 +50,7 @@ import Effect (Effect)
 -- | `itajara/src/engine.rs` matches on the engine's own state constants and can
 -- | return exactly these six words. This type mirrors that function, and if one
 -- | changes the other must — the same contract `LooperState` already has with
--- | `snapshot` in `ws.rs`.
+-- | `rig_json` in `ws.rs`.
 data LoopPhase
   -- | Waiting for a sound rather than for a foot. Empty by definition: this is
   -- | what a loop is while it waits to stop being empty.
@@ -107,11 +107,11 @@ allPhases = [ Armed, RecordingFirst, Overdubbing, Multiplying, Playing, Idle ]
 -- | diagnostics readout in `Component.App`, which prints `state` raw — the one
 -- | place an unrecognised word is still visible after this function has run.
 -- |
--- | Row-polymorphic because the snapshot carries `state` twice: once per loop,
--- | and once at the top level where the flat legacy fields still describe
--- | whichever loop is selected. Those flat fields are on their way out, and
--- | taking the row rather than the record means this does not have to care
--- | when they go.
+-- | Row-polymorphic: it asks only for `state`, so it reads a `LoopState` and
+-- | any other record that carries the word. (Until 2026-09-06 the snapshot
+-- | carried `state` twice — once per loop and once at the top level, where
+-- | flat legacy fields described whichever loop was selected. Those went with
+-- | review step 6; taking the row meant this did not have to care.)
 phaseOf :: forall r. { state :: String | r } -> LoopPhase
 phaseOf st = case st.state of
   "armed" -> Armed
@@ -121,16 +121,18 @@ phaseOf st = case st.state of
   "playing" -> Playing
   _ -> Idle
 
--- | What the daemon says about itself. Mirrors `snapshot` in `itajara/src/ws.rs`
--- | field for field; if one changes the other must.
+-- | What the daemon says about itself: the rig, and its loops. Mirrors
+-- | `rig_json` in `itajara/daemon/src/ws.rs` field for field; if one changes
+-- | the other must.
+-- |
+-- | **Rig-level facts only.** Nothing here describes one loop; that is
+-- | `LoopState`, one per entry of `loops`. (Until 2026-09-06 nine of the
+-- | selected loop's fields — `state`, `layers`, `loopFrames`, `loopSecs`,
+-- | `pos`, `phase`, `armed`, `recording`, `shapes` — were repeated at this
+-- | level for a page written when there was one loop. Every surface reads
+-- | `loops[i]` now, and the daemon stopped sending them: review step 6.)
 type LooperState =
-  { state :: String
-  , layers :: Int
-  , maxLayers :: Int
-  , loopFrames :: Int
-  , loopSecs :: Number
-  , pos :: Int
-  , phase :: Number
+  { maxLayers :: Int
   , sampleRate :: Int
   , inDb :: Number
   , outDb :: Number
@@ -141,8 +143,6 @@ type LooperState =
   -- | one loop — and reported since 2026-08-25 because a control that sets it
   -- | needs to be able to show it.
   , armDb :: Number
-  , armed :: Boolean
-  , recording :: Boolean
   , calibrated :: Boolean
   , k :: Int
   -- | Whether the audio callbacks are actually running. A connected socket says
@@ -151,15 +151,6 @@ type LooperState =
   , audioAlive :: Boolean
   , deviceLost :: Boolean
   , reopens :: Int
-  -- | Each layer's own length and where it sounds. The daemon has sent these
-  -- | since layers stopped being tiled into the cycle; this type went on
-  -- | claiming to mirror the snapshot without them, which is how a field the
-  -- | display most needs stayed invisible.
-  -- |
-  -- | `period` and `phase` are the whole reason a take is stored rather than
-  -- | flattened: two layers of the same length look identical until you can see
-  -- | that one of them sounds one cycle in four.
-  , shapes :: Array LayerShape
   -- | What the last command had to say, and a counter that moves when it
   -- | changes. Carried in every snapshot rather than sent once, so a reload
   -- | still sees it — and so a client can tell a fresh ack from the same one
@@ -196,14 +187,9 @@ type LooperState =
   -- | rather than numbered, because "input 2" on an encoder is the loop
   -- | numbering problem all over again.
   , sources :: Array { name :: String, mono :: Boolean }
-  -- | All six loops, and which one the flat fields above describe.
-  -- |
-  -- | The duplication is deliberate and meant to be temporary. Everything above
-  -- | describes ONE loop, because there was one when this type was written;
-  -- | those fields now report whichever loop is selected, so this page keeps
-  -- | working untouched while the six-loop display is built against `loops`.
-  -- | Two new things at once is how you end up debugging both and understanding
-  -- | neither. When the new display lands, the flat fields go.
+  -- | The loop a console verb with no loop digit addresses. Once also the
+  -- | loop whose fields were repeated at this level; now only that, and no
+  -- | surface reads it — a page keeps its own focus.
   , selected :: Int
   , nLoops :: Int
   -- | **The shape**, with `nLoops`, `maxLayers` and `sampleRate`: everything
@@ -340,6 +326,10 @@ type LoopState =
   -- | Frames a first take (or multiply) has laid so far; zero otherwise. An
   -- | overdub's progress is `pos`.
   , recFrames :: Int
+  -- | Each layer's own length and where it sounds. `period` and `phase` are
+  -- | the whole reason a take is stored rather than flattened: two layers of
+  -- | the same length look identical until you can see that one of them
+  -- | sounds one cycle in four.
   , shapes :: Array LayerShape
   }
 
