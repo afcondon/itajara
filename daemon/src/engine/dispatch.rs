@@ -42,7 +42,7 @@ use super::cycle::{
 };
 use super::edit::{schedule_restart, thread_blank};
 use super::export::{export_layers, export_set, save_take};
-use super::guards::{busy_elsewhere, not_plain, not_writable};
+use super::guards::{busy_elsewhere, not_plain, not_writable, still_recording};
 use super::shared::Shared;
 use super::verb::tokenize;
 
@@ -288,6 +288,12 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 Phase::Multiply => return multiply_end(sh, li, sr),
                 Phase::First | Phase::Overdub => return format!("loop {} is still recording — finish that first.", li),
                 _ => {
+                    // A loop listening for a sound, or waiting for the bar,
+                    // is about to record; a multiply here abandoned the arm
+                    // and left its request standing (step 5b).
+                    if let Some(no) = still_recording(lp, li) {
+                        return no;
+                    }
                     if let Some(other) = busy_elsewhere(sh, li) {
                         return other;
                     }
@@ -306,12 +312,9 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 // begin locks out all five others. Asked before the claim checks
                 // below, because it is this loop's own claim being released.
                 Phase::Armed => {
-                    lp.enter(Phase::Idle, sh.out_frames.load(Ordering::Acquire) as i64);
-                    // The whole plan goes, not just the back-date: a crossing
-                    // found a buffer ago may already have set the request,
-                    // and a cancelled arm that still recorded would be the
-                    // worst kind of surprise.
-                    lp.next.clear();
+                    // Back to what the loop held — playing if it has layers,
+                    // idle if not — with the whole plan gone. See `disarm`.
+                    lp.disarm(sh.out_frames.load(Ordering::Acquire) as i64);
                     return format!("loop {} has stopped listening.", li);
                 }
                 _ => {
@@ -491,6 +494,12 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 }
             }
             "t" => {
+                // The past goes into the next layer, and on a loop that is
+                // listening, waiting or writing that layer is the one being
+                // written (step 5b).
+                if let Some(no) = still_recording(lp, li) {
+                    return no;
+                }
                 let secs = arg.parse::<f64>().unwrap_or(8.0);
                 return take(sh, li, sr, secs, late);
             }
@@ -869,6 +878,12 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 return format!("loop {} redone: {} layers playing.", li, n + 1);
             }
             "u" => {
+                // Not under a live write, and not under a wait for one: the
+                // layer that would go is the one being written, or the one
+                // the take is about to be laid on (step 5b).
+                if let Some(no) = still_recording(lp, li) {
+                    return no;
+                }
                 let n = lp.n_layers.load(Ordering::Acquire);
                 if n == 0 {
                     return format!("loop {} has nothing to undo.", li);
@@ -969,8 +984,8 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     Ok(_) => return format!("a tape wants a length in seconds, not {}.", arg),
                     _ => return format!("a tape wants a length in seconds, not `{}`.", arg),
                 };
-                if lp.is_recording() {
-                    return format!("loop {} is recording; finish that first.", li);
+                if let Some(no) = still_recording(lp, li) {
+                    return no;
                 }
                 // **Threaded, not recorded** is the test — not the layer count,
                 // which cannot tell them apart because a threaded tape has one
@@ -1130,8 +1145,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 // the wait, or the loop keeps the input for a recording that can
                 // no longer begin.
                 if !on && lp.is_armed() {
-                    lp.enter(Phase::Idle, sh.out_frames.load(Ordering::Acquire) as i64);
-                    lp.next.clear();
+                    lp.disarm(sh.out_frames.load(Ordering::Acquire) as i64);
                 }
                 return if on {
                     format!(

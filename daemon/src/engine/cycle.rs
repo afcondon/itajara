@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 
 use super::{FIRE, MAX_BARS, MAX_PERIOD, Phase, Shape};
 use super::commit::{draw_layer, fill_from_ring};
+use super::guards::still_recording;
 use super::shared::Shared;
 
 /// Begin a multiply: keep the loop playing and start recording across it.
@@ -263,8 +264,8 @@ pub(crate) fn place_at(sh: &Shared, li: usize, n: usize) -> String {
 /// wants every layer the same length. Resizing material stays `len`'s job.
 pub(crate) fn fix_next(sh: &Shared, li: usize, sr: u32, secs: f64) -> String {
     let lp = sh.lp(li);
-    if lp.is_recording() || lp.is_armed() {
-        return format!("loop {} is recording; finish that first.", li);
+    if let Some(no) = still_recording(lp, li) {
+        return no;
     }
     // With material in it the length is settled, and "fix the next take" can
     // only mean one thing: another layer of that length, one pass, closing
@@ -322,8 +323,8 @@ pub(crate) fn set_bars(sh: &Shared, li: usize, sr: u32, n: usize) -> String {
     if n < 1 || n > MAX_BARS {
         return format!("a loop wants 1 to {} bars, not {}.", MAX_BARS, n);
     }
-    if lp.is_recording() {
-        return format!("loop {} is recording; finish that first.", li);
+    if let Some(no) = still_recording(lp, li) {
+        return no;
     }
     let layers = lp.n_layers.load(Ordering::Acquire);
     let anchor = sh.anchor.load(Ordering::Acquire);
@@ -659,9 +660,14 @@ pub(crate) fn dense(sh: &Shared, li: usize) -> String {
 ///
 /// Refused while layers exist, because the length is what they are addressed by.
 /// Clearing it under them would leave a mix reading positions in a cycle that no
-/// longer has a size.
+/// longer has a size. And refused while a take is on the way or under way
+/// (step 5b): a sized first take mid-write, or one waiting for the bar, is a
+/// take *of that length*, and forgetting it under them is `c`'s job.
 pub(crate) fn free_length(sh: &Shared, li: usize, sr: u32) -> String {
     let lp = sh.lp(li);
+    if let Some(no) = still_recording(lp, li) {
+        return no;
+    }
     let n = lp.n_layers.load(Ordering::Acquire);
     if n > 0 {
         return format!(

@@ -31,12 +31,16 @@
 //! loop, forgetting a sized-and-empty loop's length, re-threading a tape,
 //! `commit`'s revox branch storing `Playing` a second time — and are legal.
 //!
-//! Several legal pairs are reachable only because a verb is not guarded
-//! against the phase it finds: `x`, `z`, `blank` and `t` on an `Armed`
-//! loop, `z` and `t` on a `First` one. They are in the table because the
-//! code produces them today; each is marked, and the Glassbox artifact
+//! Six pairs used to be in the table only because a verb was not guarded
+//! against the phase it found: `x`, `z`, `blank` and `t` on an `Armed`
+//! loop, `z` and `t` on a `First` one. The Glassbox artifact
 //! (`purescript-glassbox/core/machines/itajara-loop.json`) refuses every
-//! one of them. Step 5b reconciles; this step records.
+//! one of them, and since step 5b (2026-09-06) so does the daemon —
+//! `guards::still_recording` — so `Armed → Multiply` is gone and the other
+//! five pairs are produced by their honest sites alone. The same step made
+//! a cancelled arm return to what the loop held (`Loop::disarm`), which is
+//! where `Armed → Playing` comes from now. `engine/conformance.rs` replays
+//! the artifact's table through the engine to hold the two together.
 //!
 //! An illegal pair is not an error in release: `enter` logs it once per
 //! pair and performs the store anyway, so the daemon behaves exactly as it
@@ -125,7 +129,8 @@ impl fmt::Display for Phase {
 }
 
 /// Every `(from, to)` pair a store site produces, with the site that
-/// produces it. See the module comment for what is left out and why.
+/// produces it — 21 rows since step 5b, 22 before. See the module comment
+/// for what is left out and why.
 pub(crate) const LEGAL: &[(Phase, Phase)] = &[
     // -- from Idle --------------------------------------------------------
     // `Loop::cleared` (`c`) on a loop that is already idle; `free_length`
@@ -142,25 +147,21 @@ pub(crate) const LEGAL: &[(Phase, Phase)] = &[
     // `multiply_start` (`x`) on a sized-and-empty loop.
     (Phase::Idle, Phase::Multiply),
     // -- from Armed -------------------------------------------------------
-    // `dispatch` `r` taking the arm back; `lev0` under an arm; `cleared`
-    // (`c`); `free_length` (`z`) — `z` is not guarded against an arm.
+    // `disarm` — `r` taking the arm back, `lev0` under one — on a loop with
+    // no layers; `cleared` (`c`).
     (Phase::Armed, Phase::Idle),
     // output callback: the level crossing's request on a loop with no layers.
     (Phase::Armed, Phase::First),
     // output callback: the level crossing's request on a loop with layers.
     (Phase::Armed, Phase::Overdub),
-    // `take` (`t`) and `thread_blank` (`blank`) on a listening loop — neither
-    // is guarded against an arm; the artifact refuses both.
+    // `disarm` on a loop with layers, a threaded tape included: it was
+    // playing before it listened, and is again.
     (Phase::Armed, Phase::Playing),
-    // `multiply_start` (`x`) on a listening loop — abandons the arm; the
-    // artifact refuses it.
-    (Phase::Armed, Phase::Multiply),
     // -- from First -------------------------------------------------------
-    // `cleared` (`c`); `supervise` on a lost device, no length yet;
-    // `free_length` (`z`) mid-take on a sized first take — unguarded.
+    // `cleared` (`c`); `supervise` on a lost device, no length yet.
     (Phase::First, Phase::Idle),
     // `commit` (`r`, or the closer); `supervise` on a lost device with a
-    // length; `take` (`t`) mid-take — unguarded.
+    // length.
     (Phase::First, Phase::Playing),
     // -- from Overdub -----------------------------------------------------
     // `cleared` (`c`).

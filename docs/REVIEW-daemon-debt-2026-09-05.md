@@ -350,6 +350,78 @@ net; none changes behaviour; each can land alone.
    multiply → `Playing`, `lost` from an open first take → `Idle` and from
    an overdub or multiply → `Playing`, `sized` on `multiply` →
    `Multiply`.
+
+   **Step 5b — done 2026-09-06**, branch `daemon/conformance`. The
+   artifact's table, replayed through the engine. New
+   `engine/conformance.rs` (test-only): `artifact_state(sh, li)` reads the
+   byte, the plan and the content facts into one of the artifact's twelve
+   states — the three the byte cannot separate are `sized` (`Idle` with a
+   length, *or* `Playing` with a length and no layers), `armed-for-grid`
+   (`Idle` or `Playing` with an `ARMED` request filed for a boundary) and
+   `armed-by-sound` (`Armed` with one) — and `rig_in` builds loop 0 in a
+   vector's `from` state under its facts and config, by the road the
+   daemon takes to it (`r`, `x`, `blank` through `dispatch`; the crossing
+   through `callbacks::crossed`; the stamp through `callbacks::stamp`,
+   which is the callback's consumption of the plan lifted into a function
+   so a test can run it at a chosen frame; `closed` as the closer does
+   it; `lost` as `run::drop_takes`, lifted the same way). The vectors are
+   read from `$GLASSBOX_DIR` or the sibling checkout; absent, the test
+   says so and passes. Commands are printed, not asserted.
+
+   **Replayed 339 / skipped 14 of 353.** The 14 all say `has-layers` and
+   not `has-length`, which no loop can be — a layer implies a length —
+   and are the only skip. Every other assignment is realised, including
+   the two the engine cannot hold independently (`writable` false makes
+   `plain` false; `plain` false on an empty loop makes it unwritable),
+   which the guard order makes harmless and the doc comment records.
+
+   Every mismatch the first run found, one decision each:
+
+   | mismatch | decision | where |
+   |---|---|---|
+   | `x` on `Armed` started a multiply; artifact refuses `still-recording` | daemon: refuse | `dispatch` `x`, via `guards::still_recording` |
+   | `u` on an armed, waiting or recording loop took a layer; artifact refuses | daemon: refuse | `dispatch` `u` |
+   | `z` on `Armed`, `First`, or a grid wait forgot the length; artifact refuses | daemon: refuse (reverses step 4's "`z` drops a grid wait"; `c` still does) | `cycle::free_length` |
+   | `blank`, `len` on `Armed` or a grid wait; `fix` on a grid wait; artifact refuses | daemon: refuse | `dispatch` `blank`, `cycle::set_bars`, `cycle::fix_next` |
+   | `t` on `Armed`, `First`, `Overdub`, `Multiply` or a grid wait wrote the live layer (no artifact event) | daemon: refuse | `dispatch` `t` |
+   | cancelled level arm (`r` again, `lev0`) went to `Idle` with its layers still summing; artifact returns to what the loop held | daemon: `Loop::disarm` — layers (a tape has one) → `Playing`, none → `Idle`, length kept | `loop_state.rs`, both sites |
+   | lost device on a sized first take: code `Playing` + length + no layers, artifact `sized` | mapping: that *is* `sized`; no change | `artifact_state` |
+   | undo of the last layer: code keeps `Playing`, artifact `sized` | mapping; no change | `artifact_state` |
+   | `armed-by-level --sound--> armed-for-grid` under quantise: the engine keeps the byte `Armed`, still holds the input, `r` cancels it and `lost` drops the crossing and leaves it listening — none of which `armed-for-grid` does | artifact: twelfth state `armed-by-sound`; `armed-for-grid` is entered with no layers only, so its exits read `has-length` alone | `itajara-loop.json`, notes |
+   | `len` on `playing`/`tape` with no bar: engine refuses `no-grid`, artifact `stay` | artifact: `not has-grid → no-grid` first, as on `empty` and `sized` | `itajara-loop.json` |
+   | `lost` from a listening loop whose crossing was found: 5a's "the code drops the crossing" | artifact: `armed-by-sound --lost--> armed-by-level`, which is what the code does | `itajara-loop.json` |
+
+   Refusals added (verb × state → tag, ack): `x`, `u`, `z`, `blank`,
+   `len`, `t` on `Armed` → `still-recording`, "loop N is listening for a
+   sound; finish that first."; the same six plus `fix` on a loop waiting
+   for the bar → `still-recording`, "loop N is waiting for the bar; finish
+   that first."; `u`, `z`, `t` on `First`/`Overdub`/`Multiply` →
+   `still-recording`, "loop N is recording; finish that first." (the
+   sentence `fix`, `blank` and `len` already used). `fix` on `Armed` now
+   says "listening for a sound" where it said "is recording".
+
+   `phase::LEGAL` is 21 rows: `Armed → Multiply` is gone, and `Armed →
+   Playing` is now `disarm` on a loop with layers rather than `t`/`blank`
+   unguarded. The site-pair test drives the cancel both ways and asserts
+   the four verbs refuse and leave the phase standing. Tests: 63 (60 +
+   the replay + the mapping + the `t` guard), both hash constants
+   unchanged, both checkers, zero warnings. Glassbox side, on
+   `glassbox-rs`: artifact amended (notes say why), 353 vectors (was 328),
+   renders regenerated, `spago test` and `cargo test` pass.
+
+   **What remains unmapped.** `input-held-elsewhere` is `wants_input`,
+   which does not count a loop waiting for the bar: two loops can be
+   filed for the same boundary and the second records nothing — the bug
+   `busy_elsewhere` exists to refuse, one state short. `quantised`
+   without a bar records now; the artifact's `record` rule reads
+   `quantised` alone, so the replay supplies a bar whenever it is set.
+   `multiplying` entered from `sized` and then lost comes back `sized`
+   (no layers) where the artifact says `playing`; the vectors build
+   `multiplying` from `playing`, so it is not reached. `len` on material
+   that would shrink below a layer refuses with an argument the machine
+   does not know. The pedalboard's PureScript half (`Socket.phaseOf`,
+   `Machine.perform`) is not yet held to the same file; the snapshot's
+   `state` still carries the byte's word, not the artifact's id.
 6. **One serialiser per type, and drop the top-level duplication** once the
    pedalboard reads `loops[i]` (it already can).
 7. **One control lane.** `dispatch` runs on three threads unlocked. It is

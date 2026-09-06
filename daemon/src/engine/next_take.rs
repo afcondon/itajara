@@ -148,6 +148,14 @@ impl NextTake {
         self.request.get() != 0
     }
 
+    /// Whether a take is filed for a frame still to come: an `ARMED` request
+    /// with a deadline. What "waiting for the bar" is, to the guards and to
+    /// the conformance mapping — a request with no deadline is consumed on
+    /// the next buffer and is not a wait.
+    pub(crate) fn waits_for_boundary(&self) -> bool {
+        self.request.get() == ARMED && self.request_at.load(Ordering::Acquire) != i64::MIN
+    }
+
     /// Whether there is no plan at all: nothing pending, no frame, no
     /// back-date, no one-pass. What `clear` leaves.
     #[cfg(test)]

@@ -483,29 +483,7 @@ fn supervise<F>(
             device_name
         );
 
-        // A recording that spans an outage has a hole in it, and a hole in a
-        // layer is worse than no layer: it will be discovered later, in the
-        // mix, with no way to tell what went wrong. So abandon whatever was
-        // being captured and keep only what was already committed.
-        // Whichever loop held the input, and every loop's pending request: an
-        // outage invalidates all of them, not just the one that was recording.
-        if let Some(li) = sh.recording_loop() {
-            let lp = sh.lp(li);
-            let n = lp.n_layers.load(Ordering::Acquire);
-            sh.zero_layer(li, n);
-            lp.enter(
-                if lp.loop_len.load(Ordering::Acquire) > 0 {
-                    Phase::Playing
-                } else {
-                    Phase::Idle
-                },
-                sh.out_frames.load(Ordering::Acquire) as i64,
-            );
-            eprintln!("  the recording in progress on loop {} was dropped — it would have had a gap", li);
-        }
-        for li in 0..sh.n_loops {
-            sh.lp(li).next.clear();
-        }
+        drop_takes(sh);
 
         // Both streams restart independently, so the input↔output pairing has
         // to be established again from scratch. Everything downstream reads
@@ -543,6 +521,37 @@ fn supervise<F>(
                 Err(_) => continue,
             }
         }
+    }
+}
+
+/// What an outage does to the takes.
+///
+/// A recording that spans an outage has a hole in it, and a hole in a layer
+/// is worse than no layer: it will be discovered later, in the mix, with no
+/// way to tell what went wrong. So abandon whatever was being captured and
+/// keep only what was already committed. Whichever loop held the input, and
+/// every loop's pending request: an outage invalidates all of them, not just
+/// the one that was recording. A loop merely listening keeps listening.
+///
+/// Its own function since 2026-09-06 (step 5b), so the conformance replay
+/// can deliver `lost` the way the supervisor does.
+pub(super) fn drop_takes(sh: &Shared) {
+    if let Some(li) = sh.recording_loop() {
+        let lp = sh.lp(li);
+        let n = lp.n_layers.load(Ordering::Acquire);
+        sh.zero_layer(li, n);
+        lp.enter(
+            if lp.loop_len.load(Ordering::Acquire) > 0 {
+                Phase::Playing
+            } else {
+                Phase::Idle
+            },
+            sh.out_frames.load(Ordering::Acquire) as i64,
+        );
+        eprintln!("  the recording in progress on loop {} was dropped — it would have had a gap", li);
+    }
+    for li in 0..sh.n_loops {
+        sh.lp(li).next.clear();
     }
 }
 

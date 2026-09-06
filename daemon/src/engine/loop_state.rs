@@ -883,6 +883,29 @@ impl Loop {
         self.state.set(to.as_u8());
     }
 
+    /// Take a level arm back: the loop returns to what it held before it
+    /// listened, and the plan goes whole.
+    ///
+    /// **To what it held, not to idle** (2026-09-06, REVIEW-daemon-debt step
+    /// 5b). Both roads out of `Armed` — the second `r`, and `lev0` under the
+    /// wait — stored `Idle`, so a loop with layers that was armed from
+    /// `Playing` came back reading idle with its layers intact and the mixer
+    /// still summing them: a byte saying one thing about a loop doing
+    /// another. The artifact returns to tape, playing, sized or empty by what
+    /// is in the loop, and the byte is derived the same way here: layers (a
+    /// threaded tape has one) mean it was playing; none mean it was idle,
+    /// with whatever length it had kept.
+    ///
+    /// The whole plan goes, not just the back-date: a crossing found a buffer
+    /// ago may already have set the request, and a cancelled arm that still
+    /// recorded would be the worst kind of surprise.
+    pub(crate) fn disarm(&self, at: i64) {
+        let held = self.n_layers.load(Ordering::Acquire) > 0
+            || self.threaded.load(Ordering::Relaxed);
+        self.enter(if held { Phase::Playing } else { Phase::Idle }, at);
+        self.next.clear();
+    }
+
     pub fn state_name(&self) -> &'static str {
         self.phase().wire_word()
     }

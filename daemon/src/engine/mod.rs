@@ -78,6 +78,12 @@ pub(crate) use run::resolve_residual;
 #[cfg(test)]
 pub(crate) mod tests;
 
+/// The phase machine held to the Glassbox artifact: the mapping from the
+/// engine's byte-and-facts to the artifact's states, and the replay of its
+/// conformance vectors.
+#[cfg(test)]
+mod conformance;
+
 /// How deep a loop can be stacked.
 ///
 /// **Four, down from eight on 2026-08-29**, because the arena is

@@ -7,6 +7,29 @@ use std::sync::atomic::Ordering;
 use super::loop_state::Loop;
 use super::shared::Shared;
 
+/// Refuse a verb that would change a loop while a take is on the way or under
+/// way: listening for a sound, waiting for the bar, or writing.
+///
+/// Added 2026-09-06 (REVIEW-daemon-debt step 5b), where the Glassbox artifact
+/// refuses `still-recording` and the daemon had no guard: `u`, `x`, `z`,
+/// `blank`, `len` and `t` on an armed loop, `u`, `z` and `t` on a recording
+/// one, and all of them on a loop waiting for the bar. A press there
+/// decremented a layer under a live write, forgot a length mid-take, or
+/// abandoned an arm to start a multiply. The three sentences say which wait
+/// it is; every one ends the way `fix`'s refusal always has.
+pub(crate) fn still_recording(lp: &Loop, li: usize) -> Option<String> {
+    if lp.next.waits_for_boundary() {
+        return Some(format!("loop {} is waiting for the bar; finish that first.", li));
+    }
+    if lp.is_armed() {
+        return Some(format!("loop {} is listening for a sound; finish that first.", li));
+    }
+    if lp.is_recording() {
+        return Some(format!("loop {} is recording; finish that first.", li));
+    }
+    None
+}
+
 /// Refuse a claim on the input when another loop already has it.
 ///
 /// There is one converter, so only one loop can record at a time. Without this

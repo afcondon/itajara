@@ -77,140 +77,7 @@ pub(super) fn output(
         // only changes at a pass boundary, so a `powi` per layer per
         // buffer is free where per frame would not be.
         lp.age(base as i64);
-        // The one place the plan is consumed. `take` peeks rather
-        // than takes until the request is due inside this buffer or
-        // has already gone by, and hands over every field of the
-        // plan at once.
-        let Some(plan) = lp.next.take((base + frames) as i64) else {
-            continue;
-        };
-        let at = plan.at;
-        // The frame the transition belongs to. `origin` and
-        // `rec_from` are stamped with this rather than with the
-        // buffer start, which is what makes the alignment exact:
-        // the flag flips at buffer granularity, but everything
-        // downstream reads the frame.
-        let stamp = if at == i64::MIN { base as i64 } else { at.max(base as i64) };
-        match plan.phase {
-            ARMED => {
-                lp.reached.store(0, Ordering::Release);
-                lp.rec_reached.store(0, Ordering::Release);
-                // A level-armed recording knows the frame the sound
-                // crossed the threshold, and that frame is earlier
-                // than the one this request can be stamped at — the
-                // crossing is found on the input thread. Hand the
-                // difference to `started_late`, which is the same
-                // road a late footswitch already travels: `commit`
-                // shifts `origin` back by it and fills the front
-                // from the ring.
-                match plan.arm_from {
-                    i64::MIN => {}
-                    want => lp
-                        .started_late
-                        .store((stamp - want).max(0), Ordering::Release),
-                }
-                let n = lp.n_layers.load(Ordering::Acquire);
-                if n < sh.max_layers {
-                    // **Layers, not length.** This asked whether the
-                    // loop had a length, which was the same question
-                    // while the only way to have one was to have
-                    // recorded one. A loop can now be *sized and
-                    // empty* — told how many bars it is before
-                    // anything is played into it — and that is a
-                    // first recording with a length, not an overdub
-                    // of nothing.
-                    if n == 0 {
-                        // Only the first recording lays down the grid.
-                        // Re-stamping origin on every arm would drag the
-                        // whole loop to position zero the instant you
-                        // hit record — playback reads origin too. The
-                        // self-test cannot catch that, because both
-                        // sides move together.
-                        //
-                        // Safe on a sized-and-empty loop for the same
-                        // reason it is unsafe elsewhere: there is no
-                        // audio, so there is nothing for zero to move
-                        // away from.
-                        lp.origin.store(stamp, Ordering::Release);
-                        lp.rec_from.store(stamp, Ordering::Release);
-                        lp.clear_rec_env();
-                        lp.threaded.store(false, Ordering::Relaxed);
-                        lp.enter(Phase::First, stamp);
-                        // If the length was known before a note was
-                        // played, the close is known too. Arm it here
-                        // and let `closer` do the work — an audio
-                        // callback must not be the thing that draws a
-                        // layer.
-                        let want = lp.loop_len.load(Ordering::Acquire);
-                        lp.rec_len.store(want, Ordering::Release);
-                        lp.close_at.store(
-                            if want > 0 { stamp + want as i64 } else { i64::MIN },
-                            Ordering::Release,
-                        );
-                    } else {
-                        // An overdub is modular against the existing
-                        // grid, so it records from the same reference
-                        // the loop plays from.
-                        lp.rec_from
-                            .store(lp.origin.load(Ordering::Acquire), Ordering::Release);
-                        lp.clear_rec_env();
-                        lp.threaded.store(false, Ordering::Relaxed);
-                        // A one-pass overdub knows its close the
-                        // moment it starts: one loop length on.
-                        // Any other overdub clears the deadline,
-                        // because a `close_at` left from a pass
-                        // that was closed early by hand would
-                        // otherwise fire on this one.
-                        let len = lp.loop_len.load(Ordering::Acquire);
-                        lp.close_at.store(
-                            if plan.one_pass && len > 0 {
-                                stamp + len as i64
-                            } else {
-                                i64::MIN
-                            },
-                            Ordering::Release,
-                        );
-                        lp.enter(Phase::Overdub, stamp);
-                    }
-                }
-            }
-            PLAYING => lp.enter(Phase::Playing, stamp),
-            // **The one place `origin` moves.**
-            //
-            // Everywhere else in this engine a loop's zero is fixed
-            // at the moment it was recorded and stays there. That is
-            // what phase-locking means and it is why stopping a loop
-            // and starting it again puts it back where it would have
-            // been rather than where it began — the alternative,
-            // moving `origin`, is called out on `muted` as "the one
-            // thing that must never happen to a loop that closed on a
-            // grid boundary".
-            //
-            // A one-shot is the documented exception, and has to be:
-            // the entire gesture is *play this, from the top, now*.
-            // Which is also why the mode is a mode — a loop that can
-            // be fired is a loop that has given up its place in the
-            // phase-locked set, and that should be a thing you turn
-            // on rather than a thing a footswitch does to you.
-            FIRE => {
-                let len = lp.loop_len.load(Ordering::Acquire);
-                if len > 0 {
-                    lp.origin.store(stamp, Ordering::Release);
-                    // Backwards, the top of the pass is the *end*.
-                    // Starting at zero and stepping negative wraps
-                    // there anyway, one sample later and audibly.
-                    let from = if lp.speed() < 0.0 { (len - 1) as f64 } else { 0.0 };
-                    lp.warp.store(from.to_bits(), Ordering::Relaxed);
-                    lp.shot_end
-                        .store(stamp + lp.pass_frames(len), Ordering::Release);
-                    // A fired loop is audible by definition. Leaving
-                    // `muted` set would make the switch do nothing
-                    // for a reason nothing on screen could explain.
-                    lp.muted.store(false, Ordering::Relaxed);
-                }
-            }
-            _ => {}
-        }
+        stamp(sh, li, base, frames);
     }
 
     // **The click follows the grid, and ticks beats.**
@@ -364,6 +231,149 @@ pub(super) fn output(
     sh.out_frames.store(base + frames, Ordering::Release);
 }
 
+/// **The one place the plan is consumed.** Loop `li`'s pending transition,
+/// taken if it is due before `base + frames` and stamped to the frame it
+/// belongs to. `take` peeks rather than takes until the request is due
+/// inside this buffer or has already gone by, and hands over every field of
+/// the plan at once.
+///
+/// Its own function since 2026-09-06 (REVIEW-daemon-debt step 5b), so the
+/// conformance replay can drive the callback's consumption at a chosen
+/// frame without a stream; the body is the body the loop had.
+pub(super) fn stamp(sh: &Shared, li: usize, base: usize, frames: usize) {
+    let lp = sh.lp(li);
+    let Some(plan) = lp.next.take((base + frames) as i64) else {
+        return;
+    };
+    let at = plan.at;
+    // The frame the transition belongs to. `origin` and
+    // `rec_from` are stamped with this rather than with the
+    // buffer start, which is what makes the alignment exact:
+    // the flag flips at buffer granularity, but everything
+    // downstream reads the frame.
+    let stamp = if at == i64::MIN { base as i64 } else { at.max(base as i64) };
+    match plan.phase {
+        ARMED => {
+            lp.reached.store(0, Ordering::Release);
+            lp.rec_reached.store(0, Ordering::Release);
+            // A level-armed recording knows the frame the sound
+            // crossed the threshold, and that frame is earlier
+            // than the one this request can be stamped at — the
+            // crossing is found on the input thread. Hand the
+            // difference to `started_late`, which is the same
+            // road a late footswitch already travels: `commit`
+            // shifts `origin` back by it and fills the front
+            // from the ring.
+            match plan.arm_from {
+                i64::MIN => {}
+                want => lp
+                    .started_late
+                    .store((stamp - want).max(0), Ordering::Release),
+            }
+            let n = lp.n_layers.load(Ordering::Acquire);
+            if n < sh.max_layers {
+                // **Layers, not length.** This asked whether the
+                // loop had a length, which was the same question
+                // while the only way to have one was to have
+                // recorded one. A loop can now be *sized and
+                // empty* — told how many bars it is before
+                // anything is played into it — and that is a
+                // first recording with a length, not an overdub
+                // of nothing.
+                if n == 0 {
+                    // Only the first recording lays down the grid.
+                    // Re-stamping origin on every arm would drag the
+                    // whole loop to position zero the instant you
+                    // hit record — playback reads origin too. The
+                    // self-test cannot catch that, because both
+                    // sides move together.
+                    //
+                    // Safe on a sized-and-empty loop for the same
+                    // reason it is unsafe elsewhere: there is no
+                    // audio, so there is nothing for zero to move
+                    // away from.
+                    lp.origin.store(stamp, Ordering::Release);
+                    lp.rec_from.store(stamp, Ordering::Release);
+                    lp.clear_rec_env();
+                    lp.threaded.store(false, Ordering::Relaxed);
+                    lp.enter(Phase::First, stamp);
+                    // If the length was known before a note was
+                    // played, the close is known too. Arm it here
+                    // and let `closer` do the work — an audio
+                    // callback must not be the thing that draws a
+                    // layer.
+                    let want = lp.loop_len.load(Ordering::Acquire);
+                    lp.rec_len.store(want, Ordering::Release);
+                    lp.close_at.store(
+                        if want > 0 { stamp + want as i64 } else { i64::MIN },
+                        Ordering::Release,
+                    );
+                } else {
+                    // An overdub is modular against the existing
+                    // grid, so it records from the same reference
+                    // the loop plays from.
+                    lp.rec_from
+                        .store(lp.origin.load(Ordering::Acquire), Ordering::Release);
+                    lp.clear_rec_env();
+                    lp.threaded.store(false, Ordering::Relaxed);
+                    // A one-pass overdub knows its close the
+                    // moment it starts: one loop length on.
+                    // Any other overdub clears the deadline,
+                    // because a `close_at` left from a pass
+                    // that was closed early by hand would
+                    // otherwise fire on this one.
+                    let len = lp.loop_len.load(Ordering::Acquire);
+                    lp.close_at.store(
+                        if plan.one_pass && len > 0 {
+                            stamp + len as i64
+                        } else {
+                            i64::MIN
+                        },
+                        Ordering::Release,
+                    );
+                    lp.enter(Phase::Overdub, stamp);
+                }
+            }
+        }
+        PLAYING => lp.enter(Phase::Playing, stamp),
+        // **The one place `origin` moves.**
+        //
+        // Everywhere else in this engine a loop's zero is fixed
+        // at the moment it was recorded and stays there. That is
+        // what phase-locking means and it is why stopping a loop
+        // and starting it again puts it back where it would have
+        // been rather than where it began — the alternative,
+        // moving `origin`, is called out on `muted` as "the one
+        // thing that must never happen to a loop that closed on a
+        // grid boundary".
+        //
+        // A one-shot is the documented exception, and has to be:
+        // the entire gesture is *play this, from the top, now*.
+        // Which is also why the mode is a mode — a loop that can
+        // be fired is a loop that has given up its place in the
+        // phase-locked set, and that should be a thing you turn
+        // on rather than a thing a footswitch does to you.
+        FIRE => {
+            let len = lp.loop_len.load(Ordering::Acquire);
+            if len > 0 {
+                lp.origin.store(stamp, Ordering::Release);
+                // Backwards, the top of the pass is the *end*.
+                // Starting at zero and stepping negative wraps
+                // there anyway, one sample later and audibly.
+                let from = if lp.speed() < 0.0 { (len - 1) as f64 } else { 0.0 };
+                lp.warp.store(from.to_bits(), Ordering::Relaxed);
+                lp.shot_end
+                    .store(stamp + lp.pass_frames(len), Ordering::Release);
+                // A fired loop is audible by definition. Leaving
+                // `muted` set would make the switch do nothing
+                // for a reason nothing on screen could explain.
+                lp.muted.store(false, Ordering::Relaxed);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The input callback: establish `K` once, keep every source's pre-roll
 /// ring, listen for a level-armed loop's threshold, and write the recording
 /// loop's layer.
@@ -449,24 +459,8 @@ pub(super) fn input(
                     .any(|c| data[f * in_channels + asrc.ch[c]].abs() >= thresh)
             })
             {
-                let lp = sh.lp(li);
                 let k = sh.k.load(Ordering::Acquire);
-                let at = (base + f) as i64 + k;
-                // Quantised wins, as it does for a footswitch: a loop
-                // told to start on the grid starts on the grid,
-                // whatever asked for it. There is no back-dating then
-                // — the boundary is ahead, not behind.
-                match if lp.quant.load(Ordering::Relaxed) {
-                    sh.next_boundary(at)
-                } else {
-                    None
-                } {
-                    Some(t) => lp.next.set_from(t, i64::MIN),
-                    None => {
-                        let reach = sh.arm_reach.load(Ordering::Relaxed) as i64;
-                        lp.next.set_from(i64::MIN, at - reach);
-                    }
-                }
+                crossed(sh, li, (base + f) as i64 + k);
             }
         }
     }
@@ -660,4 +654,26 @@ pub(super) fn input(
     // two sides are within a sample of each other by construction.
     lp.tape_lp.store(lp_mem[0].to_bits(), Ordering::Relaxed);
     sh.in_frames.store(base + frames, Ordering::Release);
+}
+
+/// A level-armed loop's sound crossed the threshold at output frame `at`:
+/// file the take. Quantised wins, as it does for a footswitch: a loop told
+/// to start on the grid starts on the grid, whatever asked for it, and there
+/// is no back-dating then — the boundary is ahead, not behind. Otherwise the
+/// take is dated `arm_reach` before the crossing.
+///
+/// Its own function since 2026-09-06 (step 5b), for the reason `stamp` is.
+pub(super) fn crossed(sh: &Shared, li: usize, at: i64) {
+    let lp = sh.lp(li);
+    match if lp.quant.load(Ordering::Relaxed) {
+        sh.next_boundary(at)
+    } else {
+        None
+    } {
+        Some(t) => lp.next.set_from(t, i64::MIN),
+        None => {
+            let reach = sh.arm_reach.load(Ordering::Relaxed) as i64;
+            lp.next.set_from(i64::MIN, at - reach);
+        }
+    }
 }

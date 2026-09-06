@@ -16,7 +16,7 @@ const LEN: usize = 1000;
 /// was a constructor taking thirty arguments so that one caller could pass
 /// zeros. Adding a field to `Shared` breaks this at compile time, which is
 /// the only kind of drift worth defending against here.
-fn rig(max_frames: usize) -> Shared {
+pub(super) fn rig(max_frames: usize) -> Shared {
     Shared {
         arena: (0..DEFAULT_LOOPS * DEFAULT_LAYERS * max_frames * CHANNELS)
             .map(|_| AtomicU32::new(0))
@@ -68,7 +68,7 @@ fn rig(max_frames: usize) -> Shared {
 }
 
 /// Fill one layer with a constant, and declare its shape.
-fn lay(sh: &Shared, li: usize, layer: usize, len: usize, v: f32) {
+pub(super) fn lay(sh: &Shared, li: usize, layer: usize, len: usize, v: f32) {
     for p in 0..len {
         for ch in 0..CHANNELS {
             sh.cell(li, layer, p, ch).store(v.to_bits(), Ordering::Relaxed);
@@ -84,7 +84,7 @@ fn lay(sh: &Shared, li: usize, layer: usize, len: usize, v: f32) {
 }
 
 /// A loop of `len` holding one layer, at the origin, ready to render.
-fn one_layer_loop(sh: &Shared, li: usize, len: usize, v: f32) {
+pub(super) fn one_layer_loop(sh: &Shared, li: usize, len: usize, v: f32) {
     lay(sh, li, 0, len, v);
     let lp = sh.lp(li);
     lp.loop_len.store(len, Ordering::Release);
@@ -1230,13 +1230,17 @@ fn a_plan_does_not_outlive_the_loop_it_was_made_for() {
     assert_eq!(plan.phase, ARMED);
     assert!(sh.lp(2).next.is_empty(), "nothing left for the overdub after");
 
-    // A record waiting for the grid on a sized loop, then the length
-    // forgotten: the ack says the next recording sets a length, so the one
-    // that was waiting is not it.
+    // A record waiting for the grid on a sized loop: since step 5b `z` is
+    // refused there — the take waiting is a take of that length, and the
+    // artifact says so — and `c` is what drops it.
     assert!(dispatch(&sh, 1000, "3fix0.5").contains("closes itself"));
     assert_eq!(dispatch(&sh, 1000, "3r"), "loop 3 recording.");
     assert!(sh.lp(3).next.is_pending());
-    assert!(dispatch(&sh, 1000, "3z").contains("length forgotten"));
+    sh.lp(3).next.set(ARMED, 5000);
+    assert!(sh.lp(3).next.waits_for_boundary());
+    assert!(dispatch(&sh, 1000, "3z").contains("waiting for the bar"));
+    assert!(sh.lp(3).next.waits_for_boundary(), "the wait stands");
+    dispatch(&sh, 1000, "3c");
     assert!(sh.lp(3).next.is_empty());
 }
 
@@ -1302,7 +1306,9 @@ fn reach(lp: &Loop, path: &[Phase]) {
 /// through the rig where a verb reaches it; where a site needs a running
 /// callback or a closer thread, its pair is asserted directly. The pairs
 /// collected are then compared with `phase::LEGAL` both ways, so a row
-/// nothing produces and a site the table forgot both fail here.
+/// nothing produces and a site the table forgot both fail here. Since step
+/// 5b the verbs that used to reach a phase unguarded (`x`, `z`, `blank`,
+/// `t`) are asserted to refuse and leave the phase standing.
 #[test]
 fn every_store_site_pair_is_in_the_table_and_the_table_has_no_more() {
     use super::phase::LEGAL;
@@ -1337,7 +1343,8 @@ fn every_store_site_pair_is_in_the_table_and_the_table_has_no_more() {
     }
 
     // `dispatch` `r` with level-arm: Idle -> Armed, and the second press
-    // Armed -> Idle; `lev0` under the arm, Armed -> Idle.
+    // Armed -> Idle; `lev0` under the arm, Armed -> Idle. On a loop with
+    // layers, Playing -> Armed, and the cancel Armed -> Playing (`disarm`).
     {
         let sh = rig(LEN);
         dispatch(&sh, 1000, "0lev1");
@@ -1358,6 +1365,14 @@ fn every_store_site_pair_is_in_the_table_and_the_table_has_no_more() {
         assert!(dispatch(&sh, 1000, "1r").contains("listening"));
         assert_eq!(sh.lp(1).phase(), Phase::Armed);
         note(Phase::Playing, Phase::Armed);
+        assert!(dispatch(&sh, 1000, "1r").contains("stopped listening"));
+        assert_eq!(sh.lp(1).phase(), Phase::Playing, "back to what it held");
+        assert_eq!(sh.lp(1).n_layers.load(Ordering::Acquire), 1);
+        note(Phase::Armed, Phase::Playing);
+        assert!(dispatch(&sh, 1000, "1r").contains("listening"));
+        dispatch(&sh, 1000, "1lev0");
+        assert_eq!(sh.lp(1).phase(), Phase::Playing);
+        note(Phase::Armed, Phase::Playing);
     }
 
     // The output callback's three sites, asserted directly: they need a
@@ -1381,15 +1396,13 @@ fn every_store_site_pair_is_in_the_table_and_the_table_has_no_more() {
     }
 
     // `commit` (three stores): First -> Playing, Overdub -> Playing, and
-    // the revox branch's Playing -> Playing. `take`: Idle -> Playing, and
-    // — unguarded — Armed -> Playing and First -> Playing. Directly: both
-    // sleep on the drain.
+    // the revox branch's Playing -> Playing. `take`: Idle -> Playing.
+    // Directly: both sleep on the drain.
     for path in [
         &[Phase::First, Phase::Playing][..],
         &[Phase::Playing, Phase::Overdub, Phase::Playing][..],
         &[Phase::Playing, Phase::Playing][..],
         &[Phase::Playing][..],
-        &[Phase::Armed, Phase::Playing][..],
     ] {
         let lp = Loop::new(0, DEFAULT_LAYERS);
         reach(&lp, &path[..path.len() - 1]);
@@ -1399,9 +1412,10 @@ fn every_store_site_pair_is_in_the_table_and_the_table_has_no_more() {
     }
 
     // `multiply_start` (`x`): Playing -> Multiply on a loop with layers,
-    // Idle -> Multiply on a sized-and-empty one, Armed -> Multiply on a
-    // listening one (unguarded). `multiply_end` waits on the boundary, so
-    // Multiply -> Playing is asserted directly, as is `supervise`'s.
+    // Idle -> Multiply on a sized-and-empty one. On a listening loop it
+    // refuses (step 5b), so Armed -> Multiply is gone from the table.
+    // `multiply_end` waits on the boundary, so Multiply -> Playing is
+    // asserted directly, as is `supervise`'s.
     {
         let sh = rig(LEN);
         one_layer_loop(&sh, 0, 100, 0.0);
@@ -1413,34 +1427,36 @@ fn every_store_site_pair_is_in_the_table_and_the_table_has_no_more() {
         note(Phase::Idle, Phase::Multiply);
         sh.lp(2).loop_len.store(100, Ordering::Release);
         reach(sh.lp(2), &[Phase::Armed]);
-        assert!(dispatch(&sh, 1000, "2x").contains("multiplying"));
-        note(Phase::Armed, Phase::Multiply);
+        assert!(dispatch(&sh, 1000, "2x").contains("listening for a sound"));
+        assert_eq!(sh.lp(2).phase(), Phase::Armed, "the arm stands");
         reach(sh.lp(0), &[Phase::Playing]);
         note(Phase::Multiply, Phase::Playing);
     }
 
     // `free_length` (`z`): Idle -> Idle on a sized-and-empty loop, Playing
-    // -> Idle after every layer was undone, and — unguarded — Armed -> Idle
-    // and First -> Idle.
-    for (path, ack) in [
-        (&[][..], "length forgotten"),
-        (&[Phase::Playing][..], "length forgotten"),
-        (&[Phase::Armed][..], "length forgotten"),
-        (&[Phase::First][..], "length forgotten"),
+    // -> Idle after every layer was undone. On a listening or a recording
+    // loop it refuses (step 5b) and the phase stands.
+    for (path, ack, to) in [
+        (&[][..], "length forgotten", Phase::Idle),
+        (&[Phase::Playing][..], "length forgotten", Phase::Idle),
+        (&[Phase::Armed][..], "listening for a sound", Phase::Armed),
+        (&[Phase::First][..], "is recording", Phase::First),
     ] {
         let sh = rig(LEN);
         sh.lp(0).loop_len.store(100, Ordering::Release);
         reach(sh.lp(0), path);
         let from = sh.lp(0).phase();
         assert!(dispatch(&sh, 1000, "0z").contains(ack));
-        assert_eq!(sh.lp(0).phase(), Phase::Idle);
-        note(from, Phase::Idle);
+        assert_eq!(sh.lp(0).phase(), to);
+        if to != from {
+            note(from, to);
+        }
     }
 
     // `copy_layers` (`cp`): Idle -> Playing onto an empty loop, Playing ->
     // Playing onto a threaded tape. `thread_blank` (`blank`): Idle ->
-    // Playing, then Playing -> Playing re-threading; and, unguarded,
-    // Armed -> Playing.
+    // Playing, then Playing -> Playing re-threading. On a listening loop
+    // it refuses (step 5b).
     {
         let sh = rig(LEN);
         one_layer_loop(&sh, 0, 100, 0.0);
@@ -1457,9 +1473,8 @@ fn every_store_site_pair_is_in_the_table_and_the_table_has_no_more() {
         assert!(dispatch(&sh, 1000, "3blank0.2").contains("tape"));
         note(Phase::Playing, Phase::Playing);
         reach(sh.lp(4), &[Phase::Armed]);
-        assert!(dispatch(&sh, 1000, "4blank0.1").contains("tape"));
-        assert_eq!(sh.lp(4).phase(), Phase::Playing);
-        note(Phase::Armed, Phase::Playing);
+        assert!(dispatch(&sh, 1000, "4blank0.1").contains("listening for a sound"));
+        assert_eq!(sh.lp(4).phase(), Phase::Armed, "the arm stands");
     }
 
     // `supervise` on a lost device: a recording loop to Playing with a
