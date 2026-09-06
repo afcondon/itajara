@@ -135,6 +135,21 @@ net; none changes behaviour; each can land alone.
    named sub-steps), `commit.rs`, `edit.rs` (windows, rotation, layer
    windows), `copy.rs`, `export.rs`, `tests/`. Zero semantic risk, and every
    later step becomes reviewable. Do this first or nothing else is.
+
+   **Step 1 — done 2026-09-06**, branch `daemon/modules`. `engine.rs` is
+   `engine/`: `mod.rs` (constants, `Opts`, `Source`, ack words, bar
+   arithmetic, wiring), `loop_state.rs` (`Loop`), `shared.rs` (`Shared`),
+   `run.rs` (residual, arena, streams, supervise), `callbacks.rs` (output
+   and input, lifted whole out of `run`'s closures), `control.rs` (console,
+   closer), `commit.rs` (commit, draw_layer, fill_from_ring, take),
+   `cycle.rs` (multiply, sparse/place/rotate/dense, fix, bars, tempo,
+   start_all, free), `guards.rs` (busy_elsewhere, not_writable, not_plain),
+   `dispatch.rs` (dispatch alone, arms in their order; `check-verbs` reads
+   it by path), `edit.rs` (thread_blank, schedule_restart), `copy.rs`,
+   `export.rs`, `selftest.rs`, `tests.rs` (one module, as before). Nothing
+   renamed or reordered; the only visibility change is `pub(crate)` where a
+   field or function now crosses a file boundary. 43 tests, both checkers,
+   zero warnings.
 2. **Verb tokenizer and table.** Parse `loop / verb / arg / @late` once;
    match on the verb word exactly. Retire the prefix guards and the
    ordering comments. `check-verbs.py` then compares two tables, which is
