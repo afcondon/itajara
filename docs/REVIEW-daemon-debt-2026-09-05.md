@@ -182,6 +182,36 @@ net; none changes behaviour; each can land alone.
    discipline; one `layer_json`. The Arbhar face's whole vocabulary (`ly`,
    `lw`, `dp`, `cp…l`) is then operations on one type — and it is the
    foundation any module emulation stands on.
+
+   **Step 3 — done 2026-09-06**, branch `daemon/layer-struct`. New
+   `engine/layer.rs`: `pub(crate) struct Layer { len: AtomicUsize, tail:
+   AtomicUsize, born: AtomicI64, env: Mutex<Vec<u8>>, gain: AtomicU32,
+   on: AtomicBool, win_in: AtomicI64, win_out: AtomicI64, period:
+   AtomicUsize, phase: AtomicUsize }` — each field the atomic its `Vec`
+   held, with the doc comment that was on the array. `Loop.layers:
+   Vec<Layer>`, `max_layers` of them from construction; `n_layers` and
+   `redo_to` are what they were. Every `lp.l_xxx[k]` is `lp.layers[k].xxx`
+   with the same orderings; `set_layer_shape`, `layer_pos`, `layer_window`,
+   `windowed_pos`, `layer_shape`, `layer_gain`, `layer_on`, `layer_born`
+   and `layer_tail` have their bodies on `Layer` and stay on `Loop` as
+   delegations, so no caller outside the engine moved (`layer_env` went,
+   since its one caller now reads the layer). The envelope mutex is **one
+   per layer** rather than one over all of them: `rebuild_env` writes one
+   layer, the snapshot copies one layer, and `clear_env` takes them in
+   turn — nothing ever held two layers' pictures under one lock, and a
+   snapshot could already see between two layers because it locked once
+   per layer. `ws.rs` has one `layer_json(&Layer)`, called from both
+   places the per-layer object is emitted, and a test holding its output
+   to a literal captured from the old emitter. The proof is two tests
+   committed *before* the refactor (de1c1a0): `fixture()` in
+   `engine/tests.rs` — a continuation and wrap fade under a loop window
+   with a rotation, a layer off, a layer window, decay with differing
+   births, a sparse layer at a fractional speed folded and panned, and a
+   threaded blank — rendered for 4096 frames through the callback's own
+   `loop_at` plus each `render_loop`, FNV-1a over the sample bits
+   (`1122269442957771175`), and the whole `ws::snapshot` text hashed the
+   same way (`5753937055540615430`). Both constants unchanged after. 52
+   tests, both checkers, zero warnings.
 4. **`NextTake` as one value.** Length, close, one-pass, threaded, level-arm
    and boundary in one struct, written by the command thread, read once by
    the callback at the transition, cleared in one place. Swapped whole (a
