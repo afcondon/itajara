@@ -1288,3 +1288,213 @@ fn a_blank_tape_does_not_survive_a_clear() {
     assert_eq!(dispatch(&sh, 1000, "0r"), "loop 0 recording.");
 }
 
+/// Walk a loop through `path` by `enter`, checking the phase after each
+/// step — how the tests below reach a phase they cannot reach by verb.
+fn reach(lp: &Loop, path: &[Phase]) {
+    for &p in path {
+        lp.enter(p, 0);
+        assert_eq!(lp.phase(), p);
+    }
+}
+
+/// **Every store site's pair is in the table, and every row of the table
+/// is a site's pair.** Each of the seventeen `enter` sites is driven
+/// through the rig where a verb reaches it; where a site needs a running
+/// callback or a closer thread, its pair is asserted directly. The pairs
+/// collected are then compared with `phase::LEGAL` both ways, so a row
+/// nothing produces and a site the table forgot both fail here.
+#[test]
+fn every_store_site_pair_is_in_the_table_and_the_table_has_no_more() {
+    use super::phase::LEGAL;
+    let mut seen: Vec<(Phase, Phase)> = Vec::new();
+    let mut note = |from: Phase, to: Phase| {
+        assert!(
+            LEGAL.contains(&(from, to)),
+            "{} -> {} is produced but not in the table",
+            from,
+            to
+        );
+        if !seen.contains(&(from, to)) {
+            seen.push((from, to));
+        }
+    };
+
+    // `Loop::cleared` (`c`): from every phase.
+    for &from in &Phase::ALL {
+        let lp = Loop::new(0, DEFAULT_LAYERS);
+        let path: &[Phase] = match from {
+            Phase::Idle => &[],
+            Phase::Armed => &[Phase::Armed],
+            Phase::First => &[Phase::First],
+            Phase::Overdub => &[Phase::Playing, Phase::Overdub],
+            Phase::Playing => &[Phase::Playing],
+            Phase::Multiply => &[Phase::Playing, Phase::Multiply],
+        };
+        reach(&lp, path);
+        lp.cleared(0);
+        assert_eq!(lp.phase(), Phase::Idle);
+        note(from, Phase::Idle);
+    }
+
+    // `dispatch` `r` with level-arm: Idle -> Armed, and the second press
+    // Armed -> Idle; `lev0` under the arm, Armed -> Idle.
+    {
+        let sh = rig(LEN);
+        dispatch(&sh, 1000, "0lev1");
+        assert!(dispatch(&sh, 1000, "0r").contains("listening"));
+        assert_eq!(sh.lp(0).phase(), Phase::Armed);
+        note(Phase::Idle, Phase::Armed);
+        assert!(dispatch(&sh, 1000, "0r").contains("stopped listening"));
+        assert_eq!(sh.lp(0).phase(), Phase::Idle);
+        note(Phase::Armed, Phase::Idle);
+        dispatch(&sh, 1000, "0r");
+        dispatch(&sh, 1000, "0lev0");
+        assert_eq!(sh.lp(0).phase(), Phase::Idle);
+        note(Phase::Armed, Phase::Idle);
+        // And on a loop with layers: Playing -> Armed.
+        one_layer_loop(&sh, 1, 100, 0.0);
+        reach(sh.lp(1), &[Phase::Playing]);
+        dispatch(&sh, 1000, "1lev1");
+        assert!(dispatch(&sh, 1000, "1r").contains("listening"));
+        assert_eq!(sh.lp(1).phase(), Phase::Armed);
+        note(Phase::Playing, Phase::Armed);
+    }
+
+    // The output callback's three sites, asserted directly: they need a
+    // running stream. An `ARMED` request on no layers -> First, from
+    // Idle, from a level arm, and from a loop whose layers were all
+    // undone; on layers -> Overdub, from Playing and from a level arm;
+    // the `PLAYING` request -> Playing, which nothing sends.
+    for (path, to) in [
+        (&[Phase::First][..], Phase::First),
+        (&[Phase::Armed, Phase::First][..], Phase::First),
+        (&[Phase::Playing, Phase::First][..], Phase::First),
+        (&[Phase::Playing, Phase::Overdub][..], Phase::Overdub),
+        (&[Phase::Playing, Phase::Armed, Phase::Overdub][..], Phase::Overdub),
+        (&[Phase::Playing, Phase::Playing][..], Phase::Playing),
+    ] {
+        let lp = Loop::new(0, DEFAULT_LAYERS);
+        reach(&lp, &path[..path.len() - 1]);
+        let from = lp.phase();
+        reach(&lp, &path[path.len() - 1..]);
+        note(from, to);
+    }
+
+    // `commit` (three stores): First -> Playing, Overdub -> Playing, and
+    // the revox branch's Playing -> Playing. `take`: Idle -> Playing, and
+    // — unguarded — Armed -> Playing and First -> Playing. Directly: both
+    // sleep on the drain.
+    for path in [
+        &[Phase::First, Phase::Playing][..],
+        &[Phase::Playing, Phase::Overdub, Phase::Playing][..],
+        &[Phase::Playing, Phase::Playing][..],
+        &[Phase::Playing][..],
+        &[Phase::Armed, Phase::Playing][..],
+    ] {
+        let lp = Loop::new(0, DEFAULT_LAYERS);
+        reach(&lp, &path[..path.len() - 1]);
+        let from = lp.phase();
+        reach(&lp, &path[path.len() - 1..]);
+        note(from, Phase::Playing);
+    }
+
+    // `multiply_start` (`x`): Playing -> Multiply on a loop with layers,
+    // Idle -> Multiply on a sized-and-empty one, Armed -> Multiply on a
+    // listening one (unguarded). `multiply_end` waits on the boundary, so
+    // Multiply -> Playing is asserted directly, as is `supervise`'s.
+    {
+        let sh = rig(LEN);
+        one_layer_loop(&sh, 0, 100, 0.0);
+        reach(sh.lp(0), &[Phase::Playing]);
+        assert!(dispatch(&sh, 1000, "0x").contains("multiplying"));
+        note(Phase::Playing, Phase::Multiply);
+        sh.lp(1).loop_len.store(100, Ordering::Release);
+        assert!(dispatch(&sh, 1000, "1x").contains("multiplying"));
+        note(Phase::Idle, Phase::Multiply);
+        sh.lp(2).loop_len.store(100, Ordering::Release);
+        reach(sh.lp(2), &[Phase::Armed]);
+        assert!(dispatch(&sh, 1000, "2x").contains("multiplying"));
+        note(Phase::Armed, Phase::Multiply);
+        reach(sh.lp(0), &[Phase::Playing]);
+        note(Phase::Multiply, Phase::Playing);
+    }
+
+    // `free_length` (`z`): Idle -> Idle on a sized-and-empty loop, Playing
+    // -> Idle after every layer was undone, and — unguarded — Armed -> Idle
+    // and First -> Idle.
+    for (path, ack) in [
+        (&[][..], "length forgotten"),
+        (&[Phase::Playing][..], "length forgotten"),
+        (&[Phase::Armed][..], "length forgotten"),
+        (&[Phase::First][..], "length forgotten"),
+    ] {
+        let sh = rig(LEN);
+        sh.lp(0).loop_len.store(100, Ordering::Release);
+        reach(sh.lp(0), path);
+        let from = sh.lp(0).phase();
+        assert!(dispatch(&sh, 1000, "0z").contains(ack));
+        assert_eq!(sh.lp(0).phase(), Phase::Idle);
+        note(from, Phase::Idle);
+    }
+
+    // `copy_layers` (`cp`): Idle -> Playing onto an empty loop, Playing ->
+    // Playing onto a threaded tape. `thread_blank` (`blank`): Idle ->
+    // Playing, then Playing -> Playing re-threading; and, unguarded,
+    // Armed -> Playing.
+    {
+        let sh = rig(LEN);
+        one_layer_loop(&sh, 0, 100, 0.0);
+        reach(sh.lp(0), &[Phase::Playing]);
+        assert!(dispatch(&sh, 1000, "1cp0").contains("copied"));
+        assert_eq!(sh.lp(1).phase(), Phase::Playing);
+        note(Phase::Idle, Phase::Playing);
+        assert!(dispatch(&sh, 1000, "2blank0.1").contains("tape"));
+        assert_eq!(sh.lp(2).phase(), Phase::Playing);
+        note(Phase::Idle, Phase::Playing);
+        assert!(dispatch(&sh, 1000, "2cp0").contains("copied"));
+        note(Phase::Playing, Phase::Playing);
+        assert!(dispatch(&sh, 1000, "3blank0.1").contains("tape"));
+        assert!(dispatch(&sh, 1000, "3blank0.2").contains("tape"));
+        note(Phase::Playing, Phase::Playing);
+        reach(sh.lp(4), &[Phase::Armed]);
+        assert!(dispatch(&sh, 1000, "4blank0.1").contains("tape"));
+        assert_eq!(sh.lp(4).phase(), Phase::Playing);
+        note(Phase::Armed, Phase::Playing);
+    }
+
+    // `supervise` on a lost device: a recording loop to Playing with a
+    // length, to Idle without. Directly: it is a thread over the streams.
+    for (path, to) in [
+        (&[Phase::First][..], Phase::Idle),
+        (&[Phase::First][..], Phase::Playing),
+        (&[Phase::Playing, Phase::Overdub][..], Phase::Playing),
+        (&[Phase::Playing, Phase::Multiply][..], Phase::Playing),
+    ] {
+        let lp = Loop::new(0, DEFAULT_LAYERS);
+        reach(&lp, path);
+        let from = lp.phase();
+        reach(&lp, &[to]);
+        note(from, to);
+    }
+
+    // Both ways: nothing produced is outside the table (checked as we
+    // went), and nothing in the table went unproduced.
+    for &(from, to) in LEGAL {
+        assert!(
+            seen.contains(&(from, to)),
+            "{} -> {} is in the table but no site produced it",
+            from,
+            to
+        );
+    }
+    assert_eq!(seen.len(), LEGAL.len());
+}
+
+/// **An illegal pair panics under test.** `Idle -> Overdub`: nothing
+/// overdubs a loop that has never played.
+#[test]
+#[should_panic(expected = "idle -> overdubbing")]
+fn an_illegal_transition_panics_under_test() {
+    let lp = Loop::new(0, DEFAULT_LAYERS);
+    lp.enter(Phase::Overdub, 0);
+}
