@@ -267,6 +267,89 @@ net; none changes behaviour; each can land alone.
 5. **`Phase` as an enum with one `transition` function.** The qualifiers
    move inside the constructors; the 17 sites become calls; the callback
    stays the only stamper of frames.
+
+   **Step 5a — done 2026-09-06**, branch `daemon/phase`. The enum, the
+   one writer and the table; the qualifiers stay beside the byte for now,
+   and conformance against the Glassbox artifact is 5b. New
+   `engine/phase.rs`: `pub(crate) enum Phase { Idle, Armed, First,
+   Overdub, Playing, Multiply }`, `repr(u8)` with the constants' values,
+   `from_u8`/`as_u8`, and `Display` giving the wire word (`idle`, `armed`,
+   `recordingFirst`, `overdubbing`, `playing`, `multiplying`) — one
+   spelling, which `state_name` and so the snapshot and `busy_elsewhere`
+   now read from. The storage is the same `AtomicU8` on `Loop`, private
+   now, read by `Loop::phase()` with the same Acquire load, and stored by
+   **`Loop::enter(&self, to: Phase, at: i64)`** and nothing else: it reads
+   the phase it is leaving, checks the pair against `phase::LEGAL`, and
+   stores. An illegal pair in release is stored anyway and logged once per
+   pair (loop, from, to, frame); under test it panics. `at` is passed, not
+   read — the callback hands over its `stamp`, the control thread reads
+   `out_frames` at the moment it acts (or the `cur`/`now` it had just
+   read), and `cleared` takes the frame from its caller for the same
+   reason. `ARMED`, `PLAYING` and `FIRE` remain as `u8` for the request
+   byte `NextTake` carries, which is a superset of the phases; `IDLE`,
+   `FIRST`, `OVERDUB`, `MULTIPLY` are gone.
+
+   The seventeen `state.set` sites, before → after, all seventeen now
+   `enter` calls on the same thread at the same moment: output callback
+   ×3 (`FIRST` → `enter(First, stamp)`, `OVERDUB` → `enter(Overdub,
+   stamp)`, the `PLAYING` request → `enter(Playing, stamp)`); `commit` ×2
+   (`PLAYING` before the drain and again in the revox branch, each with a
+   fresh `out_frames`); `take` ×1 (`PLAYING` → `enter(Playing, now)`);
+   `multiply_start` (`MULTIPLY` → `enter(Multiply, cur)`); `multiply_end`
+   ×2 (`PLAYING` at the ceiling refusal with `cur`, `PLAYING` after the
+   boundary with a fresh read); `free_length` (`IDLE`); `copy_layers`
+   (`PLAYING` on the destination); `thread_blank` (`PLAYING` → `enter(
+   Playing, now)`); `dispatch` ×3 (`r` cancelling an arm → `Idle`, `r`
+   under level arm → `Armed`, `lev0` under an arm → `Idle`); `Loop::
+   cleared` (`IDLE`, frame from the `c` arm); `supervise` (`PLAYING` or
+   `IDLE` on a lost device).
+
+   The table, 22 rows, derived from the sites: Idle → {Idle, Armed,
+   First, Playing, Multiply}; Armed → {Idle, First, Overdub, Playing,
+   Multiply}; First → {Idle, Playing}; Overdub → {Idle, Playing};
+   Playing → {Idle, Armed, First, Overdub, Playing, Multiply}; Multiply →
+   {Idle, Playing}. Self-transitions: `Idle → Idle` (clearing an idle
+   loop; `z` on a sized-and-empty loop) and `Playing → Playing`
+   (`commit`'s second store, `cp` onto a threaded tape, re-threading a
+   tape, the `PLAYING` request that nothing sends since Start All became
+   `FIRE`) are legal; the other four are not produced and are not legal.
+   Left out on purpose, and so logged if they ever happen: pairs only a
+   thread race makes — `x` with a grid request still pending (`Multiply →
+   Overdub`), a `c` inside `commit`'s or `multiply_end`'s sleep (`Idle →
+   Playing` from their second store). Six rows are in the table only
+   because a verb is not guarded against the phase it finds, each marked
+   in the source: `x`, `z`, `blank` and `t` on an `Armed` loop (`Armed →
+   Multiply`, `Armed → Idle`, `Armed → Playing`), `z` and `t` on a `First`
+   one (`First → Idle`, `First → Playing`). Tests: 60 (55 + the three in
+   `phase.rs` + the two in `tests.rs`), both hash constants unchanged, both
+   checkers, zero warnings.
+
+   **Artifact versus code, for 5b** (`itajara-loop.json`, 11 states,
+   unchanged by this step). The artifact's states are the byte plus the
+   facts, so its `sized` is `Idle` with a length *or* `Playing` with a
+   length and no layers (after undo-all), its `tape` is `Playing` +
+   `threaded`, and its `armed-for-grid` is `Idle` with a request pending
+   — three artifact states the byte cannot tell apart, which is the whole
+   of what 5b has to map. Code produces, artifact refuses: `Armed →
+   Multiply` (`x` on a listening loop; the artifact's notes already name
+   it), `Armed → Idle` by `z`, `Armed → Playing` by `blank` and by `t`,
+   `First → Idle` by `z` mid-take, `First → Playing` by `t` mid-take
+   (`t` has no state guard at all beyond the layer ceiling, and the
+   artifact has no `take` event). Code differs: a cancelled level arm
+   (`r` again, or `lev0`) always goes to `Idle`, where the artifact
+   returns to `tape`/`playing`/`sized`/`empty` by the facts — a loop with
+   layers that was armed from `Playing` comes back reading `idle` with
+   its layers intact; and a lost device during a sized first take goes to
+   `Playing` (length kept, no layers) where the artifact says `sized`.
+   Artifact allows, code never stores: `undo` on the last layer (`playing
+   → sized`; the code leaves the byte at `Playing`), and `lost` from
+   `armed-by-level` (`stay`; the code stays too, but `next.clear()` drops
+   the crossing already found). Matching: every `clear` to `Idle` (or
+   `tape` on a fixed rig, which is `Idle` then `Playing`), `closed` on a
+   sized take or one-pass → `Playing`, `multiply`/`record` ending a
+   multiply → `Playing`, `lost` from an open first take → `Idle` and from
+   an overdub or multiply → `Playing`, `sized` on `multiply` →
+   `Multiply`.
 6. **One serialiser per type, and drop the top-level duplication** once the
    pedalboard reads `loops[i]` (it already can).
 7. **One control lane.** `dispatch` runs on three threads unlocked. It is
