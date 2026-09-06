@@ -461,15 +461,15 @@ impl Shared {
         let xf = lp.fade.load(Ordering::Relaxed);
         // The ordinary case, and the first test is the cheap one: away from a
         // wrap this is the single read it has always been.
-        if xf == 0 || p >= xf || lp.l_period[layer].load(Ordering::Relaxed) > 1 {
+        if xf == 0 || p >= xf || lp.layers[layer].period.load(Ordering::Relaxed) > 1 {
             return v;
         }
-        let len = lp.l_len[layer].load(Ordering::Relaxed);
+        let len = lp.layers[layer].len.load(Ordering::Relaxed);
         // Bounded by what the layer actually kept, and by where its slice of the
         // arena ends — reading past that would read the next layer's audio,
         // which is silent corruption rather than an error.
         let n = xf
-            .min(lp.l_tail[layer].load(Ordering::Acquire))
+            .min(lp.layers[layer].tail.load(Ordering::Acquire))
             .min(self.max_frames.saturating_sub(len));
         if p >= n {
             return v;
@@ -498,7 +498,7 @@ impl Shared {
     /// take — which is why it is cached rather than computed per snapshot.
     pub(crate) fn rebuild_env(&self, li: usize, layer: usize) {
         let lp = self.lp(li);
-        let len = lp.l_len[layer].load(Ordering::Acquire);
+        let len = lp.layers[layer].len.load(Ordering::Acquire);
         let mut out = Vec::new();
         if len > 0 {
             out.reserve(ENV_BUCKETS);
@@ -518,8 +518,8 @@ impl Shared {
                 out.push(to_byte(peak));
             }
         }
-        if let Ok(mut e) = lp.env.lock() {
-            e[layer] = out;
+        if let Ok(mut e) = lp.layers[layer].env.lock() {
+            *e = out;
         }
     }
 
@@ -569,9 +569,9 @@ impl Shared {
 
     /// Forget every envelope on a loop, for when its audio goes.
     pub(crate) fn clear_env(&self, li: usize) {
-        if let Ok(mut e) = self.lp(li).env.lock() {
-            for v in e.iter_mut() {
-                v.clear();
+        for layer in self.lp(li).layers.iter() {
+            if let Ok(mut e) = layer.env.lock() {
+                e.clear();
             }
         }
     }

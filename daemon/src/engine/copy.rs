@@ -63,7 +63,7 @@ pub(crate) fn copy_layers(sh: &Shared, dst: usize, src: usize, layer: Option<usi
         Some(k) => vec![k],
         None => (0..n_from).collect(),
     };
-    let chosen: Vec<usize> = chosen.into_iter().filter(|&l| from.l_len[l].load(Ordering::Acquire) > 0).collect();
+    let chosen: Vec<usize> = chosen.into_iter().filter(|&l| from.layers[l].len.load(Ordering::Acquire) > 0).collect();
     if chosen.is_empty() {
         return format!("loop {} has nothing to copy.", src);
     }
@@ -77,7 +77,7 @@ pub(crate) fn copy_layers(sh: &Shared, dst: usize, src: usize, layer: Option<usi
         sh.zero_layer(dst, j);
     }
     for (j, &l) in chosen.iter().enumerate() {
-        let len = from.l_len[l].load(Ordering::Acquire);
+        let len = from.layers[l].len.load(Ordering::Acquire);
         for p in 0..len {
             for ch in 0..CHANNELS {
                 sh.write(dst, j, p, ch, sh.read(src, l, p, ch));
@@ -85,16 +85,16 @@ pub(crate) fn copy_layers(sh: &Shared, dst: usize, src: usize, layer: Option<usi
         }
         to.set_layer_shape(j, Shape {
             len,
-            tail: from.l_tail[l].load(Ordering::Relaxed),
-            born: from.l_born[l].load(Ordering::Relaxed),
+            tail: from.layers[l].tail.load(Ordering::Relaxed),
+            born: from.layers[l].born.load(Ordering::Relaxed),
         });
-        to.l_period[j].store(from.l_period[l].load(Ordering::Relaxed), Ordering::Release);
-        to.l_phase[j].store(from.l_phase[l].load(Ordering::Relaxed), Ordering::Release);
+        to.layers[j].period.store(from.layers[l].period.load(Ordering::Relaxed), Ordering::Release);
+        to.layers[j].phase.store(from.layers[l].phase.load(Ordering::Relaxed), Ordering::Release);
         // A layer's own window is the slice the player chose of it, so it
         // travels with the layer; the loop's window does not.
-        to.l_win_in[j].store(from.l_win_in[l].load(Ordering::Relaxed), Ordering::Relaxed);
-        to.l_win_out[j].store(from.l_win_out[l].load(Ordering::Relaxed), Ordering::Relaxed);
-        to.l_on[j].store(true, Ordering::Release);
+        to.layers[j].win_in.store(from.layers[l].win_in.load(Ordering::Relaxed), Ordering::Relaxed);
+        to.layers[j].win_out.store(from.layers[l].win_out.load(Ordering::Relaxed), Ordering::Relaxed);
+        to.layers[j].on.store(true, Ordering::Release);
         sh.rebuild_env(dst, j);
     }
     to.loop_len.store(src_len, Ordering::Release);

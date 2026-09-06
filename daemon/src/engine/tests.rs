@@ -75,11 +75,11 @@ fn lay(sh: &Shared, li: usize, layer: usize, len: usize, v: f32) {
         }
     }
     let lp = sh.lp(li);
-    lp.l_len[layer].store(len, Ordering::Release);
-    lp.l_period[layer].store(1, Ordering::Release);
-    lp.l_phase[layer].store(0, Ordering::Release);
-    lp.l_tail[layer].store(0, Ordering::Release);
-    lp.l_gain[layer].store(1.0f32.to_bits(), Ordering::Release);
+    lp.layers[layer].len.store(len, Ordering::Release);
+    lp.layers[layer].period.store(1, Ordering::Release);
+    lp.layers[layer].phase.store(0, Ordering::Release);
+    lp.layers[layer].tail.store(0, Ordering::Release);
+    lp.layers[layer].gain.store(1.0f32.to_bits(), Ordering::Release);
     lp.n_layers.store(layer + 1, Ordering::Release);
 }
 
@@ -396,8 +396,8 @@ fn a_sparse_layer_renders_where_it_lands() {
     one_layer_loop(&sh, 0, bar, 0.5);
     let lp = sh.lp(0);
     lp.loop_len.store(4 * bar, Ordering::Release);
-    lp.l_period[0].store(4, Ordering::Release);
-    lp.l_phase[0].store(2, Ordering::Release); // the third of four
+    lp.layers[0].period.store(4, Ordering::Release);
+    lp.layers[0].phase.store(2, Ordering::Release); // the third of four
     let out = sh.render_loop(0).expect("renders");
     assert_eq!(out.len(), 4 * bar * CHANNELS, "one cycle, not more");
     let quarter = |q: usize| out[q * bar * CHANNELS];
@@ -1096,8 +1096,8 @@ pub(crate) fn fixture() -> Shared {
     {
         let lp = sh.lp(2);
         lp.loop_len.store(1000, Ordering::Release);
-        lp.l_period[0].store(4, Ordering::Release);
-        lp.l_phase[0].store(2, Ordering::Release);
+        lp.layers[0].period.store(4, Ordering::Release);
+        lp.layers[0].phase.store(2, Ordering::Release);
         lp.speed.store(0.75f64.to_bits(), Ordering::Relaxed);
         lp.mono.store(true, Ordering::Relaxed);
         lp.pan.store(30, Ordering::Relaxed);

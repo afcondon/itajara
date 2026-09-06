@@ -204,10 +204,10 @@ pub(crate) fn sparse(sh: &Shared, li: usize, _sr: u32, n: usize) -> String {
     if len == 0 {
         return "that layer has no length.".into();
     }
-    lp.l_period[l].store(n, Ordering::Release);
+    lp.layers[l].period.store(n, Ordering::Release);
     // A phase that is now past the end would silence the layer outright, which
     // is not what asking for a different spacing means.
-    lp.l_phase[l].store(phase % n, Ordering::Release);
+    lp.layers[l].phase.store(phase % n, Ordering::Release);
     if n == 1 {
         format!("layer {} sounds every time round.", l + 1)
     } else {
@@ -238,7 +238,7 @@ pub(crate) fn place_at(sh: &Shared, li: usize, n: usize) -> String {
     let l = layers - 1;
     let (_, period, _) = lp.layer_shape(l);
     let slot = n % period.max(1);
-    lp.l_phase[l].store(slot, Ordering::Release);
+    lp.layers[l].phase.store(slot, Ordering::Release);
     if period <= 1 {
         format!(
             "layer {} sounds every time round, so there is only one slot; \
@@ -625,7 +625,7 @@ pub(crate) fn rotate(sh: &Shared, li: usize) -> String {
         return "that layer sounds every time round — spread it first.".into();
     }
     let next = (phase + 1) % period;
-    lp.l_phase[l].store(next, Ordering::Release);
+    lp.layers[l].phase.store(next, Ordering::Release);
     format!("layer {} moved to slot {} of {}.", l + 1, next + 1, period)
 }
 
@@ -641,8 +641,8 @@ pub(crate) fn dense(sh: &Shared, li: usize) -> String {
         return "nothing to fill.".into();
     }
     let l = layers - 1;
-    lp.l_period[l].store(1, Ordering::Release);
-    lp.l_phase[l].store(0, Ordering::Release);
+    lp.layers[l].period.store(1, Ordering::Release);
+    lp.layers[l].phase.store(0, Ordering::Release);
     format!("layer {} sounds every time round again.", l + 1)
 }
 

@@ -26,7 +26,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::engine::{dispatch, Shared};
+use crate::engine::{dispatch, Layer, Shared};
 
 /// How often the snapshot goes out. Fast enough for a position readout to look
 /// continuous, slow enough to be free.
@@ -184,6 +184,48 @@ fn talk(
     }
 }
 
+/// One layer, as JSON: the `LayerShape` the other side reads.
+///
+/// **The only place a layer is written to the wire**, and it has to stay
+/// that way. It used to be two hand-written format strings — one under each
+/// loop, one at the top level for the selected loop — and both are read as
+/// one `LayerShape` type on the other side, coerced from JSON with nothing
+/// checking. Sending three fields here and six there did not fail politely:
+/// the app compares snapshots to decide whether to redraw, that comparison
+/// reads `env`, and PureScript's array equality opens with `xs.length`, so a
+/// missing field threw a TypeError ten times a second and froze the display
+/// while the socket, the commands and the audio all stayed healthy
+/// (2026-08-23). Two serialisers for one type was the whole bug; if the two
+/// places ever need to diverge, give them their own types on both sides.
+///
+/// `tail` is the continuation held past this layer's end — never sounded,
+/// and the only material a seamless wrap could be made from. Reported so the
+/// display can say a loop has it rather than leaving it invisible. `env` is
+/// forty-eight bytes, and only for layers that exist — small enough to ride
+/// here rather than needing a message of its own, a request to trigger it,
+/// and a way for it to be out of date.
+fn layer_json(layer: &Layer) -> String {
+    let (len, period, phase) = layer.shape();
+    format!(
+        r#"{{"len":{},"period":{},"phase":{},"tail":{},"gain":{:.5},"born":{},"on":{},"lwIn":{},"lwOut":{},"env":[{}]}}"#,
+        len,
+        period,
+        phase,
+        layer.tail(),
+        layer.gain(),
+        layer.born(),
+        layer.on(),
+        layer.window().map(|w| w.0).unwrap_or(0),
+        layer.window().map(|w| w.1).unwrap_or(0),
+        layer
+            .env()
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
 /// The whole visible state of the engine, as JSON.
 ///
 /// Hand-rolled rather than pulling in a serialiser: the shape is fixed, small,
@@ -212,34 +254,7 @@ pub(crate) fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
             // loop is — which it would the moment speed or a pendulum was on.
             let pos = lp.play_pos(cur, len) as i64;
             let shapes: Vec<String> = (0..lp.n_layers.load(Ordering::Acquire))
-                .map(|l| {
-                    let (slen, period, phase) = lp.layer_shape(l);
-                    // `tail` is the continuation held past this layer's end —
-                    // never sounded, and the only material a seamless wrap
-                    // could be made from. Reported so the display can say a
-                    // loop has it rather than leaving it invisible.
-                    format!(
-                        r#"{{"len":{},"period":{},"phase":{},"tail":{},"gain":{:.5},"born":{},"on":{},"lwIn":{},"lwOut":{},"env":[{}]}}"#,
-                        slen,
-                        period,
-                        phase,
-                        lp.layer_tail(l),
-                        lp.layer_gain(l),
-                        lp.layer_born(l),
-                        lp.layer_on(l),
-                        lp.layer_window(l).map(|w| w.0).unwrap_or(0),
-                        lp.layer_window(l).map(|w| w.1).unwrap_or(0),
-                        // Forty-eight bytes, and only for layers that exist —
-                        // small enough to ride here rather than needing a
-                        // message of its own, a request to trigger it, and a
-                        // way for it to be out of date.
-                        lp.layer_env(l)
-                            .iter()
-                            .map(|b| b.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    )
-                })
+                .map(|l| layer_json(&lp.layers[l]))
                 .collect();
             format!(
                 concat!(
@@ -378,36 +393,10 @@ pub(crate) fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
     // a loop and not what is in it: two takes of the same length look identical
     // when one of them plays one bar in four, and that is precisely the thing
     // the display exists to make visible.
-    // The SAME six fields as the per-loop shapes above, and it has to stay that
-    // way: both are read as one `LayerShape` type on the other side, coerced
-    // from JSON with nothing checking. Sending three here and six there did not
-    // fail politely — the app compares snapshots to decide whether to redraw,
-    // that comparison reads `env`, and PureScript's array equality opens with
-    // `xs.length`, so a missing field threw a TypeError ten times a second and
-    // froze the display while the socket, the commands and the audio all stayed
-    // healthy (2026-08-23). Two serialisers for one type is the whole bug; if
-    // this ever needs to diverge again, give it its own type on both sides.
+    // The SAME fields as the per-loop shapes above, through the same
+    // `layer_json` — see there for why it has to be one function.
     let shapes: Vec<String> = (0..cl.n_layers.load(Ordering::Acquire))
-        .map(|l| {
-            let (len, period, phase) = cl.layer_shape(l);
-            format!(
-                r#"{{"len":{},"period":{},"phase":{},"tail":{},"gain":{:.5},"born":{},"on":{},"lwIn":{},"lwOut":{},"env":[{}]}}"#,
-                len,
-                period,
-                phase,
-                cl.layer_tail(l),
-                cl.layer_gain(l),
-                cl.layer_born(l),
-                cl.layer_on(l),
-                cl.layer_window(l).map(|w| w.0).unwrap_or(0),
-                cl.layer_window(l).map(|w| w.1).unwrap_or(0),
-                cl.layer_env(l)
-                    .iter()
-                    .map(|v| v.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        })
+        .map(|l| layer_json(&cl.layers[l]))
         .collect();
 
     // The last thing a command said, carried in every snapshot rather than sent
@@ -532,4 +521,40 @@ fn db(x: f32) -> f64 {
 fn is_edit(cmd: &str) -> bool {
     let rest = cmd.trim().trim_start_matches(|c: char| c.is_ascii_digit());
     ["in", "out", "win", "rot", "pk", "ly", "lw", "dp"].iter().any(|v| rest.starts_with(v))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use super::layer_json;
+    use crate::engine::{ENV_BUCKETS, Layer};
+
+    /// **The wire did not move.** The literal is one layer's object as the
+    /// pre-`Layer` emitter wrote it (loop 1's third layer of the engine's
+    /// `fixture`, captured on `main` at de1c1a0): same keys, same order, same
+    /// number formatting. `check-snapshot.py` holds the running daemon to the
+    /// PureScript readers; this holds the function to the text.
+    #[test]
+    fn a_layer_is_written_as_it_always_was() {
+        let layer = Layer::new();
+        layer.len.store(300, Ordering::Release);
+        layer.born.store(1, Ordering::Release);
+        layer.gain.store(10f32.powf(-6.0 / 20.0).to_bits(), Ordering::Release);
+        layer.win_in.store(100, Ordering::Relaxed);
+        layer.win_out.store(200, Ordering::Release);
+        *layer.env.lock().unwrap() = vec![211; ENV_BUCKETS];
+        assert_eq!(
+            layer_json(&layer),
+            format!(
+                r#"{{"len":300,"period":1,"phase":0,"tail":0,"gain":0.50119,"born":1,"on":true,"lwIn":100,"lwOut":200,"env":[{}]}}"#,
+                ["211"; ENV_BUCKETS].join(",")
+            )
+        );
+        // And a bare one, which is what an empty slot's layers are.
+        assert_eq!(
+            layer_json(&Layer::new()),
+            r#"{"len":0,"period":1,"phase":0,"tail":0,"gain":1.00000,"born":0,"on":true,"lwIn":0,"lwOut":0,"env":[]}"#
+        );
+    }
 }

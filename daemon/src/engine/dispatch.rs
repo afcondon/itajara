@@ -688,7 +688,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 let n = lp.n_layers.load(Ordering::Acquire);
                 return match num.parse::<usize>() {
                     Ok(l) if l >= 1 && l <= n => {
-                        lp.l_on[l - 1].store(on, Ordering::Release);
+                        lp.layers[l - 1].on.store(on, Ordering::Release);
                         format!("loop {} layer {} is {}.", li, l, if on { "on" } else { "off" })
                     }
                     Ok(l) => format!(
@@ -716,21 +716,21 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 let l = k - 1;
                 match (parts.next(), parts.next()) {
                     (None, _) => {
-                        lp.l_win_in[l].store(0, Ordering::Relaxed);
-                        lp.l_win_out[l].store(0, Ordering::Relaxed);
+                        lp.layers[l].win_in.store(0, Ordering::Relaxed);
+                        lp.layers[l].win_out.store(0, Ordering::Relaxed);
                         return format!("loop {} layer {} plays whole again.", li, k);
                     }
                     (Some(a), Some(b)) => {
-                        let len = lp.l_len[l].load(Ordering::Acquire) as i64;
+                        let len = lp.layers[l].len.load(Ordering::Acquire) as i64;
                         match (a.trim().parse::<i64>(), b.trim().parse::<i64>()) {
                             // Anywhere, so long as it overlaps the layer: the
                             // read is a range check, so silence either side
                             // costs nothing, and a thirteen-second window on a
                             // five-second layer is exactly the Arbhar's case.
                             (Ok(i), Ok(o)) if o > i && i < len && o > 0 && (o - i) as usize <= sh.max_frames => {
-                                lp.l_win_out[l].store(0, Ordering::Relaxed);
-                                lp.l_win_in[l].store(i, Ordering::Relaxed);
-                                lp.l_win_out[l].store(o, Ordering::Release);
+                                lp.layers[l].win_out.store(0, Ordering::Relaxed);
+                                lp.layers[l].win_in.store(i, Ordering::Relaxed);
+                                lp.layers[l].win_out.store(o, Ordering::Release);
                                 return format!(
                                     "loop {} layer {} plays {}..{} of {}{}.",
                                     li, k, i, o, len,
@@ -759,7 +759,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                             return format!("loop {} is recording — finish it first.", li);
                         }
                         let src = k - 1;
-                        let len = lp.l_len[src].load(Ordering::Acquire);
+                        let len = lp.layers[src].len.load(Ordering::Acquire);
                         sh.zero_layer(li, n);
                         for p in 0..len {
                             for ch in 0..CHANNELS {
@@ -768,14 +768,14 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                         }
                         lp.set_layer_shape(n, Shape {
                             len,
-                            tail: lp.l_tail[src].load(Ordering::Relaxed),
-                            born: lp.l_born[src].load(Ordering::Relaxed),
+                            tail: lp.layers[src].tail.load(Ordering::Relaxed),
+                            born: lp.layers[src].born.load(Ordering::Relaxed),
                         });
-                        lp.l_period[n].store(lp.l_period[src].load(Ordering::Relaxed), Ordering::Release);
-                        lp.l_phase[n].store(lp.l_phase[src].load(Ordering::Relaxed), Ordering::Release);
-                        lp.l_win_in[n].store(lp.l_win_in[src].load(Ordering::Relaxed), Ordering::Relaxed);
-                        lp.l_win_out[n].store(lp.l_win_out[src].load(Ordering::Relaxed), Ordering::Relaxed);
-                        lp.l_on[n].store(true, Ordering::Release);
+                        lp.layers[n].period.store(lp.layers[src].period.load(Ordering::Relaxed), Ordering::Release);
+                        lp.layers[n].phase.store(lp.layers[src].phase.load(Ordering::Relaxed), Ordering::Release);
+                        lp.layers[n].win_in.store(lp.layers[src].win_in.load(Ordering::Relaxed), Ordering::Relaxed);
+                        lp.layers[n].win_out.store(lp.layers[src].win_out.load(Ordering::Relaxed), Ordering::Relaxed);
+                        lp.layers[n].on.store(true, Ordering::Release);
                         sh.rebuild_env(li, n);
                         lp.n_layers.store(n + 1, Ordering::Release);
                         lp.redo_to.store(n + 1, Ordering::Release);

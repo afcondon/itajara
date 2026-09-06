@@ -49,6 +49,7 @@ mod dispatch;
 mod edit;
 mod export;
 mod guards;
+mod layer;
 mod loop_state;
 mod run;
 mod selftest;
@@ -57,6 +58,7 @@ mod verb;
 
 pub use dispatch::dispatch;
 pub use loop_state::Loop;
+pub(crate) use layer::Layer;
 pub use run::run;
 pub use shared::Shared;
 pub(crate) use run::resolve_residual;
@@ -168,7 +170,7 @@ pub(crate) struct Shape {
 /// slot is where a loop is watched. Four times the bytes on the wire —
 /// eight loops of four layers is six kilobytes a snapshot, thirty a second,
 /// on localhost — for a picture that says which loop this is.
-const ENV_BUCKETS: usize = 192;
+pub(crate) const ENV_BUCKETS: usize = 192;
 
 /// The quietest thing the envelope draws, in dBFS.
 ///

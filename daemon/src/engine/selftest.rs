@@ -147,8 +147,8 @@ pub(crate) fn selftest(sh: &Shared, sr: u32, secs: f64) -> Result<(), Box<dyn Er
     if n >= 2 {
         println!("\n  Spread: the same layer, sounding once instead of {} times.", n);
         let before: Vec<f32> = (0..n).map(click_at).collect();
-        lp.l_period[0].store(n, Ordering::Release);
-        lp.l_phase[0].store(0, Ordering::Release);
+        lp.layers[0].period.store(n, Ordering::Release);
+        lp.layers[0].phase.store(0, Ordering::Release);
         let sounding: Vec<usize> = (0..n).filter(|&c| click_at(c) >= 0.01).collect();
         if sounding != vec![0] {
             return Err(format!(
@@ -157,7 +157,7 @@ pub(crate) fn selftest(sh: &Shared, sr: u32, secs: f64) -> Result<(), Box<dyn Er
             )
             .into());
         }
-        lp.l_phase[0].store(n - 1, Ordering::Release);
+        lp.layers[0].phase.store(n - 1, Ordering::Release);
         let moved: Vec<usize> = (0..n).filter(|&c| click_at(c) >= 0.01).collect();
         if moved != vec![n - 1] {
             return Err(format!(
@@ -169,8 +169,8 @@ pub(crate) fn selftest(sh: &Shared, sr: u32, secs: f64) -> Result<(), Box<dyn Er
         }
         println!("    sounds at cycle 0 alone, then at cycle {} alone.", n - 1);
 
-        lp.l_period[0].store(1, Ordering::Release);
-        lp.l_phase[0].store(0, Ordering::Release);
+        lp.layers[0].period.store(1, Ordering::Release);
+        lp.layers[0].phase.store(0, Ordering::Release);
         let after: Vec<f32> = (0..n).map(click_at).collect();
         if before != after {
             return Err("dense again did not restore what spreading hid — the audio \
