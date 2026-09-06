@@ -226,155 +226,155 @@ fn layer_json(layer: &Layer) -> String {
     )
 }
 
-/// The whole visible state of the engine, as JSON.
+/// One loop, as JSON: the `LoopState` the other side reads, one of the
+/// `loops` that `rig_json` carries.
+///
+/// **The only place a loop is written to the wire.** Its layers go through
+/// `layer_json`, and the reason given there is the reason for this function
+/// too. `cur` is the output frame the whole snapshot is drawn at — read once
+/// by the caller, so eight positions describe one instant.
+fn loop_json(sh: &Shared, li: usize, sr: u32, cur: i64) -> String {
+    let lp = sh.lp(li);
+    let len = lp.loop_len.load(Ordering::Acquire);
+    // Through the engine's own playhead rather than subtracting `origin`
+    // here, so the display cannot disagree with the audio about where a
+    // loop is — which it would the moment speed or a pendulum was on.
+    let pos = lp.play_pos(cur, len) as i64;
+    let shapes: Vec<String> = (0..lp.n_layers.load(Ordering::Acquire))
+        .map(|l| layer_json(&lp.layers[l]))
+        .collect();
+    format!(
+        concat!(
+            r#"{{"index":{},"state":"{}","layers":{},"loopFrames":{},"#,
+            r#""loopSecs":{:.4},"pos":{},"phase":{:.5},"armed":{},"#,
+            r#""recording":{},"quant":{},"muted":{},"reverse":{},"pan":{},"#,
+            r#""speed":{:.4},"pendulum":{},"oneShot":{},"levelArm":{},"#,
+            r#""firing":{},"chance":{:.4},"skipping":{},"fadeMs":{:.1},"decayDb":{:.2},"#,
+            r#""volDb":{:.2},"revox":{},"fbDb":{:.2},"toneHz":{:.0},"cycles":{},"winIn":{},"winOut":{},"rot":{},"#,
+            r#""src":{},"mono":{},"pendingAt":{},"recFrames":{},"recEnv":[{}],"shapes":[{}]}}"#
+        ),
+        li,
+        lp.state_name(),
+        lp.n_layers.load(Ordering::Acquire),
+        len,
+        len as f64 / sr as f64,
+        pos,
+        if len > 0 { pos as f64 / len as f64 } else { 0.0 },
+        lp.is_armed(),
+        lp.is_recording(),
+        lp.quantised(),
+        lp.muted.load(Ordering::Relaxed),
+        // Direction is the sign of speed in the engine; it is reported
+        // separately as well because the display asks "which way round
+        // is this" far more often than it asks "how fast".
+        lp.speed() < 0.0,
+        lp.pan.load(Ordering::Relaxed),
+        lp.speed().abs(),
+        lp.pendulum.load(Ordering::Relaxed),
+        // The two modes. Reported because the pedal cannot show them and
+        // because they change what a *tap* means: a tap on a one-shot
+        // fires it where a tap on any other loop stops it, and the app
+        // has to know which before the foot lands.
+        lp.one_shot.load(Ordering::Relaxed),
+        lp.level_arm.load(Ordering::Relaxed),
+        // Inside a pass, or between them. The playhead never stops — it
+        // cannot — so `pos` alone shows a one-shot sweeping along while
+        // it is silent, which is a display describing something nobody
+        // can hear.
+        lp.firing(cur),
+        // How often this loop plays, and whether it is sitting this
+        // pass out. `skipping` reads the mixer's decision and never
+        // makes one — a snapshot that rolled would decide passes on
+        // whether anybody was looking.
+        lp.chance_of(),
+        lp.skipping(cur, len),
+        // In milliseconds rather than frames, so the display never has
+        // to know the sample rate to say what a switch did.
+        lp.fade.load(Ordering::Relaxed) as f64 / sr as f64 * 1000.0,
+        // In decibels a pass, the unit it was asked for. Zero holds for
+        // ever, which is what every loop did before this existed.
+        {
+            let d = lp.decay_of();
+            if d >= 1.0 { 0.0 } else { 20.0 * (d.max(1e-9) as f64).log10() }
+        },
+        // This loop's level, in decibels, unity at zero. **Silence is
+        // reported as the floor rather than as negative infinity**,
+        // which is not a number JSON has and not a number a knob can be
+        // put at — the client's own scale bottoms out at -60 and reads
+        // that as off.
+        {
+            let g = f32::from_bits(lp.vol.load(Ordering::Relaxed));
+            if g >= 1.0 { 0.0 }
+            else if g <= 0.0 { -60.0 }
+            else { 20.0 * (g.max(1e-9) as f64).log10() }
+        },
+        // Frames until a scheduled transition fires, or -1 for nothing
+        // pending. A display that can show "starts in 1.4 s" is the
+        // difference between a deliberate wait and a dead button.
+        // Whether this loop is a tape, and what a pass over it leaves.
+        // Reported because it changes what every other control means —
+        // undo is gone, an overdub makes no layer — and a mode you
+        // cannot see is a mode you will be surprised by.
+        lp.revox.load(Ordering::Relaxed),
+        {
+            let g = f32::from_bits(lp.fb.load(Ordering::Relaxed));
+            if g >= 1.0 { 0.0 }
+            else if g <= 0.0 { -60.0 }
+            else { 20.0 * (g.max(1e-9) as f64).log10() }
+        },
+        f32::from_bits(lp.tone.load(Ordering::Relaxed)),
+        // How many bars this loop has been told it is. Zero means never
+        // told, which reads as one everywhere — reported as stored, so
+        // the app can tell "one bar" from "nobody has said".
+        lp.cycles.load(Ordering::Acquire),
+        // As the hand has set them — pending while an edit waits to
+        // be applied — so the page shows what was asked, not the past.
+        lp.edit_view().0,
+        lp.edit_view().1,
+        lp.edit_view().2,
+        // **One-based, because it is an index into a list a person
+        // reads.** The wire counts loops from zero and that is a debt
+        // being carried; a field added today should not add to it.
+        sh.src_of(li) + 1,
+        lp.mono.load(Ordering::Relaxed),
+        lp.pending_in(cur),
+        lp.rec_frames(sh.out_frames.load(Ordering::Acquire) as i64),
+        // **The take in hand, drawn while it is being played.** Empty
+        // whenever nothing is recording, so the display has one test
+        // rather than having to work the state out for itself — and so
+        // a finished take stops being drawn twice the instant it
+        // becomes a layer.
+        if lp.is_recording() {
+            lp.rec_env_bytes()
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            String::new()
+        },
+        shapes.join(","),
+    )
+}
+
+/// The rig, as JSON: the `LooperState` the other side reads, which is the top
+/// level of the snapshot.
+///
+/// **Rig-level facts only** — the device, the clock, the arena, the sources,
+/// the last ack — and then `loops`, one `loop_json` each. Nothing about any
+/// one loop is written here. It used to be: the selected loop's `state`,
+/// `layers`, `loopFrames`, `loopSecs`, `pos`, `phase`, `armed`, `recording`
+/// and `shapes` were repeated at the top level for a page written when there
+/// was one loop, deliberately and temporarily, until every surface read
+/// `loops[i]`; they all do, and the repetition went on 2026-09-06.
 ///
 /// Hand-rolled rather than pulling in a serialiser: the shape is fixed, small,
 /// and this way it is obvious at a glance what the app is being told. If it
 /// grows a variable shape, that is the moment to reach for serde and not
 /// before.
-pub(crate) fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
+fn rig_json(sh: &Shared, sr: u32, alive: bool) -> String {
     let cur = sh.out_frames.load(Ordering::Acquire) as i64;
-
-    // One object per loop, and separately the SELECTED loop's numbers repeated
-    // at the top level.
-    //
-    // The duplication is deliberate and temporary. The app's `LooperState` is a
-    // flat record describing one loop, written when there was one; promoting it
-    // to an array is a change to every reader of it. Keeping the old fields
-    // pointed at the selected loop means the existing Looper page keeps working
-    // untouched while the six-loop display is built against `loops` — rather
-    // than the display and the engine both being new at once, which is how you
-    // end up debugging two things and knowing neither.
-    let each: Vec<String> = (0..sh.n_loops)
-        .map(|li| {
-            let lp = sh.lp(li);
-            let len = lp.loop_len.load(Ordering::Acquire);
-            // Through the engine's own playhead rather than subtracting `origin`
-            // here, so the display cannot disagree with the audio about where a
-            // loop is — which it would the moment speed or a pendulum was on.
-            let pos = lp.play_pos(cur, len) as i64;
-            let shapes: Vec<String> = (0..lp.n_layers.load(Ordering::Acquire))
-                .map(|l| layer_json(&lp.layers[l]))
-                .collect();
-            format!(
-                concat!(
-                    r#"{{"index":{},"state":"{}","layers":{},"loopFrames":{},"#,
-                    r#""loopSecs":{:.4},"pos":{},"phase":{:.5},"armed":{},"#,
-                    r#""recording":{},"quant":{},"muted":{},"reverse":{},"pan":{},"#,
-                    r#""speed":{:.4},"pendulum":{},"oneShot":{},"levelArm":{},"#,
-                    r#""firing":{},"chance":{:.4},"skipping":{},"fadeMs":{:.1},"decayDb":{:.2},"#,
-                    r#""volDb":{:.2},"revox":{},"fbDb":{:.2},"toneHz":{:.0},"cycles":{},"winIn":{},"winOut":{},"rot":{},"#,
-                    r#""src":{},"mono":{},"pendingAt":{},"recFrames":{},"recEnv":[{}],"shapes":[{}]}}"#
-                ),
-                li,
-                lp.state_name(),
-                lp.n_layers.load(Ordering::Acquire),
-                len,
-                len as f64 / sr as f64,
-                pos,
-                if len > 0 { pos as f64 / len as f64 } else { 0.0 },
-                lp.is_armed(),
-                lp.is_recording(),
-                lp.quantised(),
-                lp.muted.load(Ordering::Relaxed),
-                // Direction is the sign of speed in the engine; it is reported
-                // separately as well because the display asks "which way round
-                // is this" far more often than it asks "how fast".
-                lp.speed() < 0.0,
-                lp.pan.load(Ordering::Relaxed),
-                lp.speed().abs(),
-                lp.pendulum.load(Ordering::Relaxed),
-                // The two modes. Reported because the pedal cannot show them and
-                // because they change what a *tap* means: a tap on a one-shot
-                // fires it where a tap on any other loop stops it, and the app
-                // has to know which before the foot lands.
-                lp.one_shot.load(Ordering::Relaxed),
-                lp.level_arm.load(Ordering::Relaxed),
-                // Inside a pass, or between them. The playhead never stops — it
-                // cannot — so `pos` alone shows a one-shot sweeping along while
-                // it is silent, which is a display describing something nobody
-                // can hear.
-                lp.firing(cur),
-                // How often this loop plays, and whether it is sitting this
-                // pass out. `skipping` reads the mixer's decision and never
-                // makes one — a snapshot that rolled would decide passes on
-                // whether anybody was looking.
-                lp.chance_of(),
-                lp.skipping(cur, len),
-                // In milliseconds rather than frames, so the display never has
-                // to know the sample rate to say what a switch did.
-                lp.fade.load(Ordering::Relaxed) as f64 / sr as f64 * 1000.0,
-                // In decibels a pass, the unit it was asked for. Zero holds for
-                // ever, which is what every loop did before this existed.
-                {
-                    let d = lp.decay_of();
-                    if d >= 1.0 { 0.0 } else { 20.0 * (d.max(1e-9) as f64).log10() }
-                },
-                // This loop's level, in decibels, unity at zero. **Silence is
-                // reported as the floor rather than as negative infinity**,
-                // which is not a number JSON has and not a number a knob can be
-                // put at — the client's own scale bottoms out at -60 and reads
-                // that as off.
-                {
-                    let g = f32::from_bits(lp.vol.load(Ordering::Relaxed));
-                    if g >= 1.0 { 0.0 }
-                    else if g <= 0.0 { -60.0 }
-                    else { 20.0 * (g.max(1e-9) as f64).log10() }
-                },
-                // Frames until a scheduled transition fires, or -1 for nothing
-                // pending. A display that can show "starts in 1.4 s" is the
-                // difference between a deliberate wait and a dead button.
-                // Whether this loop is a tape, and what a pass over it leaves.
-                // Reported because it changes what every other control means —
-                // undo is gone, an overdub makes no layer — and a mode you
-                // cannot see is a mode you will be surprised by.
-                lp.revox.load(Ordering::Relaxed),
-                {
-                    let g = f32::from_bits(lp.fb.load(Ordering::Relaxed));
-                    if g >= 1.0 { 0.0 }
-                    else if g <= 0.0 { -60.0 }
-                    else { 20.0 * (g.max(1e-9) as f64).log10() }
-                },
-                f32::from_bits(lp.tone.load(Ordering::Relaxed)),
-                // How many bars this loop has been told it is. Zero means never
-                // told, which reads as one everywhere — reported as stored, so
-                // the app can tell "one bar" from "nobody has said".
-                lp.cycles.load(Ordering::Acquire),
-                // As the hand has set them — pending while an edit waits to
-                // be applied — so the page shows what was asked, not the past.
-                lp.edit_view().0,
-                lp.edit_view().1,
-                lp.edit_view().2,
-                // **One-based, because it is an index into a list a person
-                // reads.** The wire counts loops from zero and that is a debt
-                // being carried; a field added today should not add to it.
-                sh.src_of(li) + 1,
-                lp.mono.load(Ordering::Relaxed),
-                lp.pending_in(cur),
-                lp.rec_frames(sh.out_frames.load(Ordering::Acquire) as i64),
-                // **The take in hand, drawn while it is being played.** Empty
-                // whenever nothing is recording, so the display has one test
-                // rather than having to work the state out for itself — and so
-                // a finished take stops being drawn twice the instant it
-                // becomes a layer.
-                if lp.is_recording() {
-                    lp.rec_env_bytes()
-                        .iter()
-                        .map(|b| b.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                } else {
-                    String::new()
-                },
-                shapes.join(","),
-            )
-        })
-        .collect();
-
-    let sel = sh.sel();
-    let cl = sh.lp(sel);
-    let loop_len = cl.loop_len.load(Ordering::Acquire);
-    let pos = cl.play_pos(cur, loop_len) as i64;
+    let each: Vec<String> = (0..sh.n_loops).map(|li| loop_json(sh, li, sr, cur)).collect();
 
     // Peaks are swapped out, so each reader gets the peak since the last read
     // rather than a decaying maximum. With one client that is exactly right;
@@ -389,16 +389,6 @@ pub(crate) fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
         .fold(0.0f32, f32::max);
     let out_peak = f32::from_bits(sh.out_peak.swap(0, Ordering::Relaxed));
 
-    // Each layer's own length and where it sounds. Without this the app can draw
-    // a loop and not what is in it: two takes of the same length look identical
-    // when one of them plays one bar in four, and that is precisely the thing
-    // the display exists to make visible.
-    // The SAME fields as the per-loop shapes above, through the same
-    // `layer_json` — see there for why it has to be one function.
-    let shapes: Vec<String> = (0..cl.n_layers.load(Ordering::Acquire))
-        .map(|l| layer_json(&cl.layers[l]))
-        .collect();
-
     // The last thing a command said, carried in every snapshot rather than sent
     // once. A client that reloads still sees it, and one that misses a frame has
     // not missed the only copy.
@@ -409,23 +399,16 @@ pub(crate) fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
 
     format!(
         concat!(
-            r#"{{"state":"{}","layers":{},"maxLayers":{},"loopFrames":{},"#,
-            r#""loopSecs":{:.4},"pos":{},"phase":{:.5},"sampleRate":{},"#,
+            r#"{{"maxLayers":{},"sampleRate":{},"#,
             r#""inDb":{:.1},"outDb":{:.1},"click":{},"monitor":{},"armDb":{:.1},"#,
-            r#""armed":{},"recording":{},"calibrated":{},"k":{},"#,
-            r#""audioAlive":{},"deviceLost":{},"reopens":{},"shapes":[{}],"#,
+            r#""calibrated":{},"k":{},"#,
+            r#""audioAlive":{},"deviceLost":{},"reopens":{},"#,
             r#""ack":"{}","ackSeq":{},"linkTempo":{:.4},"linkQuantum":{:.4},"#,
             r#""linkBarFrames":{},"linkAnchors":{},"linkRejected":{},"#,
             r#""barFrames":{},"barOrigin":{},"launchQ":{},"#,
             r#""maxSecs":{:.3},"fixedSecs":{:.3},"ringSecs":{:.3},"selected":{},"nLoops":{},"sources":[{}],"loops":[{}]}}"#
         ),
-        cl.state_name(),
-        cl.n_layers.load(Ordering::Acquire),
         sh.max_layers,
-        loop_len,
-        loop_len as f64 / sr as f64,
-        pos,
-        if loop_len > 0 { pos as f64 / loop_len as f64 } else { 0.0 },
         sr,
         db(in_peak),
         db(out_peak),
@@ -441,14 +424,11 @@ pub(crate) fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
             let m = f32::from_bits(sh.arm_thresh.load(Ordering::Relaxed));
             if m <= 0.0 { -80.0 } else { (20.0 * (m.max(1e-9) as f64).log10()).max(-80.0) }
         },
-        cl.is_armed(),
-        cl.is_recording(),
         sh.k_set.load(Ordering::Acquire),
         sh.k.load(Ordering::Acquire),
         alive,
         sh.device_lost.load(Ordering::Acquire),
         sh.reopens.load(Ordering::Acquire),
-        shapes.join(","),
         escape(&ack),
         sh.ack_seq.load(Ordering::Acquire),
         tempo,
@@ -474,7 +454,9 @@ pub(crate) fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
         sh.max_frames as f64 / sr as f64,
         sh.fixed_frames as f64 / sr as f64,
         sh.ring_len as f64 / sr as f64,
-        sel,
+        // The loop a console verb with no loop digit addresses. Once the loop
+        // whose fields were repeated above; now only that.
+        sh.sel(),
         sh.n_loops,
         // **The sources, named, in the order a `src<n>` counts them.** Without
         // this the app would have a number and no way to say what it meant, and
@@ -486,6 +468,15 @@ pub(crate) fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
             .join(","),
         each.join(","),
     )
+}
+
+/// The whole visible state of the engine, as JSON: one `rig_json`. This is the
+/// message; that is the type. Three emitters write it — `rig_json`,
+/// `loop_json`, `layer_json` — one per type on the wire, each called once per
+/// instance, and `check-snapshot.py` holds the running daemon to the
+/// PureScript side.
+pub(crate) fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
+    rig_json(sh, sr, alive)
 }
 
 /// Enough JSON string escaping for the one free-text field in the snapshot.
@@ -527,7 +518,8 @@ fn is_edit(cmd: &str) -> bool {
 mod tests {
     use std::sync::atomic::Ordering;
 
-    use super::layer_json;
+    use super::{layer_json, loop_json, rig_json};
+    use crate::engine::tests::fixture;
     use crate::engine::{ENV_BUCKETS, Layer};
 
     /// **The wire did not move.** The literal is one layer's object as the
@@ -556,5 +548,61 @@ mod tests {
             layer_json(&Layer::new()),
             r#"{"len":0,"period":1,"phase":0,"tail":0,"gain":1.00000,"born":0,"on":true,"lwIn":0,"lwOut":0,"env":[]}"#
         );
+    }
+
+    /// **The loop did not move either.** Loop 2 of the engine's `fixture` —
+    /// one sparse layer at three-quarter speed, folded to mono and panned —
+    /// as the pre-`loop_json` emitter wrote it into `loops[]` (captured on
+    /// `main` at c6b52b2), and an empty slot beside it. Same keys, same order,
+    /// same number formatting; only the top level shrank.
+    #[test]
+    fn a_loop_is_written_as_it_always_was() {
+        let sh = fixture();
+        let cur = sh.out_frames.load(Ordering::Acquire) as i64;
+        assert_eq!(
+            loop_json(&sh, 2, 48_000, cur),
+            format!(
+                concat!(
+                    r#"{{"index":2,"state":"idle","layers":1,"loopFrames":1000,"loopSecs":0.0208,"pos":0,"phase":0.00000,"armed":false,"recording":false,"quant":false,"muted":false,"reverse":false,"pan":30,"speed":0.7500,"pendulum":false,"oneShot":false,"levelArm":false,"firing":false,"chance":1.0000,"skipping":false,"fadeMs":0.0,"decayDb":0.00,"volDb":-1.94,"revox":false,"fbDb":-3.00,"toneHz":6500,"cycles":0,"winIn":0,"winOut":0,"rot":0,"src":1,"mono":true,"pendingAt":-1,"recFrames":0,"recEnv":[],"#,
+                    r#""shapes":[{{"len":250,"period":4,"phase":2,"tail":0,"gain":1.00000,"born":0,"on":true,"lwIn":0,"lwOut":0,"env":[{}]}}]}}"#
+                ),
+                ["229"; ENV_BUCKETS].join(",")
+            )
+        );
+        assert_eq!(
+            loop_json(&sh, 4, 48_000, cur),
+            r#"{"index":4,"state":"idle","layers":0,"loopFrames":0,"loopSecs":0.0000,"pos":0,"phase":0.00000,"armed":false,"recording":false,"quant":false,"muted":false,"reverse":false,"pan":64,"speed":1.0000,"pendulum":false,"oneShot":false,"levelArm":false,"firing":false,"chance":1.0000,"skipping":false,"fadeMs":0.0,"decayDb":0.00,"volDb":0.00,"revox":false,"fbDb":-3.00,"toneHz":6500,"cycles":0,"winIn":0,"winOut":0,"rot":0,"src":1,"mono":false,"pendingAt":-1,"recFrames":0,"recEnv":[],"shapes":[]}"#
+        );
+    }
+
+    /// **The top level is the rig and nothing else.** Its keys, in the order
+    /// they are written; none of the nine that used to repeat the selected
+    /// loop; and `loops` is `loop_json` once per loop, in order.
+    #[test]
+    fn the_rig_is_only_the_rig() {
+        let sh = fixture();
+        let text = rig_json(&sh, 48_000, true);
+        let v: serde_json::Value = serde_json::from_str(&text).expect("rig_json is JSON");
+        let obj = v.as_object().expect("an object");
+        let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        let mut expected = vec![
+            "maxLayers", "sampleRate", "inDb", "outDb", "click", "monitor", "armDb",
+            "calibrated", "k", "audioAlive", "deviceLost", "reopens", "ack", "ackSeq",
+            "linkTempo", "linkQuantum", "linkBarFrames", "linkAnchors", "linkRejected",
+            "barFrames", "barOrigin", "launchQ", "maxSecs", "fixedSecs", "ringSecs",
+            "selected", "nLoops", "sources", "loops",
+        ];
+        expected.sort_unstable();
+        assert_eq!(keys, expected);
+        for gone in ["state", "layers", "loopFrames", "loopSecs", "pos", "phase", "armed", "recording", "shapes"] {
+            assert!(!obj.contains_key(gone), "{} is a loop's, not the rig's", gone);
+        }
+        assert_eq!(text.starts_with(r#"{"maxLayers":"#), true, "{}", text);
+        // The loops are the loop emitter's text, verbatim and in order.
+        let cur = sh.out_frames.load(Ordering::Acquire) as i64;
+        let loops: Vec<String> = (0..sh.n_loops).map(|li| loop_json(&sh, li, 48_000, cur)).collect();
+        assert!(text.ends_with(&format!(r#","loops":[{}]}}"#, loops.join(","))));
+        assert_eq!(obj["loops"].as_array().map(|a| a.len()), Some(sh.n_loops));
     }
 }
