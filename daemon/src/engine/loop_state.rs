@@ -20,6 +20,7 @@ use super::{
     IDLE,
     Layer,
     MULTIPLY,
+    NextTake,
     OVERDUB,
     PLAYING,
     Shape,
@@ -229,20 +230,11 @@ pub struct Loop {
     /// wasteful at sample rate.
     pub pan: AtomicUsize,
     pub(crate) state: AtomicU8Wrapper,
-    /// Set by the control thread, consumed by the output callback, which is the
-    /// only place a transition can be stamped to an exact frame.
-    pub(crate) request: AtomicU8Wrapper,
-    /// The output frame the pending request should take effect on, or
-    /// `i64::MIN` for "the next buffer", which is what every request used to be.
-    ///
-    /// This is what makes a loop start *on* a boundary rather than within a
-    /// buffer of one. Sleeping on the control thread until the boundary and
-    /// then setting the request would still land at the start of whichever
-    /// buffer came next — up to a full buffer late, and a buffer is 21 ms at
-    /// 1024 frames, which is an audible flam against a loop already playing.
-    /// The callback is the only thread that knows the frame, so the frame is
-    /// what it is told.
-    pub(crate) request_at: AtomicI64,
+    /// The plan for the next recording and the transition that starts it:
+    /// the phase asked for and its frame, a one-pass overdub, a level
+    /// crossing's back-date. Set by the control thread, taken once by the
+    /// output callback, cleared in one place. See `NextTake`.
+    pub(crate) next: NextTake,
     /// Whether this loop's transitions wait for the grid.
     ///
     /// Off by default, so a rig that never asks for it behaves exactly as it
@@ -311,16 +303,6 @@ pub struct Loop {
     /// continuously"*: with the ring running, arming costs nothing and the
     /// recording can begin before the command that caused it.
     pub level_arm: AtomicBool,
-    /// The output frame a pending recording should be back-dated to, or
-    /// `i64::MIN` for none.
-    ///
-    /// Written by the input callback at the threshold crossing, read by the
-    /// output callback when it stamps the recording. The two cannot be the same
-    /// frame — the crossing is found on the input thread and the transition is
-    /// stamped on the output one — so the difference is handed to `started_late`
-    /// and spent as pre-roll, which is the machinery a late footswitch already
-    /// built.
-    pub(crate) arm_from: AtomicI64,
     /// How many frames of the wrap are crossfaded with the layer's continuation.
     /// Zero is off, which is the default.
     ///
@@ -400,13 +382,6 @@ pub struct Loop {
     /// Cleared the moment anything is recorded, which is the moment resizing
     /// would become a trim.
     pub threaded: AtomicBool,
-    /// **The next overdub is one pass**: it starts at the loop's own zero and
-    /// closes itself a loop length later, as a layer the length of the loop.
-    /// Set by `fix` on a loop with material and spent when the overdub starts,
-    /// so a stale one cannot outlive the press it was sent with by more than
-    /// a moment. What a module that wants every layer the same length means
-    /// by "record another one".
-    pub one_pass: AtomicBool,
     pub revox: AtomicBool,
     /// What a Revox pass leaves of what was under it, as a linear gain. `1.0`
     /// is a tape that never erases; `0.0` is one that replaces.
@@ -491,8 +466,7 @@ impl Loop {
             cfg_armed: AtomicBool::new(false),
             pan: AtomicUsize::new(64),
             state: AtomicU8Wrapper::new(IDLE),
-            request: AtomicU8Wrapper::new(0),
-            request_at: AtomicI64::new(i64::MIN),
+            next: NextTake::new(),
             quant: AtomicBool::new(false),
             reached: AtomicUsize::new(0),
             rec_reached: AtomicI64::new(0),
@@ -503,13 +477,11 @@ impl Loop {
             one_shot: AtomicBool::new(false),
             shot_end: AtomicI64::new(i64::MIN),
             level_arm: AtomicBool::new(false),
-            arm_from: AtomicI64::new(i64::MIN),
             fade: AtomicUsize::new(0),
             decay: AtomicU32::new(1.0f32.to_bits()),
             vol: AtomicU32::new(1.0f32.to_bits()),
             rec_env: (0..ENV_BUCKETS).map(|_| AtomicU8::new(0)).collect(),
             threaded: AtomicBool::new(false),
-            one_pass: AtomicBool::new(false),
             revox: AtomicBool::new(false),
             fb: AtomicU32::new(10f32.powf(-3.0 / 20.0).to_bits()),
             tone: AtomicU32::new(6500.0f32.to_bits()),
@@ -787,7 +759,6 @@ impl Loop {
         self.one_shot.store(false, Ordering::Relaxed);
         self.shot_end.store(i64::MIN, Ordering::Release);
         self.level_arm.store(false, Ordering::Relaxed);
-        self.arm_from.store(i64::MIN, Ordering::Release);
         self.quant.store(false, Ordering::Relaxed);
         self.fade.store(0, Ordering::Relaxed);
         self.decay.store(1.0f32.to_bits(), Ordering::Relaxed);
@@ -820,7 +791,9 @@ impl Loop {
         self.cycles.store(0, Ordering::Release);
         self.close_at.store(i64::MIN, Ordering::Release);
         self.rec_len.store(0, Ordering::Release);
-        self.one_pass.store(false, Ordering::Relaxed);
+        // And the plan for the next take, whole: a request still pending, its
+        // frame, a one-pass, a back-date. A cleared loop has no next take.
+        self.next.clear();
     }
 
     /// Ask for a speed and pendulum. Applied by the callback, at its own frame.
@@ -1023,13 +996,7 @@ impl Loop {
     /// Frames until a scheduled transition fires, or `-1` when nothing is
     /// pending or it has no deadline.
     pub fn pending_in(&self, now: i64) -> i64 {
-        if self.request.get() == 0 {
-            return -1;
-        }
-        match self.request_at.load(Ordering::Acquire) {
-            i64::MIN => -1,
-            at => (at - now).max(0),
-        }
+        self.next.due_in(now)
     }
     pub fn layer_tail(&self, layer: usize) -> usize {
         self.layers[layer].tail()

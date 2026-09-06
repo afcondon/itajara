@@ -272,7 +272,7 @@ pub(crate) fn fix_next(sh: &Shared, li: usize, sr: u32, secs: f64) -> String {
     // layers of two lengths in one loop is a different instrument.
     if lp.n_layers.load(Ordering::Acquire) > 0 {
         let len = lp.loop_len.load(Ordering::Acquire);
-        lp.one_pass.store(true, Ordering::Relaxed);
+        lp.next.plan_one_pass();
         let have = len as f64 / sr as f64;
         return format!(
             "loop {}'s next record adds one layer of {:.3} s{}.",
@@ -586,8 +586,7 @@ pub(crate) fn start_all(sh: &Shared, sr: u32) -> String {
             busy += 1;
             continue;
         }
-        lp.request_at.store(at.unwrap_or(i64::MIN), Ordering::Release);
-        lp.request.set(FIRE);
+        lp.next.set(FIRE, at.unwrap_or(i64::MIN));
         n += 1;
     }
     if n == 0 {
@@ -678,6 +677,10 @@ pub(crate) fn free_length(sh: &Shared, li: usize, sr: u32) -> String {
     lp.loop_len.store(0, Ordering::Release);
     lp.reached.store(0, Ordering::Release);
     lp.state.set(IDLE);
+    // A take planned for the length just forgotten is no longer the take
+    // that was planned; the ack promises the next recording sets a length,
+    // and one still waiting for the grid would have recorded open-ended.
+    lp.next.clear();
     sh.release_anchor(li);
     format!(
         "length forgotten (was {:.3} s). The next recording sets a new one.",

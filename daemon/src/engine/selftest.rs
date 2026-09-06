@@ -25,7 +25,7 @@ pub(crate) fn selftest(sh: &Shared, sr: u32, secs: f64) -> Result<(), Box<dyn Er
     println!("Self-test: {} frame loop ({:.2} s), recording one cycle.", len, secs);
 
     lp.loop_len.store(len, Ordering::Release);
-    lp.request.set(ARMED);
+    lp.next.set(ARMED, i64::MIN);
     std::thread::sleep(Duration::from_secs_f64(secs * 2.0 + 0.3));
     commit(sh, li, sr, 0);
     std::thread::sleep(Duration::from_millis(200));
@@ -47,7 +47,7 @@ pub(crate) fn selftest(sh: &Shared, sr: u32, secs: f64) -> Result<(), Box<dyn Er
     // not, every overdub would sit a little further out than the last.
     println!("\nOverdub pass: click off, recording layer 0's own playback.");
     sh.click.store(false, Ordering::Relaxed);
-    lp.request.set(ARMED);
+    lp.next.set(ARMED, i64::MIN);
     std::thread::sleep(Duration::from_secs_f64(secs * 2.0 + 0.3));
     commit(sh, li, sr, 0);
     std::thread::sleep(Duration::from_millis(200));

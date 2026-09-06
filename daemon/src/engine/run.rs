@@ -501,7 +501,7 @@ fn supervise<F>(
             eprintln!("  the recording in progress on loop {} was dropped — it would have had a gap", li);
         }
         for li in 0..sh.n_loops {
-            sh.lp(li).request.take();
+            sh.lp(li).next.clear();
         }
 
         // Both streams restart independently, so the input↔output pairing has

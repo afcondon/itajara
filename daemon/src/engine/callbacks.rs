@@ -77,31 +77,21 @@ pub(super) fn output(
         // only changes at a pass boundary, so a `powi` per layer per
         // buffer is free where per frame would not be.
         lp.age(base as i64);
-        // Peek, not take: a request with a deadline in the future
-        // has to survive this buffer and be reconsidered on the
-        // next. Consuming first and re-arming would lose it if the
-        // control thread never looked again.
-        let pending = lp.request.get();
-        if pending == 0 {
+        // The one place the plan is consumed. `take` peeks rather
+        // than takes until the request is due inside this buffer or
+        // has already gone by, and hands over every field of the
+        // plan at once.
+        let Some(plan) = lp.next.take((base + frames) as i64) else {
             continue;
-        }
-        let at = lp.request_at.load(Ordering::Acquire);
-        // Due if it has no deadline, or its deadline falls inside
-        // this buffer, or has already gone by — a deadline in the
-        // past means the control thread was late, and being late is
-        // not a reason to wait a whole cycle more.
-        if at != i64::MIN && at >= (base + frames) as i64 {
-            continue;
-        }
+        };
+        let at = plan.at;
         // The frame the transition belongs to. `origin` and
         // `rec_from` are stamped with this rather than with the
         // buffer start, which is what makes the alignment exact:
         // the flag flips at buffer granularity, but everything
         // downstream reads the frame.
         let stamp = if at == i64::MIN { base as i64 } else { at.max(base as i64) };
-        lp.request.set(0);
-        lp.request_at.store(i64::MIN, Ordering::Release);
-        match pending {
+        match plan.phase {
             ARMED => {
                 lp.reached.store(0, Ordering::Release);
                 lp.rec_reached.store(0, Ordering::Release);
@@ -113,7 +103,7 @@ pub(super) fn output(
                 // road a late footswitch already travels: `commit`
                 // shifts `origin` back by it and fills the front
                 // from the ring.
-                match lp.arm_from.swap(i64::MIN, Ordering::AcqRel) {
+                match plan.arm_from {
                     i64::MIN => {}
                     want => lp
                         .started_late
@@ -173,7 +163,7 @@ pub(super) fn output(
                         // otherwise fire on this one.
                         let len = lp.loop_len.load(Ordering::Acquire);
                         lp.close_at.store(
-                            if lp.one_pass.swap(false, Ordering::AcqRel) && len > 0 {
+                            if plan.one_pass && len > 0 {
                                 stamp + len as i64
                             } else {
                                 i64::MIN
@@ -472,17 +462,12 @@ pub(super) fn input(
                 } else {
                     None
                 } {
-                    Some(t) => {
-                        lp.arm_from.store(i64::MIN, Ordering::Release);
-                        lp.request_at.store(t, Ordering::Release);
-                    }
+                    Some(t) => lp.next.set_from(t, i64::MIN),
                     None => {
                         let reach = sh.arm_reach.load(Ordering::Relaxed) as i64;
-                        lp.arm_from.store(at - reach, Ordering::Release);
-                        lp.request_at.store(i64::MIN, Ordering::Release);
+                        lp.next.set_from(i64::MIN, at - reach);
                     }
                 }
-                lp.request.set(ARMED);
             }
         }
     }

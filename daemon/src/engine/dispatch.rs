@@ -311,7 +311,11 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 // below, because it is this loop's own claim being released.
                 ARMED => {
                     lp.state.set(IDLE);
-                    lp.arm_from.store(i64::MIN, Ordering::Release);
+                    // The whole plan goes, not just the back-date: a crossing
+                    // found a buffer ago may already have set the request,
+                    // and a cancelled arm that still recorded would be the
+                    // worst kind of surprise.
+                    lp.next.clear();
                     return format!("loop {} has stopped listening.", li);
                 }
                 _ => {
@@ -353,8 +357,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                         // back-date the loop past the note that began it.
                         if lp.level_arm.load(Ordering::Relaxed) {
                             lp.started_late.store(0, Ordering::Release);
-                            lp.arm_from.store(i64::MIN, Ordering::Release);
-                            lp.request_at.store(i64::MIN, Ordering::Release);
+                            lp.next.listen();
                             lp.state.set(ARMED);
                             return format!(
                                 "loop {} is listening — it starts when something goes over {}.",
@@ -382,7 +385,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                         // sign of the wait. The layer spans the whole loop
                         // either way, and what you play lands where you heard
                         // it; the wait bought nothing the music could hear.
-                        let one_pass = lp.one_pass.load(Ordering::Relaxed) && layer > 0;
+                        let one_pass = lp.next.is_one_pass() && layer > 0;
                         let boundary = if lp.quant.load(Ordering::Relaxed)
                             && lp.n_layers.load(Ordering::Acquire) == 0
                         {
@@ -392,8 +395,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                         };
                         match boundary {
                             Some(t) => {
-                                lp.request_at.store(t, Ordering::Release);
-                                lp.request.set(ARMED);
+                                lp.next.set(ARMED, t);
                                 let wait =
                                     (t - sh.out_frames.load(Ordering::Acquire) as i64).max(0);
                                 return format!(
@@ -403,8 +405,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                                 );
                             }
                             None => {
-                                lp.request_at.store(i64::MIN, Ordering::Release);
-                                lp.request.set(ARMED);
+                                lp.next.set(ARMED, i64::MIN);
                                 // The press you make most often, and until now
                                 // the one that said least. Which layer matters:
                                 // "recording" on an empty loop and "recording"
@@ -464,8 +465,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     None
                 } {
                     Some(t) => {
-                        lp.request_at.store(t, Ordering::Release);
-                        lp.request.set(FIRE);
+                        lp.next.set(FIRE, t);
                         return format!(
                             "loop {} fires on the grid in {:.2} s.",
                             li,
@@ -473,8 +473,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                         );
                     }
                     None => {
-                        lp.request_at.store(i64::MIN, Ordering::Release);
-                        lp.request.set(FIRE);
+                        lp.next.set(FIRE, i64::MIN);
                         return format!("loop {} fires.", li);
                     }
                 }
@@ -1136,7 +1135,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 // no longer begin.
                 if !on && lp.is_armed() {
                     lp.state.set(IDLE);
-                    lp.arm_from.store(i64::MIN, Ordering::Release);
+                    lp.next.clear();
                 }
                 return if on {
                     format!(

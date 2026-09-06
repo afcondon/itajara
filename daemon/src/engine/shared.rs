@@ -218,7 +218,7 @@ impl Shared {
     /// next buffer finding a second crossing and back-dating the recording to
     /// *that* one instead.
     pub fn armed_loop(&self) -> Option<usize> {
-        (0..self.n_loops).find(|&i| self.loops[i].is_armed() && self.loops[i].request.get() == 0)
+        (0..self.n_loops).find(|&i| self.loops[i].is_armed() && !self.loops[i].next.is_pending())
     }
 
     /// **The bar.** Link's when there is a clock, the first loop's cycle when

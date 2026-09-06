@@ -288,11 +288,11 @@ fn fixing_the_next_take_sizes_an_empty_loop_and_nothing_else() {
     let ack = dispatch(&sh, 1000, "0fix0.5");
     assert!(ack.contains("adds one layer of 0.100 s") && ack.contains("not 0.5 s"), "{}", ack);
     assert_eq!(sh.lp(0).loop_len.load(Ordering::Acquire), 100, "untouched");
-    assert!(sh.lp(0).one_pass.load(Ordering::Relaxed));
+    assert!(sh.lp(0).next.is_one_pass());
     // The record that follows starts now, and says it will close itself.
     let ack = dispatch(&sh, 1000, "0r");
     assert!(ack.contains("one pass"), "{}", ack);
-    assert_eq!(sh.lp(0).request_at.load(Ordering::Acquire), i64::MIN, "on the press, not at zero");
+    assert_eq!(sh.lp(0).next.due_in(0), -1, "on the press, not at zero");
     // Not past the arena, and not nonsense.
     assert!(dispatch(&sh, 1000, "2fix2").contains("past --max-secs"));
     assert!(dispatch(&sh, 1000, "2fix").contains("wants a length"));

@@ -51,6 +51,7 @@ mod export;
 mod guards;
 mod layer;
 mod loop_state;
+mod next_take;
 mod run;
 mod selftest;
 mod shared;
@@ -59,6 +60,7 @@ mod verb;
 pub use dispatch::dispatch;
 pub use loop_state::Loop;
 pub(crate) use layer::Layer;
+pub(crate) use next_take::NextTake;
 pub use run::run;
 pub use shared::Shared;
 pub(crate) use run::resolve_residual;
@@ -537,8 +539,5 @@ impl AtomicU8Wrapper {
     }
     fn set(&self, v: u8) {
         self.0.store(v, Ordering::Release)
-    }
-    fn take(&self) -> u8 {
-        self.0.swap(0, Ordering::AcqRel)
     }
 }
