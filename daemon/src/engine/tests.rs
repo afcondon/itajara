@@ -1185,3 +1185,105 @@ fn the_fixture_snapshots_to_a_known_hash() {
     );
     assert_eq!(fnv(FNV_SEED, text.as_bytes()), 5753937055540615430, "snapshot hash");
 }
+
+/// **A plan does not outlive the loop it was made for.** The stale-plan
+/// cases the review named, each driven through the verbs and probed by
+/// taking the plan the way the callback would: `fix` then `c` records open;
+/// `fix` on material then `c`, or `u` down to empty, is not one pass — and
+/// not on the overdub after, either, which is the take the stale flag used
+/// to reach; `z` drops a record still waiting for the grid.
+#[test]
+fn a_plan_does_not_outlive_the_loop_it_was_made_for() {
+    let sh = rig(LEN);
+    // Sized, cleared, recorded: open, not 0.5 s.
+    assert!(dispatch(&sh, 1000, "1fix0.5").contains("closes itself"));
+    dispatch(&sh, 1000, "1c");
+    assert!(sh.lp(1).next.is_empty(), "a cleared loop has no next take");
+    let ack = dispatch(&sh, 1000, "1r");
+    assert_eq!(ack, "loop 1 recording.");
+    assert_eq!(sh.lp(1).loop_len.load(Ordering::Acquire), 0, "sized after all");
+    let plan = sh.lp(1).next.take(i64::MAX).expect("the press left a request");
+    assert_eq!(plan.phase, ARMED);
+    assert!(!plan.one_pass);
+    assert!(sh.lp(1).next.is_empty(), "taken whole");
+
+    // One pass planned on material, then cleared: an ordinary first take.
+    one_layer_loop(&sh, 0, 100, 0.25);
+    assert!(dispatch(&sh, 1000, "0fix0.5").contains("one layer"));
+    assert!(sh.lp(0).next.is_one_pass());
+    dispatch(&sh, 1000, "0c");
+    assert!(!sh.lp(0).next.is_one_pass(), "the clear took the plan");
+    assert_eq!(dispatch(&sh, 1000, "0r"), "loop 0 recording.");
+    assert!(!sh.lp(0).next.take(i64::MAX).unwrap().one_pass);
+
+    // One pass planned on material, then undone to empty: the first take
+    // that follows is not one pass, and neither is the overdub after it —
+    // the plan is spent by the take that consumes it, whatever it turned
+    // out to be.
+    one_layer_loop(&sh, 2, 100, 0.25);
+    assert!(dispatch(&sh, 1000, "2fix0.5").contains("one layer"));
+    assert!(dispatch(&sh, 1000, "2u").contains("Empty now"));
+    assert_eq!(sh.lp(2).n_layers.load(Ordering::Acquire), 0);
+    let ack = dispatch(&sh, 1000, "2r");
+    assert_eq!(ack, "loop 2 recording.", "not `one pass`");
+    let plan = sh.lp(2).next.take(i64::MAX).unwrap();
+    assert_eq!(plan.phase, ARMED);
+    assert!(sh.lp(2).next.is_empty(), "nothing left for the overdub after");
+
+    // A record waiting for the grid on a sized loop, then the length
+    // forgotten: the ack says the next recording sets a length, so the one
+    // that was waiting is not it.
+    assert!(dispatch(&sh, 1000, "3fix0.5").contains("closes itself"));
+    assert_eq!(dispatch(&sh, 1000, "3r"), "loop 3 recording.");
+    assert!(sh.lp(3).next.is_pending());
+    assert!(dispatch(&sh, 1000, "3z").contains("length forgotten"));
+    assert!(sh.lp(3).next.is_empty());
+}
+
+/// **A cancelled arm leaves no request frame behind.** The crossing is found
+/// on the input thread and may have set the request a buffer before the
+/// second press, so the press has to take the request as well as the
+/// back-date — by either road out of `ARMED`, the press and `lev0`.
+#[test]
+fn a_cancelled_arm_leaves_no_request_frame_behind() {
+    let sh = rig(LEN);
+    assert!(dispatch(&sh, 1000, "0lev1").contains("waits for a sound"));
+    assert!(dispatch(&sh, 1000, "0r").contains("listening"));
+    assert!(sh.lp(0).is_armed());
+    assert!(sh.lp(0).next.is_empty(), "listening is not yet a request");
+    // The crossing, as the input callback writes it.
+    sh.lp(0).next.set_from(1234, 1200);
+    assert_eq!(sh.lp(0).next.due_in(1000), 234);
+    assert_eq!(dispatch(&sh, 1000, "0r"), "loop 0 has stopped listening.");
+    assert!(!sh.lp(0).is_armed());
+    assert!(sh.lp(0).next.is_empty(), "the press took the crossing with it");
+    assert!(sh.lp(0).next.take(i64::MAX).is_none());
+
+    // The same by turning level arming off under the wait.
+    assert!(dispatch(&sh, 1000, "1lev1").contains("waits for a sound"));
+    dispatch(&sh, 1000, "1r");
+    sh.lp(1).next.set_from(i64::MIN, 900);
+    assert!(sh.lp(1).next.is_pending());
+    assert_eq!(dispatch(&sh, 1000, "1lev0"), "loop 1 records on the press again.");
+    assert!(!sh.lp(1).is_armed());
+    assert!(sh.lp(1).next.is_empty());
+}
+
+/// **`blank` then `c` is not threaded.** `threaded` is a fact about what is
+/// in the loop, not part of the plan — which is why it is not in `NextTake`
+/// — and a clear has to take it along with the layer it describes.
+#[test]
+fn a_blank_tape_does_not_survive_a_clear() {
+    let sh = rig(LEN);
+    assert!(dispatch(&sh, 1000, "0blank0.5").contains("tape"));
+    let lp = sh.lp(0);
+    assert!(lp.threaded.load(Ordering::Relaxed));
+    assert_eq!(lp.n_layers.load(Ordering::Acquire), 1);
+    dispatch(&sh, 1000, "0c");
+    assert!(!lp.threaded.load(Ordering::Relaxed));
+    assert_eq!(lp.n_layers.load(Ordering::Acquire), 0);
+    assert_eq!(lp.loop_len.load(Ordering::Acquire), 0);
+    assert!(lp.next.is_empty());
+    // And recording into the cleared slot is a first take, open-ended.
+    assert_eq!(dispatch(&sh, 1000, "0r"), "loop 0 recording.");
+}
