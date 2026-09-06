@@ -1168,7 +1168,10 @@ fn the_fixture_renders_to_a_known_hash() {
 /// The same fixture, as the snapshot says it. The socket is not needed:
 /// `snapshot` is a function of `Shared`, and every number in it is fixed by
 /// the fixture — so the text, hashed, is a second constant the refactor has
-/// to hit, and it covers the per-layer object as emitted from both places.
+/// to hit. The constant moved once, on purpose, at step 6 (2026-09-06): the
+/// top level stopped repeating the selected loop's nine fields, so the text
+/// shrank; `ws::tests` holds the per-loop and per-layer objects to literals
+/// captured before that, and the render hash above did not move.
 #[test]
 fn the_fixture_snapshots_to_a_known_hash() {
     let sh = fixture();
@@ -1183,7 +1186,7 @@ fn the_fixture_snapshots_to_a_known_hash() {
         "{}",
         text
     );
-    assert_eq!(fnv(FNV_SEED, text.as_bytes()), 5753937055540615430, "snapshot hash");
+    assert_eq!(fnv(FNV_SEED, text.as_bytes()), 3623273475480213597, "snapshot hash");
 }
 
 /// **A plan does not outlive the loop it was made for.** The stale-plan
