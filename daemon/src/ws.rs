@@ -190,7 +190,7 @@ fn talk(
 /// and this way it is obvious at a glance what the app is being told. If it
 /// grows a variable shape, that is the moment to reach for serde and not
 /// before.
-fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
+pub(crate) fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
     let cur = sh.out_frames.load(Ordering::Acquire) as i64;
 
     // One object per loop, and separately the SELECTED loop's numbers repeated

@@ -1039,3 +1039,149 @@ fn a_one_shot_sounds_only_inside_its_pass() {
     lp.one_shot.store(false, Ordering::Relaxed);
     assert!(!lp.firing(500));
 }
+
+/// FNV-1a over bytes: small, dependency-free, and enough to say "the same
+/// samples" without shipping four thousand frames of expected output.
+pub(crate) fn fnv(h: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(h, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3))
+}
+pub(crate) const FNV_SEED: u64 = 0xcbf29ce484222325;
+
+/// **A rig with every per-layer field doing something**, so that a rendering
+/// of it moves if any of them is read differently.
+///
+/// Loop 0: two layers of different content, one with a continuation past its
+/// end and a wrap fade to read it, under a loop window with a rotation. Loop
+/// 1: three layers, one switched off, one with a window of its own, decay on
+/// so the gains differ and the births count. Loop 2: a sparse layer (one in
+/// four, the third slot) in a longer loop, at a fractional speed so the read
+/// interpolates, folded to mono and panned. Loop 3: a threaded blank tape.
+/// Loops 4 and 5 are empty, as most slots are.
+pub(crate) fn fixture() -> Shared {
+    let sh = rig(LEN);
+    let sr = 48_000;
+
+    // Loop 0.
+    one_layer_loop(&sh, 0, 400, 0.0);
+    for p in 0..400 {
+        for ch in 0..CHANNELS {
+            sh.write(0, 0, p, ch, p as f32 / 400.0);
+        }
+    }
+    lay(&sh, 0, 1, 400, 0.25);
+    for p in 400..416 {
+        for ch in 0..CHANNELS {
+            sh.write(0, 1, p, ch, 0.5);
+        }
+    }
+    sh.lp(0).set_layer_shape(1, Shape { len: 400, tail: 16, born: 0 });
+    sh.lp(0).fade.store(8, Ordering::Relaxed);
+    assert!(dispatch(&sh, sr, "0in50").contains("windows"));
+    assert!(dispatch(&sh, sr, "0out350").contains("windows"));
+    assert!(dispatch(&sh, sr, "0rot20").contains("starts"));
+    settle(&sh, 0);
+
+    // Loop 1.
+    one_layer_loop(&sh, 1, 300, 0.1);
+    lay(&sh, 1, 1, 300, 0.2);
+    lay(&sh, 1, 2, 300, 0.3);
+    sh.lp(1).set_layer_shape(2, Shape { len: 300, tail: 0, born: 1 });
+    assert!(dispatch(&sh, sr, "1ly20").contains("off"));
+    assert!(dispatch(&sh, sr, "1lw3:100:200").contains("plays 100..200"));
+    assert!(dispatch(&sh, sr, "1dec-6").contains("loop 1"));
+    sh.lp(1).age(600);
+
+    // Loop 2.
+    one_layer_loop(&sh, 2, 250, 0.5);
+    {
+        let lp = sh.lp(2);
+        lp.loop_len.store(1000, Ordering::Release);
+        lp.l_period[0].store(4, Ordering::Release);
+        lp.l_phase[0].store(2, Ordering::Release);
+        lp.speed.store(0.75f64.to_bits(), Ordering::Relaxed);
+        lp.mono.store(true, Ordering::Relaxed);
+        lp.pan.store(30, Ordering::Relaxed);
+        lp.vol.store(0.8f32.to_bits(), Ordering::Relaxed);
+    }
+
+    // Loop 3.
+    edit::thread_blank(&sh, 3, 500);
+
+    for (li, n) in [(0, 2), (1, 3), (2, 1)] {
+        for l in 0..n {
+            sh.rebuild_env(li, l);
+        }
+    }
+    sh
+}
+
+/// **A rendering the refactor must not move.** Every loop of the fixture
+/// through the same `loop_at` the output callback calls, live, folded and
+/// levelled as the callback does it, plus each loop's offline render — and
+/// the whole thing reduced to one number. The constant was pasted from a
+/// run on the parallel-array `Loop`; `Vec<Layer>` has to produce it too.
+#[test]
+fn the_fixture_renders_to_a_known_hash() {
+    let sh = fixture();
+    let mut rng = SmallRng::seed_from_u64(7);
+    let mut h = FNV_SEED;
+    let mut gains = [(0.0f32, 0.0f32); DEFAULT_LOOPS];
+    let mut folds = [false; DEFAULT_LOOPS];
+    for li in 0..sh.n_loops {
+        let lp = sh.lp(li);
+        let v = f32::from_bits(lp.vol.load(Ordering::Relaxed));
+        let fold = lp.mono.load(Ordering::Relaxed);
+        let (l, r) = if fold { lp.pan_gains() } else { lp.balance_gains() };
+        folds[li] = fold;
+        gains[li] = (l * v, r * v);
+    }
+    for f in 0..4096i64 {
+        let mut vl = 0.0f32;
+        let mut vr = 0.0f32;
+        for li in 0..sh.n_loops {
+            let s = sh.loop_at(li, f, &mut rng, true);
+            h = fnv(h, &s[0].to_bits().to_le_bytes());
+            h = fnv(h, &s[1].to_bits().to_le_bytes());
+            if folds[li] {
+                let m = (s[0] + s[1]) * 0.5;
+                vl += m * gains[li].0;
+                vr += m * gains[li].1;
+            } else {
+                vl += s[0] * gains[li].0;
+                vr += s[1] * gains[li].1;
+            }
+        }
+        h = fnv(h, &vl.to_bits().to_le_bytes());
+        h = fnv(h, &vr.to_bits().to_le_bytes());
+    }
+    for li in 0..sh.n_loops {
+        if let Some(out) = sh.render_loop(li) {
+            h = fnv(h, &(out.len() as u64).to_le_bytes());
+            for v in out {
+                h = fnv(h, &v.to_bits().to_le_bytes());
+            }
+        }
+    }
+    assert_eq!(h, 1122269442957771175, "render hash");
+}
+
+/// The same fixture, as the snapshot says it. The socket is not needed:
+/// `snapshot` is a function of `Shared`, and every number in it is fixed by
+/// the fixture — so the text, hashed, is a second constant the refactor has
+/// to hit, and it covers the per-layer object as emitted from both places.
+#[test]
+fn the_fixture_snapshots_to_a_known_hash() {
+    let sh = fixture();
+    let text = crate::ws::snapshot(&sh, 48_000, true);
+    // One layer's object, verbatim, so a change reads as a diff and not as a
+    // number: loop 1's third layer — windowed, born a pass later, at half.
+    assert!(
+        text.contains(&format!(
+            r#"{{"len":300,"period":1,"phase":0,"tail":0,"gain":0.50119,"born":1,"on":true,"lwIn":100,"lwOut":200,"env":[{}]}}"#,
+            ["211"; ENV_BUCKETS].join(",")
+        )),
+        "{}",
+        text
+    );
+    assert_eq!(fnv(FNV_SEED, text.as_bytes()), 5753937055540615430, "snapshot hash");
+}

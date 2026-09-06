@@ -70,7 +70,7 @@ pub(crate) use run::resolve_residual;
 /// audio, and that is a statement about two calls to `play_pos` either side of
 /// an `adopt` rather than about anything anyone can hear.
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// How deep a loop can be stacked.
 ///
