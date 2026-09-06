@@ -336,7 +336,7 @@ fn snapshot(sh: &Shared, sr: u32, alive: bool) -> String {
                 sh.src_of(li) + 1,
                 lp.mono.load(Ordering::Relaxed),
                 lp.pending_in(cur),
-                lp.rec_frames(),
+                lp.rec_frames(sh.out_frames.load(Ordering::Acquire) as i64),
                 // **The take in hand, drawn while it is being played.** Empty
                 // whenever nothing is recording, so the display has one test
                 // rather than having to work the state out for itself — and so

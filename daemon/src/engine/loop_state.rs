@@ -975,9 +975,19 @@ impl Loop {
     /// progress bar is drawn from while the loop has no length yet. Zero
     /// when nothing linear is being written — an overdub's progress is the
     /// play position, which the snapshot already carries.
-    pub fn rec_frames(&self) -> usize {
+    pub fn rec_frames(&self, now: i64) -> usize {
         match self.state.get() {
             FIRST | MULTIPLY => self.reached.load(Ordering::Relaxed),
+            // A one-pass overdub knows its close, so how far it has come is
+            // the loop's length less what is left. Any other overdub has no
+            // "how far": it goes round until told to stop, and reports zero.
+            OVERDUB => match self.close_at.load(Ordering::Acquire) {
+                i64::MIN => 0,
+                at => {
+                    let len = self.loop_len.load(Ordering::Acquire) as i64;
+                    (len - (at - now)).clamp(0, len) as usize
+                }
+            },
             _ => 0,
         }
     }

@@ -253,7 +253,14 @@ perform rig subject = case _ of
   Duty.SoloLayer k -> case loopAt rig i of
     Nothing -> [ notInSnapshot i ]
     Just st
-      | st.layers <= 1 -> [ Handled ("loop " <> show (i + 1) <> " has one layer; it sounds") ]
+      -- A lone layer that is off — the one soloed above it was undone — is
+      -- switched on; a lone layer that sounds is left alone. Answering
+      -- "it sounds" to a layer that did not was how a loop went silent with
+      -- nothing on the page able to wake it.
+      | st.layers <= 1 ->
+          if maybe true _.on (Array.head st.shapes)
+            then [ Handled ("loop " <> show (i + 1) <> " has one layer; it sounds") ]
+            else [ Command (cmd i (Verb.LayerOn 1 true)) ]
       | otherwise ->
           map (\j -> Command (cmd i (Verb.LayerOn j (j == k)))) (Array.range 1 st.layers)
   Duty.LayerWindow k a b -> [ Command (cmd i (Verb.LayerWindow k a b)) ]
