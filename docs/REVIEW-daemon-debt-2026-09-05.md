@@ -463,6 +463,121 @@ net; none changes behaviour; each can land alone.
    the edit worker already exists — route presses through a second worker
    and the console through one of the two.
 
+   **Step 7 — done 2026-09-06**, branch `daemon/control-lane`. Not a second
+   worker: one, because the reason for three was that verbs blocked inside
+   `dispatch`, and the honest fix was to stop them blocking. The survey
+   first (it is the module doc of `engine/lane.rs`):
+
+   | verb | where | what | how long | class |
+   |---|---|---|---|---|
+   | `r` on a quantised first take | `commit` | 5 ms polls until `origin + n·bar` | up to half a bar | (a) timed wait, decides the flip |
+   | `r`/`x` on a multiply | `multiply_end` | 5 ms polls until `rec_from + n·cycle` | up to half a cycle | (a) |
+   | any close, any multiply end | `commit`, `multiply_end` | 60 ms sleep after the flip, for the input to drain | 60 ms | (a′) after the flip; the layer cannot be shaped before it |
+   | `w` | `save_take` | a WAV per layer and a manifest | file writes | (b) slow, decides nothing |
+   | `ex` | `export_set` | `render_loop` and a WAV per loop | renders and writes | (b) |
+   | `exl` | `export_layers` | every loop's layers and two manifests | file writes | (b) |
+   | `pk` | the arm | `mix_at` over the loop into up to 4000 buckets | linear in the loop | (b) |
+   | `t`, `x` start, `cp`, `dp`, `rvx1`, `c`, the pre-roll shift, every layer draw | various | a layer's worth of arena reads or writes | linear in the layer, or in `--max-secs` for `zero_layer` | (c) fast in shape, state-touching: stays |
+   | everything else | the arms | atomics | µs | (c) |
+
+   **(a) went to the closer's road.** `commit` is two halves:
+   `close_take` decides the frame the take closes as of, flips to `Playing`
+   (which is what stops the input), and files the rest; `finish_take`
+   reads what was captured, shapes and draws. A quantised close whose
+   boundary is ahead files itself on `close_at` — the road a sized take
+   has always taken — with the press beside it (`Loop::closing`, a
+   `Filed { pressed, late, cycles, from }`), and the lane's tick fires it
+   at the frame *with the press's own frame and lateness*, so the layer is
+   born on the pass the foot went down on, exactly as when `closed_at` was
+   taken before the sleep. `multiply_end` is `end_multiply` +
+   `finish_multiply` the same way; the cycle count is decided at the press
+   and carried. The equivalence is pinned by two tests that derive the old
+   path's numbers by hand from the old code and drive the new one
+   (`a_quantised_close_fires_at_the_frame_the_sleep_would_have_woken_on`:
+   press at 1100 on a 400 bar from 400 → filed for 1200, fired at 1203,
+   length 800, tail 100, born 0, two bars; a press at 1250 closes now,
+   born 1; `a_multiply_ends_at_the_boundary_the_sleep_would_have_woken_on`:
+   from 800, pressed 1500 → filed for 1600, fired at 1604, origin 800,
+   length 800, layer born 0, the wait in the ack). The sized-take path is
+   untouched: the tick still passes `late = now − at` and the frame is
+   computed as it was. `commit` and `multiply_end` remain as the two halves
+   in one blocking call for the self-test and the replay.
+
+   **(a′) is a stage, not a sleep.** The flip happens in the fast half; the
+   `Take` it leaves on the loop is finished by the tick sixty milliseconds
+   later. The lane holds a command *addressed to that loop* until the
+   finish has run (`hold_for`), and nothing else: a press on another loop
+   goes straight through. That hold is the sequential form of the race the
+   table left out in 5a — `c` or `r` during a sleeping commit — which
+   cannot now happen: the close finishes first
+   (`a_command_on_a_draining_loop_is_held_until_the_layer_is_laid`), and a
+   `c` on a filed close cancels it outright
+   (`clearing_a_loop_drops_the_close_it_had_filed`).
+
+   **(b) went off the lane the other way.** `dispatch` returns an `Ack`:
+   `Now(String)` or `Later(Job)`, a closure over what the fast half decided
+   — the guards, the name and directory, the window and bucket count — run
+   on one slow thread, its ack said through the same `say` as every other.
+   Exports read the arena a layer nothing is writing, as `copy_layers`
+   already noted; a picture is of the loop as it was asked for.
+
+   **The lane** (`engine/lane.rs`): one `mpsc` of `Command { from: Caller,
+   line }`; the console thread and every socket connection are producers;
+   one worker owns `dispatch` and, after each batch or every 5 ms, ticks —
+   fires due closes, finishes due drains — which is the closer thread's
+   whole job, so that thread is gone. A batch keeps only the last `pk` per
+   loop; `in`/`out`/`rot` are not coalesced, because each is validated
+   against the view the one before it left and `rot` is relative — the
+   settle in `schedule_restart` is where a moving slider already
+   coalesces. `is_edit` is gone with the edit worker. Ack routing is by
+   `Caller`: console → printed; app → `[app]` and the snapshot; engine →
+   printed and the snapshot, as the closer's were.
+
+   **Ack text, every change.** A quantised close that waits used to print
+   `waiting 0.10 s for the grid boundary (2 cycles).` on the console and
+   ack `loop 0 committed: …` after the wait; it now acks `loop 0 closes on
+   the bar in 0.10 s (2 cycles).` at once and `loop 0 committed: …`
+   (unchanged) at the boundary. A multiply end that waits used to ack
+   `loop 0 x2: now … (rounded up, waited 0.10 s for the boundary) — 2
+   layers playing.` after the wait; it now acks `loop 0 x2 ends on the
+   boundary in 0.10 s.` at once and the old sentence, unchanged, at the
+   boundary. Every other ack is the same words at the same moment relative
+   to the work; a close's ack arrives after the drain, as it did.
+
+   Tests: 71 (65 + the two equivalences, the cancel, and three on the
+   lane: coalescing, two producers each in order, the hold). Render hash
+   `1122269442957771175` and snapshot hash `3623273475480213597` unchanged;
+   339 / 353 replayed; both checkers; zero warnings. `check-verbs.py`
+   reads the match from `perform` now, since `dispatch` and `dispatch_ack`
+   are the two roads into it.
+
+   Not done, noted: the drain is still sixty milliseconds of wall clock
+   where `in_frames > in_frames_at_flip` is the exact condition (one
+   buffer, and the layer audible that much sooner); and `zero_layer` walks
+   `--max-secs` for every `r` and every `c`, which is the one thing left
+   on the lane that is linear in the arena rather than in a layer.
+
+## What the seven steps left
+
+The opening measurements, and the same lines today (2026-09-06, evening):
+`engine.rs` at 8 328 lines with 34 tests is `engine/` at 19 files and
+11 553 lines with 71 tests and a conformance replay of 339 vectors;
+`struct Loop` has **51 fields** where it had 61 (a `Layer` struct, a
+`NextTake`, a private phase byte, and one `closing` slot in place of the
+sleeps); `Shared` 41 where it had 44; per-layer data is one `Vec<Layer>`
+where it was eleven parallel `Vec`s; the phase is an enum with one writer
+and a 21-row table, checked against the Glassbox artifact, where it was six
+bytes stored at 17 sites from 3 threads; `dispatch` is 1 402 lines of exact
+whole-word arms with no prefix guards and no order, where it was 1 423 with
+24 guards and three live ordering bugs; `commit`'s 335 lines are a 75-line
+close and a 276-line finish with nothing sleeping between them; the
+snapshot is three emitters, one per type; and `dispatch` has **one caller,
+on one thread**, where it had three kinds with no lock — the threads
+outside audio being the lane, its slow thread, the console, the socket
+acceptor and one per connection, and the Link listener; the closer thread
+and the per-command threads are gone. Nothing the music hears moved: the
+render hash is the number it was on the first day.
+
 ## What I would not do
 
 - Move any use-case knowledge into the daemon. A face is a client concept;
