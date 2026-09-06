@@ -229,7 +229,13 @@ perform rig subject = case _ of
   -- whatever is recorded into it next — so Stop All used to reach across the
   -- whole set and disarm every slot the player had not touched yet. Skipping
   -- the empties keeps the gesture meaning what it says.
-  Duty.StopAll -> map (\n -> Command (cmd n (Verb.Sounding false))) (sounding rig)
+  -- **Stop means stop.** A loop that is being written is closed first, then
+  -- silenced with the rest: silencing it alone left a loop red and still
+  -- recording under a board that read "stopped", and the take it was making
+  -- is one the player most probably deletes next anyway.
+  Duty.StopAll ->
+    map (\n -> Command (cmd n Verb.Record)) (writing rig)
+      <> map (\n -> Command (cmd n (Verb.Sounding false))) (sounding rig)
   Duty.Undo -> [ Command (cmd i Verb.Undo) ]
   Duty.LayerOn l on -> [ Command (cmd i (Verb.LayerOn l on)) ]
   Duty.WindowIn f -> [ Command (cmd i (Verb.WindowIn f)) ]
@@ -612,6 +618,12 @@ notInSnapshot i = Unavailable ("loop " <> show (i + 1) <> " is not in the snapsh
 -- | Read from the snapshot rather than assumed, like everything else here: a
 -- | loop is empty when the *engine* says it has no layers, not when this app
 -- | last thought so.
+-- | The loops a take is going into right now.
+writing :: Rig -> Array Int
+writing rig =
+  Array.filter (\i -> maybe false Looper.isWriting (loopAt rig i))
+    (Array.range 0 (Array.length rig.loops - 1))
+
 sounding :: Rig -> Array Int
 sounding rig =
   Array.filter (\i -> maybe false (\st -> st.layers > 0) (loopAt rig i))
