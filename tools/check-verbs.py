@@ -27,7 +27,7 @@ import pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 VERB_PURS = ROOT / "client/src/Data/Looper/Verb.purs"
-ENGINE_RS = ROOT / "daemon/src/engine.rs"
+ENGINE_RS = ROOT / "daemon/src/engine/dispatch.rs"
 
 
 def ours():
