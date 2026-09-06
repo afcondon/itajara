@@ -302,6 +302,43 @@ fn fixing_the_next_take_sizes_an_empty_loop_and_nothing_else() {
     assert!(!dispatch(&sh, 1000, "2f").contains("wants a length"));
 }
 
+/// **A verb is a whole word, and the loop and the lateness still come off
+/// the ends first.** The three commands the prefix guards misread, each
+/// sent the way the board sends them — addressed, and stamped late — and
+/// what is not a word answered as such.
+#[test]
+fn a_verb_is_read_whole_with_its_loop_and_its_lateness() {
+    let sh = rig(LEN);
+    // `tone3000` is a tone, not a claim of the past three thousand seconds.
+    let ack = dispatch(&sh, 48_000, "3tone3000@250");
+    assert!(ack.contains("loop 3") && ack.contains("3.0 kHz"), "ack was: {}", ack);
+    // `t` is still the claim, and answers as one: nothing has arrived here.
+    assert_eq!(dispatch(&sh, 48_000, "3t3000@250"), "no input has arrived yet.");
+    // `sp0.5` is a speed, not a sparse multiply that could not read a count.
+    assert!(dispatch(&sh, 48_000, "2sp0.5@10").contains("x0.5"));
+    assert!(dispatch(&sh, 48_000, "2s4").contains("nothing to spread"));
+    // `exl` and `ex` are read by the longest name-verb, not by their order;
+    // the export test proves the files, this proves the reading.
+    assert!(dispatch(&sh, 48_000, "exlriff").contains("nothing"), "exl on an empty rig");
+    // Not a word is not a command, wherever it sits.
+    assert_eq!(dispatch(&sh, 48_000, "1size13"), "unknown command \"size13\"");
+    assert_eq!(dispatch(&sh, 48_000, "size13@100"), "unknown command \"size13\"");
+    assert_eq!(dispatch(&sh, 48_000, "tx"), "unknown command \"tx\"");
+    // A bare word stays bare, and a flag takes only a flag.
+    assert_eq!(dispatch(&sh, 48_000, "0x1"), "unknown command \"x1\"");
+    assert_eq!(dispatch(&sh, 48_000, "0g5"), "unknown command \"g5\"");
+    assert_eq!(dispatch(&sh, 48_000, "play"), "unknown command \"play\"");
+    // The lateness is judged before the word is read, as it always was.
+    assert!(dispatch(&sh, 48_000, "3tone3000@x").contains("not a lateness"));
+    // A bare loop number still selects, and an empty line still says nothing.
+    assert_eq!(dispatch(&sh, 48_000, "3"), "loop 3 selected.");
+    assert_eq!(dispatch(&sh, 48_000, ""), "");
+    // An addressed flag sets rather than flips: `3k1` twice is on, on.
+    assert_eq!(dispatch(&sh, 48_000, "3k1"), "click on.");
+    assert_eq!(dispatch(&sh, 48_000, "3k1"), "click on.");
+    assert_eq!(dispatch(&sh, 48_000, "k0"), "click off.");
+}
+
 #[test]
 fn copying_lands_whole_and_in_phase_on_an_empty_loop_only() {
     let sh = rig(LEN);

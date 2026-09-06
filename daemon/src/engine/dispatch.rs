@@ -1,9 +1,10 @@
 //! One command, from wherever it came.
 //!
 //! Split out of `engine.rs` on 2026-09-06 (REVIEW-daemon-debt step 1). The
-//! arms are in the order the file has always had them, and that order is
-//! load-bearing — see the comments inside, and `tools/check-verbs.py`, which
-//! reads this file by path.
+//! arms are in the order the file has always had them, and since step 2 the
+//! same day that order decides nothing: `verb::tokenize` reads the command
+//! into a whole word and the `match` below is exact on it. The vocabulary is
+//! the table in `verb.rs`; `tools/check-verbs.py` reads both files by path.
 
 use std::sync::atomic::Ordering;
 
@@ -47,6 +48,12 @@ use super::edit::{schedule_restart, thread_blank};
 use super::export::{export_layers, export_set, save_take};
 use super::guards::{busy_elsewhere, not_plain, not_writable};
 use super::shared::Shared;
+use super::verb::tokenize;
+
+/// The ack for a line that is not a command, in the words it has always used.
+fn unknown(rest: &str) -> String {
+    format!("unknown command {:?}", rest)
+}
 
 /// One command, from wherever it came.
 ///
@@ -112,6 +119,18 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
         sh.selected.store(li, Ordering::Relaxed);
         return format!("loop {} selected.", li);
     }
+    // An empty line asks for nothing, and gets it.
+    if rest.is_empty() {
+        return String::new();
+    }
+    // The word and its argument, whole — see `verb.rs` for the three rules.
+    // The arms parse `arg` for themselves and quote `rest` when they refuse.
+    let Some((verb, arg)) = tokenize(rest) else {
+        return unknown(rest);
+    };
+    if !verb.arg.admits(arg) {
+        return unknown(rest);
+    }
     let lp = sh.lp(li);
     {
         // **The window, the rotation and the peaks** — the editing verbs, all
@@ -121,23 +140,22 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
         // it, `rot<f>` shifts the start by a signed number of frames, and
         // `pk<n>` asks for the loop's waveform in `n` buckets, which comes
         // back as its own message rather than in the ack.
-        // `t` is the claim-the-past verb, matched below by its first letter;
-        // spelled the same way here so `tone` is not mistaken for it.
-        let claims_past = rest.as_bytes().first() == Some(&b't') && rest.strip_prefix("tone").is_none();
+        // `t` is the claim-the-past verb, a whole word like every other now.
+        let claims_past = verb.word == "t";
         // An overdub may go into a windowed loop — the write head follows the
         // play head through the window (`write_pos`), so what you play lands
         // where you heard it and outside the window nothing is touched.
         // Multiply changes the length the window is set against, and the
         // claim writes from the ring against the cycle, so those two still
         // want the whole loop.
-        if lp.window().is_some() && (rest == "x" || claims_past) {
+        if lp.window().is_some() && (verb.word == "x" || claims_past) {
             return format!(
                 "loop {} has a window; clear it with `win` before multiplying or claiming the past.",
                 li
             );
         }
-        match rest {
-            _ if rest.starts_with("win") => {
+        match verb.word {
+            "win" => {
                 // The window goes; the rotation is its own edit and stays,
                 // folded into the whole loop's span.
                 let len = lp.loop_len.load(Ordering::Acquire).max(1);
@@ -145,9 +163,8 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 schedule_restart(sh, li, 0, 0, vr % len);
                 return format!("loop {} plays the whole loop again.", li);
             }
-            _ if rest.starts_with("in") || rest.starts_with("out") => {
-                let is_in = rest.starts_with("in");
-                let arg = rest[if is_in { 2 } else { 3 }..].trim();
+            "in" | "out" => {
+                let is_in = verb.word == "in";
                 let len = lp.loop_len.load(Ordering::Acquire);
                 if len == 0 {
                     return format!("loop {} has no length to window yet.", li);
@@ -198,12 +215,12 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     padded
                 );
             }
-            _ if rest.starts_with("rot") => {
+            "rot" => {
                 let len = lp.loop_len.load(Ordering::Acquire);
                 if len == 0 {
                     return format!("loop {} has nothing to rotate yet.", li);
                 }
-                let k: i64 = match rest[3..].trim().parse() {
+                let k: i64 = match arg.parse() {
                     Ok(k) => k,
                     Err(_) => return format!("`{}` wants a signed number of frames.", rest),
                 };
@@ -218,13 +235,13 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     k as f64 / sr as f64
                 );
             }
-            _ if rest.starts_with("pk") => {
+            "pk" => {
                 let len = lp.loop_len.load(Ordering::Acquire);
                 let n = lp.n_layers.load(Ordering::Acquire);
                 if len == 0 || n == 0 {
                 return format!("loop {} has nothing to draw.", li);
                 }
-                let buckets: usize = rest[2..].trim().parse().unwrap_or(600).clamp(16, 4000);
+                let buckets: usize = arg.parse().unwrap_or(600).clamp(16, 4000);
                 let (i, o) = lp.window().unwrap_or((0, 0));
                 // The picture spans the loop and whatever silence the window
                 // reaches into, so a window that extends past an end is drawn
@@ -462,20 +479,10 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     }
                 }
             }
-            // **Before the take guard, and that is load-bearing.** `t` is
-            // matched as `starts_with('t')` — a char, not a word — so every
-            // command beginning with a t reaches it first. `tone3000` was
-            // silently being read as "claim the last 3000 seconds", which
-            // answered with a refusal about cycles and left the tone unchanged:
-            // a verb that has an arm, is spelled right, and never arrives.
-            //
-            // `tools/check-verbs.py` cannot catch this. It asks whether every
-            // verb *has* an arm, not whether it reaches the one it meant, and
-            // both were true here.
+            // `tone` is its own word now; `t` cannot reach it.
             // How much top the tape keeps, in hertz. Twenty thousand and up is
             // off outright rather than very nearly off.
-            _ if rest.starts_with("tone") => {
-                let arg = rest[4..].trim();
+            "tone" => {
                 if arg.is_empty() {
                     return format!("loop {} {}.", li, tone_words(lp));
                 }
@@ -488,15 +495,12 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     _ => return format!("tape tone wants hertz, not `{}`.", arg),
                 }
             }
-            l if l.starts_with('t') => {
-                let secs = l[1..].trim().parse::<f64>().unwrap_or(8.0);
+            "t" => {
+                let secs = arg.parse::<f64>().unwrap_or(8.0);
                 return take(sh, li, sr, secs, late);
             }
-            // **Above `s`, which prefix-matches**, and above the `t` guard for
-            // the same reason `tone` is: both are char-matched and would eat a
-            // longer verb whole. This file has been bitten twice that way.
-            _ if rest.starts_with("src") => {
-                let arg = rest[3..].trim();
+            // `src` is its own word now; neither `s` nor `t` can reach it.
+            "src" => {
                 if arg.is_empty() {
                     let i = sh.src_of(li);
                     return format!("loop {} records from {}.", li, sh.sources[i].describe());
@@ -532,27 +536,22 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
 
             // Fold to mono at playback. Not a capture decision — the audio
             // stays stereo — so this is free to try and free to undo.
-            "mono" | "mono1" => {
-                lp.mono.store(true, Ordering::Relaxed);
-                return format!(
-                    "loop {} folds to mono; pan places it rather than balancing it.",
-                    li
-                );
-            }
-            "mono0" => {
+            "mono" => {
+                if arg != "0" {
+                    lp.mono.store(true, Ordering::Relaxed);
+                    return format!(
+                        "loop {} folds to mono; pan places it rather than balancing it.",
+                        li
+                    );
+                }
                 lp.mono.store(false, Ordering::Relaxed);
                 return format!("loop {} keeps its two channels; pan is a balance.", li);
             }
 
-            // **Above `s`, which prefix-matches.** `s` is sparse-multiply and
-            // takes anything beginning with an s, so `sp0.5` read as "sparse,
-            // could not parse the count, use 2" and quietly did a multiply. It
-            // cost half an hour and would have cost a take: the command was
-            // acked by nothing and did something else entirely. Ordering fixes
-            // it here; `s` itself was tightened to refuse a count it cannot
-            // read, rather than inventing one.
-            _ if rest.starts_with("sp") => {
-                let arg = &rest[2..];
+            // `sp` is its own word now; `s` cannot reach it. `s` itself was
+            // tightened, when this was an ordering, to refuse a count it
+            // cannot read rather than inventing one, and stays that way.
+            "sp" => {
                 match arg.parse::<f64>() {
                     // An eighth to four times. Below that a loop is a drone and
                     // linear interpolation is audibly a filter; above it, the
@@ -578,24 +577,23 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             }
             // The second multiply, and its two companions. Structural, so they
             // are instant and reversible — nothing here records anything.
-            l if l.starts_with('s') => {
+            "s" => {
                 // Bare `s` means two, which is the common case. Anything else
                 // has to be a number: `unwrap_or(2)` here turned every typo
                 // beginning with an s into a multiply nobody asked for.
-                let arg = l[1..].trim();
                 match if arg.is_empty() { Ok(2) } else { arg.parse::<usize>() } {
                     Ok(n) => return sparse(sh, li, sr, n),
-                    Err(_) => return format!("`{}` is not a command; `s` wants a count.", l),
+                    Err(_) => return format!("`{}` is not a command; `s` wants a count.", rest),
                 }
             }
             // Grid sync for this loop. Explicit forms alongside the toggle for
             // the same reason `k` and `m` have them: a client that flips rather
             // than sets drifts out of step the first time a message is dropped
             // and never recovers.
-            "g" | "g1" | "g0" => {
-                let on = match rest {
-                    "g1" => true,
-                    "g0" => false,
+            "g" => {
+                let on = match arg {
+                    "1" => true,
+                    "0" => false,
                     _ => !lp.quant.load(Ordering::Relaxed),
                 };
                 lp.quant.store(on, Ordering::Relaxed);
@@ -635,18 +633,10 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 };
             }
             "o" => return rotate(sh, li),
-            // Exact match, and it has to be: `b` would collide with `blank`,
-            // and this file has been bitten twice by a prefix guard eating a
-            // longer verb — see the note above `tone`.
             "bpm" => return take_tempo(sh, li, sr),
-            // Rig-wide, and exact-matched for the reason `bpm` above it is:
-            // `g` is already a verb (grid), so a prefix guard here would be a
-            // collision rather than a convenience.
+            // Rig-wide.
             "go" => return start_all(sh, sr),
-            // The session transport, rig-wide, exact-matched for the same
-            // reason `bpm` and `go` are: `p` is a verb already and `pan`,
-            // `pend` and `ph` all start with it, so a prefix guard here would
-            // be a collision dressed as a convenience.
+            // The session transport, rig-wide.
             //
             // **This is the only verb in the engine that does nothing to
             // audio.** It exists because the drum machine is on the iPad and
@@ -660,8 +650,14 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // link-spike, so success here means the bytes left the machine and
             // nothing more; saying "transport started" would be claiming to
             // know something this daemon cannot see.
-            "play1" | "play0" => {
-                let on = rest.ends_with('1');
+            "play" => {
+                // Set, never flipped: there is nothing here to flip, only a
+                // request to send. A bare `play` is not a command.
+                let on = match arg {
+                    "1" => true,
+                    "0" => false,
+                    _ => return unknown(rest),
+                };
                 return match crate::link::set_playing(on, crate::link::DEFAULT_TEMPO_PORT) {
                     Ok(()) => format!(
                         "asked Link to {} — peers with start/stop sync follow{}.",
@@ -673,13 +669,6 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             }
             "d" => return dense(sh, li),
             "z" => return free_length(sh, li, sr),
-            // **Ahead of every prefix guard below and behind every one above.**
-            // `len` shares two letters with `lev`, which is matched exactly, and
-            // `ph` shares one with `pan` and `pend`, which are matched by their
-            // own longer prefixes — so neither can be swallowed. That is worth
-            // stating rather than trusting: a verb defined after a looser guard
-            // is a verb that silently never runs, which has happened here once
-            // already.
             // Rig-wide, so the loop prefix is ignored — the same shape as `arm`,
             // `k` and `m`, and said in the ack so a `3lq4` does not look like it
             // set something on loop 3.
@@ -689,8 +678,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // `--layers` grows. **Set, never flipped**, for the reason every
             // flag verb in here gives: a client that flips drifts out of step
             // the first time a message is dropped.
-            _ if rest.starts_with("ly") => {
-                let arg = rest[2..].trim();
+            "ly" => {
                 let (num, flag) = arg.split_at(arg.len().saturating_sub(1));
                 let on = match flag {
                     "1" => true,
@@ -715,8 +703,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             }
             // A layer's own window: `lw<k>:<in>:<out>` sets it, `lw<k>` clears
             // it. In the layer's frames, like `in`/`out` are in the loop's.
-            _ if rest.starts_with("lw") => {
-                let arg = rest[2..].trim();
+            "lw" => {
                 let mut parts = arg.split(':');
                 let k = parts.next().unwrap_or("").trim().parse::<usize>();
                 let n = lp.n_layers.load(Ordering::Acquire);
@@ -761,9 +748,9 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // same audio twice, so the copy can carry a different window —
             // six slices of one take in one loop. The window comes with it,
             // to be moved.
-            _ if rest.starts_with("dp") => {
+            "dp" => {
                 let n = lp.n_layers.load(Ordering::Acquire);
-                return match rest[2..].trim().parse::<usize>() {
+                return match arg.parse::<usize>() {
                     Ok(k) if k >= 1 && k <= n => {
                         if n >= sh.max_layers {
                             return format!("loop {} holds {} layers already; there is no room for another.", li, sh.max_layers);
@@ -798,8 +785,8 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     Err(_) => format!("`{}` wants a layer number, as in `dp2`.", rest),
                 };
             }
-            _ if rest.starts_with("lq") => {
-                return match rest[2..].trim().parse::<i64>() {
+            "lq" => {
+                return match arg.parse::<i64>() {
                     Ok(n) if n >= -1 && n <= 64 => {
                         sh.launch_q.store(n, Ordering::Relaxed);
                         match n {
@@ -824,22 +811,21 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // page that has promised to own no clock. Not a threaded tape:
             // that carries a silent layer so it can *play*, which would make
             // the next take an overdub, and an overdub never closes itself.
-            _ if rest.starts_with("fix") => {
-                let arg = rest[3..].trim();
+            "fix" => {
                 let secs = match arg.parse::<f64>() {
                     Ok(v) if v > 0.0 => v,
                     _ => return format!("`{}` wants a length in seconds, as in `fix13`.", rest),
                 };
                 return fix_next(sh, li, sr, secs);
             }
-            _ if rest.starts_with("len") => {
-                return match rest[3..].trim().parse::<usize>() {
+            "len" => {
+                return match arg.parse::<usize>() {
                     Ok(n) => set_bars(sh, li, sr, n),
                     Err(_) => format!("`{}` wants a number of bars.", rest),
                 };
             }
-            _ if rest.starts_with("ph") => {
-                return match rest[2..].trim().parse::<usize>() {
+            "ph" => {
+                return match arg.parse::<usize>() {
                     Ok(n) => place_at(sh, li, n.saturating_sub(1)),
                     Err(_) => format!("`{}` wants a slot number.", rest),
                 };
@@ -850,31 +836,27 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // message goes back as the ack and both callers display it
             // themselves. Printing here as well got it shown twice.
             // Rig-wide, so the loop prefix is ignored — said in the ack for
-            // the same reason `arm` and `m` say it. Matched on two characters
-            // rather than on `e`, because this file has been bitten twice by a
-            // one-character guard silently eating a longer verb defined below
-            // it, and `ex` costs nothing to be careful with.
+            // the same reason `arm` and `m` say it.
             // Copy: `cp<src>` every layer of loop src into this loop, `cp<src>l<k>`
-            // its k-th (from one, like `ly`). Onto an empty loop only. Two
-            // characters, ahead of every `c`: `"c"` is an exact match and
-            // cannot eat it, but the next `c` prefix someone adds could.
-            l if l.starts_with("cp") => {
-                let rest = &l[2..];
-                let (src, layer) = match rest.split_once('l') {
+            // its k-th (from one, like `ly`). Onto an empty loop only. `cp` is
+            // its own word now; `c` cannot reach it.
+            "cp" => {
+                let (src, layer) = match arg.split_once('l') {
                     Some((a, b)) => (a.trim().parse::<usize>(), Some(b.trim().parse::<usize>())),
-                    None => (rest.trim().parse::<usize>(), None),
+                    None => (arg.trim().parse::<usize>(), None),
                 };
                 return match (src, layer) {
                     (Ok(sl), None) => copy_layers(sh, li, sl, None),
                     (Ok(sl), Some(Ok(k))) if k >= 1 => copy_layers(sh, li, sl, Some(k - 1)),
-                    _ => format!("`{}` wants a source loop, and optionally `l<layer>` from one.", l),
+                    _ => format!("`{}` wants a source loop, and optionally `l<layer>` from one.", rest),
                 };
             }
-            // Three characters, and ahead of `ex`: behind it, `exlriff` would
-            // export the set as "lriff" and say so cheerfully.
-            l if l.starts_with("exl") => return export_layers(sh, sr, &l[3..]),
-            l if l.starts_with("ex") => return export_set(sh, sr, &l[2..]),
-            l if l.starts_with('w') => return save_take(sh, li, sr, &l[1..]),
+            // The three name verbs. A name runs straight into its verb on the
+            // wire (`exlriff`), and `tokenize` reads it back by the longest
+            // name-verb, so `exl` and `ex` no longer care which is first.
+            "exl" => return export_layers(sh, sr, arg),
+            "ex" => return export_set(sh, sr, arg),
+            "w" => return save_take(sh, li, sr, arg),
             // Take back an undo. Free, now that undo does not destroy what it
             // removes: the layer is still there with its shape intact, so this
             // is one number going back up.
@@ -945,11 +927,11 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // config surface should read like what it does — `0rev1` and
             // `0pan32` say themselves in a log where `0v1` and `0n32` would
             // need the source open.
-            "rev" | "rev1" | "rev0" => {
+            "rev" => {
                 let now = lp.speed();
-                let back = match rest {
-                    "rev1" => true,
-                    "rev0" => false,
+                let back = match arg {
+                    "1" => true,
+                    "0" => false,
                     _ => now > 0.0,
                 };
                 // Direction changes the sign and keeps the rate, so reversing a
@@ -986,8 +968,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // is a way of *starting*, and quietly resizing a loop with material
             // in it would be a trim — a thing this engine does not have and
             // should not grow by accident.
-            _ if rest.starts_with("blank") => {
-                let arg = rest[5..].trim();
+            "blank" => {
                 let secs = match arg.parse::<f64>() {
                     Ok(v) if v > 0.0 => v,
                     Ok(_) => return format!("a tape wants a length in seconds, not {}.", arg),
@@ -1042,10 +1023,10 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // does not unfold what was folded — and the ack says so, because a
             // player is entitled to know which of their presses was the one
             // that could not be taken back.
-            "rvx" | "rvx1" | "rvx0" => {
-                let on = match rest {
-                    "rvx1" => true,
-                    "rvx0" => false,
+            "rvx" => {
+                let on = match arg {
+                    "1" => true,
+                    "0" => false,
                     _ => !lp.revox.load(Ordering::Relaxed),
                 };
                 if lp.is_recording() {
@@ -1076,8 +1057,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // by two mechanisms, one destroying and one not, and a single value
             // meaning "resolution here, erase head there" depending on a flag is
             // exactly the overload this engine keeps refusing.
-            _ if rest.starts_with("fb") => {
-                let arg = rest[2..].trim();
+            "fb" => {
                 if arg.is_empty() {
                     return format!("a Revox pass on loop {} leaves {} a pass.", li, fb_words(lp));
                 }
@@ -1097,10 +1077,10 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     _ => return format!("feedback wants decibels, not `{}`.", arg),
                 }
             }
-            "pend" | "pend1" | "pend0" => {
-                let want = match rest {
-                    "pend1" => true,
-                    "pend0" => false,
+            "pend" => {
+                let want = match arg {
+                    "1" => true,
+                    "0" => false,
                     _ => !lp.pendulum.load(Ordering::Relaxed),
                 };
                 lp.want(lp.speed(), want);
@@ -1120,10 +1100,10 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // phase-locked set: firing moves `origin`, which is the one thing
             // this engine otherwise never does. Making it something you switch on
             // means a loop cannot lose its grid by accident.
-            "one" | "one1" | "one0" => {
-                let on = match rest {
-                    "one1" => true,
-                    "one0" => false,
+            "one" => {
+                let on = match arg {
+                    "1" => true,
+                    "0" => false,
                     _ => !lp.one_shot.load(Ordering::Relaxed),
                 };
                 lp.one_shot.store(on, Ordering::Relaxed);
@@ -1144,10 +1124,10 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                 };
             }
             // Wait for a sound instead of starting on the press.
-            "lev" | "lev1" | "lev0" => {
-                let on = match rest {
-                    "lev1" => true,
-                    "lev0" => false,
+            "lev" => {
+                let on = match arg {
+                    "1" => true,
+                    "0" => false,
                     _ => !lp.level_arm.load(Ordering::Relaxed),
                 };
                 lp.level_arm.store(on, Ordering::Relaxed);
@@ -1175,8 +1155,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // is actually thought in — "three down a pass" is a musical
             // statement where "point seven oh eight" is a number — and because
             // it makes the ladder on the pedal readable.
-            _ if rest.starts_with("dec") => {
-                let arg = rest[3..].trim();
+            "dec" => {
                 if arg.is_empty() {
                     return format!("loop {} {}.", li, decay_words(lp));
                 }
@@ -1206,8 +1185,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // continuation has nothing to fade *from*, so the setting takes and
             // is inaudible — which is the exact shape of failure this surface
             // exists to prevent, and costs one sentence to rule out.
-            _ if rest.starts_with("xf") => {
-                let arg = rest[2..].trim();
+            "xf" => {
                 if arg.is_empty() {
                     return format!("loop {} wraps with {}.", li, fade_words(lp, sr));
                 }
@@ -1253,8 +1231,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // 4, 1 in 8) is a choice the *app* makes about which values are
             // worth a press, and the engine should not have opinions about that
             // — the same reason speed takes a number and not a gear.
-            _ if rest.starts_with("ch") => {
-                let arg = rest[2..].trim();
+            "ch" => {
                 if arg.is_empty() {
                     return format!("loop {} sounds {}.", li, odds_words(lp.chance_of()));
                 }
@@ -1276,8 +1253,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             }
             // The level a sound has to reach. Rig-wide, like the click — it
             // describes the room and the instrument, not any one loop.
-            _ if rest.starts_with("arm") => {
-                let arg = rest[3..].trim();
+            "arm" => {
                 if arg.is_empty() {
                     return format!("a level-armed loop starts at {}.", thresh_words(sh));
                 }
@@ -1303,8 +1279,7 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // Above unity is refused rather than clamped, for the same reason
             // decay refuses positive: a level control that quietly declined to
             // do what it was told would be worse than one that says no.
-            _ if rest.starts_with("vol") => {
-                let arg = rest[3..].trim();
+            "vol" => {
                 if arg.is_empty() {
                     return format!("loop {} {}.", li, vol_words(lp));
                 }
@@ -1321,8 +1296,8 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     _ => return format!("level wants decibels, not `{}`.", arg),
                 }
             }
-            _ if rest.starts_with("pan") => {
-                match rest[3..].parse::<usize>() {
+            "pan" => {
+                match arg.parse::<usize>() {
                     Ok(v) if v <= 127 => {
                         lp.pan.store(v, Ordering::Relaxed);
                         let (l, r) = lp.pan_gains();
@@ -1343,13 +1318,13 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     // Says what was wrong rather than ignoring it. A config
                     // command that silently does nothing is the failure this
                     // whole surface is built against.
-                    _ => return format!("pan wants 0-127, not `{}`.", &rest[3..]),
+                    _ => return format!("pan wants 0-127, not `{}`.", arg),
                 }
             }
-            "h" | "h1" | "h0" => {
-                let want = match rest {
-                    "h1" => false,
-                    "h0" => true,
+            "h" => {
+                let want = match arg {
+                    "1" => false,
+                    "0" => true,
                     _ => !lp.muted.load(Ordering::Relaxed),
                 };
                 lp.muted.store(want, Ordering::Relaxed);
@@ -1388,19 +1363,19 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
             // wire: a client that sets rather than flips drifts out of step the
             // first time a command is dropped, and never recovers. So the
             // explicit forms exist alongside, and the app uses those.
-            "k" | "k1" | "k0" => {
-                let on = match line.trim() {
-                    "k1" => true,
-                    "k0" => false,
+            "k" => {
+                let on = match arg {
+                    "1" => true,
+                    "0" => false,
                     _ => !sh.click.load(Ordering::Relaxed),
                 };
                 sh.click.store(on, Ordering::Relaxed);
                 return format!("click {}.", if on { "on" } else { "off" });
             }
-            "m" | "m1" | "m0" => {
-                let on = match line.trim() {
-                    "m1" => true,
-                    "m0" => false,
+            "m" => {
+                let on = match arg {
+                    "1" => true,
+                    "0" => false,
                     _ => !sh.monitor.load(Ordering::Relaxed),
                 };
                 sh.monitor.store(on, Ordering::Relaxed);
@@ -1457,8 +1432,9 @@ pub fn dispatch(sh: &Shared, sr: u32, line: &str) -> String {
                     }
                 );
             }
-            "" => {}
-            other => return format!("unknown command {:?}", other),
+            // Every word in the table has an arm above; `tokenize` has
+            // already refused what is not a word.
+            other => return unknown(other),
         }
     }
     String::new()

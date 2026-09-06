@@ -53,6 +53,7 @@ mod loop_state;
 mod run;
 mod selftest;
 mod shared;
+mod verb;
 
 pub use dispatch::dispatch;
 pub use loop_state::Loop;
