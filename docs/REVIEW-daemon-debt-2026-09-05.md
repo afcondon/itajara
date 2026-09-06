@@ -154,6 +154,30 @@ net; none changes behaviour; each can land alone.
    match on the verb word exactly. Retire the prefix guards and the
    ordering comments. `check-verbs.py` then compares two tables, which is
    what it always wanted to do.
+
+   **Step 2 — done 2026-09-06**, branch `daemon/verb-table`. The grammar
+   is `[loop digits] word [arg] [@late]`; `dispatch` still takes the loop
+   and the lateness off the ends exactly as before, and `verb::tokenize`
+   (new `engine/verb.rs`) reads what is left as the leading run of ASCII
+   letters (a `!` may open it, for `!lose`) plus the trimmed rest. If the
+   word is in `VERBS` — a `const` slice of 54 `Verb { word, arg }` rows,
+   `Arg` being `None | Flag | Number | Int | Text | Name` — that is the
+   command; only if it is not, the longest `Name` verb (`exl`, `ex`, `w`)
+   that begins the letters is, and the rest is the name, so `exlriff` is
+   `exl` + `riff` with no order consulted. Anything else is `unknown
+   command`, in the words the arm always used: `size13` is refused rather
+   than multiplied, `tone3000` is a tone, `sp0.5` a speed. The kind also
+   keeps a bare word bare — `x1`, `g5` stay unknown, as they were when
+   `x` and `g` were exact arms. The `match` is exact on the word, every
+   body reads `arg`, and the ordering comments are gone; the one arm that
+   changed shape is `k`/`m`, which read `line.trim()` and so flipped
+   instead of setting when addressed (`3k1`) — they read `arg` now.
+   `check-verbs.py` no longer looks for shadows, since there is nothing to
+   shadow with: it tokenizes every spelling `render` can produce by the
+   same rule and checks it lands on itself bare and argued, and checks
+   `VERBS` and the arms name the same words; `the_table_and_the_match_agree`
+   in `verb.rs` holds that from inside. 48 tests, both checkers, zero
+   warnings.
 3. **`Layer` as a struct.** `Vec<Layer>` behind the existing lock
    discipline; one `layer_json`. The Arbhar face's whole vocabulary (`ly`,
    `lw`, `dp`, `cp…l`) is then operations on one type — and it is the
