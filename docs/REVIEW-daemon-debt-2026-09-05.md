@@ -216,6 +216,54 @@ net; none changes behaviour; each can land alone.
    and boundary in one struct, written by the command thread, read once by
    the callback at the transition, cleared in one place. Swapped whole (a
    `Mutex` is fine; it is read once per buffer).
+
+   **Step 4 — done 2026-09-06**, branch `daemon/next-take`. Not a
+   `Mutex` after all: the same four atomics with the same orderings, so
+   the callback stays lock-free and the rendering hash is a proof of
+   sameness rather than an argument. The classification came from the
+   code, by the rule *written before the take starts and consumed at the
+   moment the callback turns the request into `FIRST` or `OVERDUB`*:
+
+   | field | is |
+   |---|---|
+   | `request` | plan — the phase asked for |
+   | `request_at` | plan — its frame, born and consumed with it |
+   | `one_pass` | plan — set by `fix` on material, spent when the take is stamped |
+   | `arm_from` | plan — the crossing's back-date, swapped out at the stamp |
+   | `close_at` | running take — written at the transition, read by the closer |
+   | `rec_len` | running take — written at the transition, taken by `commit` |
+   | `started_late` | running take — written on `r`, spent by `commit`, overwritten by every `r` |
+   | `reached`, `rec_reached`, `rec_from` | running take |
+   | `level_arm`, `quant` | mode — survive every take |
+   | `threaded` | content fact — "one layer that is an empty tape"; `blank` and `copy` read it as such |
+   | `loop_len` on zero layers | content fact — the mixer reads it; the plan reads it at the stamp and does not own it |
+
+   So the plan is smaller than the review guessed — four fields, not
+   seven — and the length of a sized-and-empty loop is deliberately not
+   in it: it is what the plan *reads*. New `engine/next_take.rs`:
+   `pub(crate) struct NextTake { request: AtomicU8Wrapper, request_at:
+   AtomicI64, one_pass: AtomicBool, arm_from: AtomicI64 }`, fields
+   private, on `Loop` as `next`. Set: `set(phase, at)` from `r`, `f` and
+   Start All; `set_from(at, from)` from the input callback's crossing;
+   `listen()` for an `r` that waits for a sound; `plan_one_pass()` from
+   `fix`. Taken: `take(before) -> Option<Taken>` in the output callback,
+   which peeks until the request is due and then reads every field —
+   a `FIRE` or `PLAYING` leaves `one_pass`/`arm_from` standing, since a
+   Start All going past does not cancel a `fix`. Cleared: `clear()` from
+   `Loop::cleared` (which used to clear `arm_from` and `one_pass` and
+   leave a pending request behind), the `r` that cancels an `ARMED` loop
+   and the `lev0` under one (both used to clear `arm_from` alone),
+   `free_length` (which cleared nothing), and the device-loss path in
+   `run` (which took `request` alone). Nothing resets a plan field
+   individually any more; the resets of `threaded`, `close_at` and
+   `rec_len` at the stamp and in `fix_next`/`copy` stay where they are,
+   being facts about the take now running or the loop's content. Three
+   stale cases closed as a consequence, each covered by a test: a
+   cancelled arm dropping a crossing already written, `c` or `z`
+   dropping a record waiting for the grid, and a one-pass surviving a
+   first take to fire on the overdub after it. `AtomicU8Wrapper::take`
+   went with its last caller. 55 tests, both hash constants unchanged,
+   both checkers, zero warnings.
 5. **`Phase` as an enum with one `transition` function.** The qualifiers
    move inside the constructors; the 17 sites become calls; the callback
    stays the only stamper of frames.
