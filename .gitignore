@@ -4,3 +4,4 @@ client/.spago/
 surface/output/
 surface/.spago/
 __pycache__/
+.DS_Store
