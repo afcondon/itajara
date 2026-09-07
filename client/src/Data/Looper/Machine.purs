@@ -85,6 +85,14 @@ type Rig =
   -- | daemon's `--loops`, not a constant of any surface. Empty until the
   -- | daemon has spoken, so "clear all" of nothing is nothing.
   { loops :: Array LoopState
+  -- | **How deep a loop goes**: the daemon's `--layers`, from the snapshot,
+  -- | and here for the same reason the loop count is the length of `loops` —
+  -- | it is a fact about the engine that was launched, not a constant of any
+  -- | surface. A knob that scales its travel to a *guess* at this is not
+  -- | merely inaccurate: `Layers` is absolute, so a ceiling below the truth
+  -- | asks for fewer layers than there are, and `perform` spends the
+  -- | difference in `Undo`. Guessing low deletes take.
+  , maxLayers :: Int
   -- | The loop the config bank acts on: the last one touched.
   , focus :: Int
   -- | The metronome and input monitoring. Global in the engine rather than per
