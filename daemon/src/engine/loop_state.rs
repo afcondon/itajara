@@ -965,6 +965,16 @@ impl Loop {
         self.unhush();
     }
 
+    /// The layer an open overdub on an alternate loop sums into: the one
+    /// that sounds. Exactly one on, that one; several on, the highest —
+    /// the newest of them; none on, the newest of all. `n` is `n_layers`.
+    pub(crate) fn sounding_layer(&self, n: usize) -> usize {
+        (0..n)
+            .rev()
+            .find(|&l| self.layers[l].on())
+            .unwrap_or(n.saturating_sub(1))
+    }
+
     /// Silence every layer while the next one goes down (an alternate
     /// loop's rule a), keeping which were on so `unhush` can give them
     /// back if the request is taken back. `n` is `n_layers`.

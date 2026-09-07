@@ -404,40 +404,64 @@ fn perform(sh: &Shared, sr: u32, line: &str, from: Caller, later: &mut Option<Jo
                         return no;
                     }
                     let layer = lp.n_layers.load(Ordering::Acquire);
-                    if layer >= sh.max_layers {
+                    // A one-pass layer starts on the press, like any
+                    // overdub. It was first made to wait for the loop's
+                    // own zero so the stacked layers would read from one
+                    // start — and on a thirteen-second loop that was up to
+                    // thirteen seconds of nothing after the press, with no
+                    // sign of the wait. The layer spans the whole loop
+                    // either way, and what you play lands where you heard
+                    // it; the wait bought nothing the music could hear.
+                    let one_pass = lp.next.is_one_pass() && layer > 0;
+                    let alt = lp.alt.load(Ordering::Relaxed);
+                    let revox = lp.revox.load(Ordering::Relaxed);
+                    // **An open overdub on an alternate loop sums into the
+                    // layer that sounds** (TAXONOMY §6, decision 2). The
+                    // layers are takes of one scene, so "another pass" is
+                    // not another take — it is more of this one, and the
+                    // write is modular and summed already, which is what
+                    // sound-on-sound is (§2C). A one-pass take is still a
+                    // new alternate, and a tape is still a tape.
+                    let summed = alt && layer > 0 && !one_pass && !revox;
+                    let slot = if summed { lp.sounding_layer(layer) } else { layer };
+                    if !summed && layer >= sh.max_layers {
                         return format!(
                             "loop {} is at {} layers, the ceiling; undo one first.",
                             li, sh.max_layers
                         );
                     } else {
                         // Said, not assumed: the take writes into the next
-                        // free slot, and the callback and the commit read
-                        // which rather than counting the layers again.
-                        lp.rec_slot.store(layer, Ordering::Release);
-                        // An overdub sums into its layer, so anything left there
-                        // from an undone take would bleed into the new one.
-                        sh.zero_layer(li, layer);
-                        // And the picture of it, which is now of audio that no
-                        // longer exists. Redrawn at commit; blank until then,
-                        // which reads as "being recorded" rather than as a lie.
-                        sh.rebuild_env(li, layer);
-                        // Anything above this layer has just been made
-                        // unrecoverable, so redo must not offer it.
-                        lp.redo_to.store(layer, Ordering::Release);
-                        // **Silence while the next one goes down.** On an
-                        // alternate loop the layers are takes of one scene,
-                        // and the one that sounds is not what the next one
-                        // is played against — it is what the next one
-                        // replaces. Silenced at the request, so a loop that
-                        // listens for a sound listens in silence too; given
-                        // back by `disarm` if the request is taken back, and
-                        // superseded by the solo when the take lands. Not a
-                        // tape: a Revox pass goes over its one layer.
-                        if lp.alt.load(Ordering::Relaxed)
-                            && layer > 0
-                            && !lp.revox.load(Ordering::Relaxed)
-                        {
-                            lp.hush(layer);
+                        // free slot, or the one that sounds, and the
+                        // callback and the commit read which rather than
+                        // counting the layers again.
+                        lp.rec_slot.store(slot, Ordering::Release);
+                        if !summed {
+                            // An overdub sums into its layer, so anything
+                            // left there from an undone take would bleed
+                            // into the new one.
+                            sh.zero_layer(li, layer);
+                            // And the picture of it, which is now of audio
+                            // that no longer exists. Redrawn at commit;
+                            // blank until then, which reads as "being
+                            // recorded" rather than as a lie.
+                            sh.rebuild_env(li, layer);
+                            // Anything above this layer has just been made
+                            // unrecoverable, so redo must not offer it.
+                            lp.redo_to.store(layer, Ordering::Release);
+                            // **Silence while the next one goes down.** On
+                            // an alternate loop the layers are takes of one
+                            // scene, and the one that sounds is not what
+                            // the next one is played against — it is what
+                            // the next one replaces. Silenced at the
+                            // request, so a loop that listens for a sound
+                            // listens in silence too; given back by
+                            // `disarm` if the request is taken back, and
+                            // superseded by the solo when the take lands.
+                            // Not for a summed pass: you hear the layer you
+                            // are adding to, and the rest are off already.
+                            if alt && layer > 0 {
+                                lp.hush(layer);
+                            }
                         }
                         // Kept until the recording closes, because the pre-roll
                         // shift that spends it happens at commit.
@@ -474,15 +498,6 @@ fn perform(sh: &Shared, sr: u32, line: &str, from: Caller, later: &mut Option<Jo
                         // exactly the loop that most needs to start on the
                         // boundary: it will be four bars long either way, and
                         // four bars starting off the grid is four bars wrong.
-                        // A one-pass layer starts on the press, like any
-                        // overdub. It was first made to wait for the loop's
-                        // own zero so the stacked layers would read from one
-                        // start — and on a thirteen-second loop that was up to
-                        // thirteen seconds of nothing after the press, with no
-                        // sign of the wait. The layer spans the whole loop
-                        // either way, and what you play lands where you heard
-                        // it; the wait bought nothing the music could hear.
-                        let one_pass = lp.next.is_one_pass() && layer > 0;
                         let boundary = if lp.quant.load(Ordering::Relaxed)
                             && lp.n_layers.load(Ordering::Acquire) == 0
                         {
@@ -509,13 +524,15 @@ fn perform(sh: &Shared, sr: u32, line: &str, from: Caller, later: &mut Option<Jo
                                 // onto layer 5 are different enough that a
                                 // display showing neither is the reason nobody
                                 // could tell an overdub had started.
-                                return if lp.revox.load(Ordering::Relaxed) {
+                                return if revox {
                                     // **Not "onto layer 2".** In Revox there is
                                     // one layer and the head is going over it;
                                     // naming a layer that will never exist is
                                     // how a mode gets blamed for making the
                                     // thing it was told not to make.
                                     format!("loop {} over the tape.", li)
+                                } else if summed {
+                                    format!("loop {} sums into layer {}.", li, slot + 1)
                                 } else if one_pass {
                                     format!(
                                         "loop {} adds layer {}, one pass, closing itself.",

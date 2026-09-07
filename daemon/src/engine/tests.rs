@@ -1737,6 +1737,9 @@ fn an_alternate_loop_is_silent_while_it_listens_and_gets_its_voice_back_if_it_st
     // The other road out: `lev0` under the wait.
     assert!(dispatch(&sh, 1000, "0ly11").contains("on"));
     assert_eq!(sounding(&sh, 0), "10", "`ly` on an alternate loop is a solo");
+    // Planned again: the arm taken back took the plan with it, and an open
+    // overdub on an alternate loop is a summed pass, which hushes nothing.
+    assert!(dispatch(&sh, 1000, "0fix0.1").contains("one layer"));
     assert!(dispatch(&sh, 1000, "0r").contains("listening"));
     assert_eq!(sounding(&sh, 0), "00");
     assert_eq!(dispatch(&sh, 1000, "0lev0"), "loop 0 records on the press again.");
@@ -1842,4 +1845,81 @@ fn a_layer_switched_on_in_an_alternate_loop_sounds_alone() {
     // And the bare word toggles, as the other flags do.
     assert!(dispatch(&sh, 1000, "0alt").contains("alternates"));
     assert_eq!(sounding(&sh, 0), "001", "declaring it solos the newest");
+}
+
+/// **An open overdub on an alternate loop sums into the layer that
+/// sounds.** No new layer: the count, the length, the tail, the birth, the
+/// window and the redo ceiling all stay, the audio changes, the picture is
+/// redrawn, and the loop is not hushed — you hear the layer you are adding
+/// to. A one-pass take on the same loop is still a new alternate, and a
+/// loop that is not alternates still opens a new layer.
+#[test]
+fn an_open_overdub_on_an_alternate_loop_sums_into_the_layer_that_sounds() {
+    let sh = rig(LEN);
+    let sr = 1000;
+    alt_loop(&sh, 0, 2);
+    assert_eq!(sounding(&sh, 0), "01");
+    let lp = sh.lp(0);
+    // Layer 2 with a shape of its own, and the loop with a window.
+    lp.set_layer_shape(1, Shape { len: 100, tail: 7, born: 3 });
+    assert!(dispatch(&sh, sr, "0lw2:10:60").contains("plays 10..60"));
+    assert!(dispatch(&sh, sr, "0in5").contains("windows"));
+    settle(&sh, 0);
+    assert_eq!(lp.window(), Some((5, 100)));
+    let before = sh.mix_at(0, 2, 20, true);
+    assert_eq!(before[0], 0.25, "layer 2 through its window");
+
+    assert_eq!(dispatch(&sh, sr, "0r"), "loop 0 sums into layer 2.");
+    assert_eq!(lp.rec_slot.load(Ordering::Acquire), 1, "the layer that sounds");
+    assert_eq!(lp.n_layers.load(Ordering::Acquire), 2, "no slot opened");
+    assert_eq!(lp.redo_to.load(Ordering::Acquire), 2, "nothing made unrecoverable");
+    assert_eq!(sounding(&sh, 0), "01", "not hushed: you hear what you add to");
+    let now = sh.out_frames.load(Ordering::Acquire);
+    callbacks::stamp(&sh, 0, now, 16);
+    assert_eq!(lp.phase(), Phase::Overdub, "the phase is the phase; alternates add none");
+    assert_eq!(lp.close_at.load(Ordering::Acquire), i64::MIN, "open");
+    // What the input callback does with a pass: sum into the slot.
+    for p in 0..100 {
+        for ch in 0..CHANNELS {
+            sh.add(0, 1, p, ch, 0.5);
+        }
+    }
+    assert_eq!(commit::commit(&sh, 0, sr, 0), "loop 0 layer 2 has another pass.");
+    assert_eq!(lp.n_layers.load(Ordering::Acquire), 2);
+    assert_eq!(lp.redo_to.load(Ordering::Acquire), 2);
+    assert_eq!(lp.layer_shape(1), (100, 1, 0), "length, period and phase kept");
+    assert_eq!(lp.layer_tail(1), 7, "the tail it had");
+    assert_eq!(lp.layer_born(1), 3, "born when it was");
+    assert_eq!(lp.layer_window(1), Some((10, 60)), "the layer's window");
+    assert_eq!(lp.window(), Some((5, 100)), "and the loop's");
+    assert_eq!(sounding(&sh, 0), "01");
+    assert_eq!(sh.mix_at(0, 2, 20, true)[0], 0.75, "the pass is in the audio");
+    assert!(!lp.layers[1].env().is_empty(), "and in the picture");
+
+    // A one-pass take is still a new alternate.
+    assert!(dispatch(&sh, sr, "0fix0.1").contains("one layer"));
+    assert!(dispatch(&sh, sr, "0r").contains("adds layer 3, one pass"));
+    assert_eq!(lp.rec_slot.load(Ordering::Acquire), 2);
+    assert_eq!(sounding(&sh, 0), "00", "hushed for a new layer");
+    callbacks::stamp(&sh, 0, sh.out_frames.load(Ordering::Acquire), 16);
+    assert!(commit::commit(&sh, 0, sr, 0).ends_with("3 layers playing."));
+    assert_eq!(sounding(&sh, 0), "001");
+
+    // Which layer a pass sums into: the one on; the highest of several;
+    // the newest when none.
+    assert_eq!(lp.sounding_layer(3), 2);
+    lp.layers[0].on.store(true, Ordering::Release);
+    lp.layers[2].on.store(false, Ordering::Release);
+    assert_eq!(lp.sounding_layer(3), 0, "exactly one on");
+    lp.layers[1].on.store(true, Ordering::Release);
+    assert_eq!(lp.sounding_layer(3), 1, "several on: the highest");
+    lp.layers[0].on.store(false, Ordering::Release);
+    lp.layers[1].on.store(false, Ordering::Release);
+    assert_eq!(lp.sounding_layer(3), 2, "none on: the newest");
+
+    // A loop that is not alternates opens a new layer, as it always did.
+    one_layer_loop(&sh, 1, 100, 0.5);
+    sh.lp(1).enter(Phase::Playing, 0);
+    assert_eq!(dispatch(&sh, sr, "1r"), "loop 1 overdubbing onto layer 2.");
+    assert_eq!(sh.lp(1).rec_slot.load(Ordering::Acquire), 1);
 }

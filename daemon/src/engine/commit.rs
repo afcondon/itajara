@@ -471,8 +471,15 @@ pub(crate) fn finish_take(sh: &Shared, li: usize, sr: u32, t: Take) -> String {
     // the end, as the continuation, the same place a first recording keeps it.
     // The material is not discarded, because it is the thing a seamless loop is
     // made of.
+    //
+    // **A summed pass keeps the tail its layer already had.** The frames
+    // after the press are still taken off the head, where they doubled it;
+    // they are not written past the end, because the end is another
+    // take's and its continuation is the one the wrap has been fading
+    // into. They go, and the layer stays the shape it was.
     if state == Phase::Overdub && late > 0 {
         let layer = lp.rec_slot.load(Ordering::Acquire);
+        let summed = layer < lp.n_layers.load(Ordering::Acquire);
         let len = lp.loop_len.load(Ordering::Acquire);
         let k = sh.k.load(Ordering::Acquire);
         let rec_from = lp.rec_from.load(Ordering::Acquire);
@@ -496,23 +503,28 @@ pub(crate) fn finish_take(sh: &Shared, li: usize, sr: u32, t: Take) -> String {
                         sh.ring_at(src, f - k, ch).unwrap_or(0.0)
                     };
                     sh.add(li, layer, pos, ch, -v);
-                    if at < sh.max_frames {
+                    if !summed && at < sh.max_frames {
                         sh.write(li, layer, at, ch, v);
                     }
                 }
                 undone += 1;
-                if at < sh.max_frames {
+                if !summed && at < sh.max_frames {
                     kept += 1;
                 }
             }
         }
-        tail = kept;
+        if !summed {
+            tail = kept;
+        }
         if undone > 0 {
             println!(
-                "  {:.0} ms recorded after the press unwrapped from the loop head, \
-                 kept as continuation ({} frames).",
+                "  {:.0} ms recorded after the press unwrapped from the loop head, {}.",
                 undone as f64 / sr as f64 * 1000.0,
-                kept
+                if summed {
+                    "discarded: the layer keeps the continuation it had".to_string()
+                } else {
+                    format!("kept as continuation ({} frames)", kept)
+                }
             );
         }
     }
@@ -533,6 +545,24 @@ pub(crate) fn finish_take(sh: &Shared, li: usize, sr: u32, t: Take) -> String {
             li,
             len as f64 / sr as f64
         );
+    }
+
+    // **A summed pass makes no layer either.** It went into a layer that
+    // was already playing — the one that sounds on an alternate loop — so
+    // there is nothing to shape or to count: the length, the tail, the
+    // birth, the window, the period and the phase are the layer's and stay,
+    // and `redo_to` does not move because nothing above was written over.
+    // What changed is the audio, so the picture is redrawn. **Undo stays a
+    // layer**: the pass is part of the layer it went into, and taking it
+    // back alone would need the ring to remember every pass separately —
+    // which is a different instrument (TAXONOMY §2C, "sound-on-sound":
+    // the whole layer, exactly).
+    if layer < lp.n_layers.load(Ordering::Acquire) {
+        sh.rebuild_env(li, layer);
+        if len > 0 {
+            draw_layer(sh, li, layer, len, sr);
+        }
+        return format!("loop {} layer {} has another pass.", li, layer + 1);
     }
 
     // Born on the pass it was committed on, which is when it starts existing as
