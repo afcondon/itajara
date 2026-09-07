@@ -263,6 +263,13 @@ data Verb
   | OneShot Boolean
   -- | Wait for a sound rather than for a foot.
   | LevelArm Boolean
+  -- | **The loop's layers are alternates**: takes of one scene, one of which
+  -- | sounds at a time. On, the daemon silences the loop while the next
+  -- | layer goes down, solos the one that lands, and sums an open overdub
+  -- | into the layer that sounds instead of opening a new one; off changes
+  -- | no layer's switch. The Friend sets it on the loops it records into;
+  -- | the pedalboard never does. See `Foreign.LooperSocket.LoopState.alt`.
+  | Alternates Boolean
   -- | The metronome, and input monitoring. Global rather than per-loop in the
   -- | engine, but addressed the same way.
   -- |
@@ -396,6 +403,7 @@ render = case _ of
   Pendulum on -> flag "pend" on
   OneShot on -> flag "one" on
   LevelArm on -> flag "lev" on
+  Alternates on -> flag "alt" on
   Click on -> flag "k" on
   Monitor on -> flag "m" on
 

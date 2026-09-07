@@ -291,6 +291,26 @@ type LoopState =
   -- | stereo. On, the channels are summed and `pan` is a true pan; off, they
   -- | pass through and `pan` is a balance.
   , mono :: Boolean
+  -- | **This loop's layers are alternates**: takes of one scene, of which one
+  -- | sounds at a time — the newest, until a hand says otherwise. A property
+  -- | of the loop since 2026-09-07 (TAXONOMY §6, decision 1), where it was a
+  -- | rule the Friend kept over the snapshot with `growing` and `soloed`, and
+  -- | a rule one surface keeps is a rule the other surface breaks. The daemon
+  -- | silences the loop while the next layer goes down, solos the one that
+  -- | lands, repairs after an undo, and reads `LayerOn` as a solo; and an
+  -- | open overdub sums into the layer that sounds rather than opening one.
+  -- | Set with `Verb.Alternates`.
+  , alt :: Boolean
+  -- | **A length and no layers**: every layer undone, or told how long before
+  -- | anything was played. The wire's `state` reads `idle` or `playing` for
+  -- | it and it is neither — both pages derived this and got it wrong, so
+  -- | the daemon says it (decision 3).
+  , sized :: Boolean
+  -- | **The loop has a window.** Not a phase, but a windowed loop refuses
+  -- | `Multiply` and `ClaimPast`, which is what a phase looks like from here.
+  -- | The live window, not one an edit is still holding: `winIn`/`winOut`
+  -- | show the hand, this shows what `x` and `t` will meet.
+  , windowed :: Boolean
   , revox :: Boolean
   -- | The window, in arena positions, or both zero for none; and the
   -- | rotation, where a pass starts inside it. Non-destructive edits — see

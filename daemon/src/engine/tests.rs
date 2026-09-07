@@ -1179,7 +1179,8 @@ fn the_fixture_renders_to_a_known_hash() {
 /// top level stopped repeating the selected loop's nine fields, so the text
 /// shrank; `ws::tests` holds the per-loop and per-layer objects to literals
 /// captured before that, and the render hash above did not move. It moved
-/// again on 2026-09-07, when `alt` joined the per-loop object.
+/// again on 2026-09-07, when `alt` joined the per-loop object, and once
+/// more the same day for `sized` and `windowed`.
 #[test]
 fn the_fixture_snapshots_to_a_known_hash() {
     let sh = fixture();
@@ -1194,7 +1195,7 @@ fn the_fixture_snapshots_to_a_known_hash() {
         "{}",
         text
     );
-    assert_eq!(fnv(FNV_SEED, text.as_bytes()), 6041819821108414677, "snapshot hash");
+    assert_eq!(fnv(FNV_SEED, text.as_bytes()), 470236186280193332, "snapshot hash");
 }
 
 /// **A plan does not outlive the loop it was made for.** The stale-plan

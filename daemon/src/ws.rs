@@ -221,7 +221,7 @@ fn loop_json(sh: &Shared, li: usize, sr: u32, cur: i64) -> String {
             r#""speed":{:.4},"pendulum":{},"oneShot":{},"levelArm":{},"#,
             r#""firing":{},"chance":{:.4},"skipping":{},"fadeMs":{:.1},"decayDb":{:.2},"#,
             r#""volDb":{:.2},"revox":{},"fbDb":{:.2},"toneHz":{:.0},"cycles":{},"winIn":{},"winOut":{},"rot":{},"#,
-            r#""src":{},"mono":{},"alt":{},"pendingAt":{},"recFrames":{},"recEnv":[{}],"shapes":[{}]}}"#
+            r#""src":{},"mono":{},"alt":{},"sized":{},"windowed":{},"pendingAt":{},"recFrames":{},"recEnv":[{}],"shapes":[{}]}}"#
         ),
         li,
         lp.state_name(),
@@ -311,6 +311,14 @@ fn loop_json(sh: &Shared, li: usize, sr: u32, cur: i64) -> String {
         // fact about the loop that both surfaces read, where it used to be
         // a rule one of them kept.
         lp.alt.load(Ordering::Relaxed),
+        // **Two states the byte cannot say, said** (TAXONOMY §6, decision
+        // 3). Sized: a length and no layers — every layer undone, or told
+        // how long before anything was played — which reads `idle` or
+        // `playing` on the wire and is neither; both pages derived it and
+        // got it wrong. Windowed: not a phase, but a loop with a window
+        // refuses `x` and `t`, which is what a phase looks like from a page.
+        len > 0 && lp.n_layers.load(Ordering::Acquire) == 0,
+        lp.window().is_some(),
         lp.pending_in(cur),
         lp.rec_frames(sh.out_frames.load(Ordering::Acquire) as i64),
         // **The take in hand, drawn while it is being played.** Empty
@@ -530,7 +538,7 @@ mod tests {
             loop_json(&sh, 2, 48_000, cur),
             format!(
                 concat!(
-                    r#"{{"index":2,"state":"idle","layers":1,"loopFrames":1000,"loopSecs":0.0208,"pos":0,"phase":0.00000,"armed":false,"recording":false,"quant":false,"muted":false,"reverse":false,"pan":30,"speed":0.7500,"pendulum":false,"oneShot":false,"levelArm":false,"firing":false,"chance":1.0000,"skipping":false,"fadeMs":0.0,"decayDb":0.00,"volDb":-1.94,"revox":false,"fbDb":-3.00,"toneHz":6500,"cycles":0,"winIn":0,"winOut":0,"rot":0,"src":1,"mono":true,"alt":false,"pendingAt":-1,"recFrames":0,"recEnv":[],"#,
+                    r#"{{"index":2,"state":"idle","layers":1,"loopFrames":1000,"loopSecs":0.0208,"pos":0,"phase":0.00000,"armed":false,"recording":false,"quant":false,"muted":false,"reverse":false,"pan":30,"speed":0.7500,"pendulum":false,"oneShot":false,"levelArm":false,"firing":false,"chance":1.0000,"skipping":false,"fadeMs":0.0,"decayDb":0.00,"volDb":-1.94,"revox":false,"fbDb":-3.00,"toneHz":6500,"cycles":0,"winIn":0,"winOut":0,"rot":0,"src":1,"mono":true,"alt":false,"sized":false,"windowed":false,"pendingAt":-1,"recFrames":0,"recEnv":[],"#,
                     r#""shapes":[{{"len":250,"period":4,"phase":2,"tail":0,"gain":1.00000,"born":0,"on":true,"lwIn":0,"lwOut":0,"env":[{}]}}]}}"#
                 ),
                 ["229"; ENV_BUCKETS].join(",")
@@ -538,8 +546,77 @@ mod tests {
         );
         assert_eq!(
             loop_json(&sh, 4, 48_000, cur),
-            r#"{"index":4,"state":"idle","layers":0,"loopFrames":0,"loopSecs":0.0000,"pos":0,"phase":0.00000,"armed":false,"recording":false,"quant":false,"muted":false,"reverse":false,"pan":64,"speed":1.0000,"pendulum":false,"oneShot":false,"levelArm":false,"firing":false,"chance":1.0000,"skipping":false,"fadeMs":0.0,"decayDb":0.00,"volDb":0.00,"revox":false,"fbDb":-3.00,"toneHz":6500,"cycles":0,"winIn":0,"winOut":0,"rot":0,"src":1,"mono":false,"alt":false,"pendingAt":-1,"recFrames":0,"recEnv":[],"shapes":[]}"#
+            r#"{"index":4,"state":"idle","layers":0,"loopFrames":0,"loopSecs":0.0000,"pos":0,"phase":0.00000,"armed":false,"recording":false,"quant":false,"muted":false,"reverse":false,"pan":64,"speed":1.0000,"pendulum":false,"oneShot":false,"levelArm":false,"firing":false,"chance":1.0000,"skipping":false,"fadeMs":0.0,"decayDb":0.00,"volDb":0.00,"revox":false,"fbDb":-3.00,"toneHz":6500,"cycles":0,"winIn":0,"winOut":0,"rot":0,"src":1,"mono":false,"alt":false,"sized":false,"windowed":false,"pendingAt":-1,"recFrames":0,"recEnv":[],"shapes":[]}"#
         );
+    }
+
+    /// **The wire carries exactly what the client declares**, for each of
+    /// the three types — read out of `LooperSocket.purs` by path, the way
+    /// `check-snapshot.py` reads it, and compared with the keys the three
+    /// emitters write. The script needs a running daemon and a loop it may
+    /// record into; this holds the same claim from inside, and both ways:
+    /// a field declared and not sent is `undefined` at the first touch, and
+    /// a field sent and not declared is one the client cannot read.
+    #[test]
+    fn the_wire_carries_what_the_client_declares() {
+        let purs = include_str!("../../client/src/Foreign/LooperSocket.purs");
+        // The fields of `type <name> = { ... }`: one per line, opened by
+        // `{` or `,`, up to the `::`; doc comments skipped; closed by `}`.
+        let declared = |name: &str| -> Vec<String> {
+            let head = format!("type {} =", name);
+            let at = purs.find(&head).unwrap_or_else(|| panic!("no `{}` in LooperSocket.purs", head));
+            let mut out = Vec::new();
+            for line in purs[at + head.len()..].lines().skip(1) {
+                let t = line.trim();
+                if t.starts_with("--") {
+                    continue;
+                }
+                if t == "}" {
+                    break;
+                }
+                let field = t.trim_start_matches(['{', ',']).trim();
+                let field = field.split("::").next().unwrap().trim();
+                assert!(!field.is_empty(), "unreadable line in `{}`: {:?}", name, line);
+                out.push(field.to_string());
+            }
+            out.sort_unstable();
+            out
+        };
+        let keys = |text: &str| -> Vec<String> {
+            let v: serde_json::Value = serde_json::from_str(text).expect("JSON");
+            let mut k: Vec<String> = v.as_object().expect("an object").keys().cloned().collect();
+            k.sort_unstable();
+            k
+        };
+        let sh = fixture();
+        let cur = sh.out_frames.load(Ordering::Acquire) as i64;
+        assert_eq!(keys(&rig_json(&sh, 48_000, true)), declared("LooperState"), "LooperState");
+        assert_eq!(keys(&loop_json(&sh, 0, 48_000, cur)), declared("LoopState"), "LoopState");
+        assert_eq!(keys(&layer_json(&sh.lp(0).layers[0])), declared("LayerShape"), "LayerShape");
+    }
+
+    /// **Sized and windowed and alternates, on the wire.** Sized is a
+    /// length with no layers; a threaded tape has one and is not. Windowed
+    /// is the live window, as `x` and `t` read it.
+    #[test]
+    fn sized_windowed_and_alt_are_said_per_loop() {
+        let sh = fixture();
+        let cur = sh.out_frames.load(Ordering::Acquire) as i64;
+        let field = |li: usize, name: &str| -> bool {
+            let v: serde_json::Value = serde_json::from_str(&loop_json(&sh, li, 48_000, cur)).unwrap();
+            v[name].as_bool().unwrap_or_else(|| panic!("loop {} has no bool `{}`", li, name))
+        };
+        // Loop 0 is windowed by the fixture; loop 3 is a threaded tape.
+        assert!(field(0, "windowed"));
+        assert!(!field(0, "sized"));
+        assert!(!field(1, "windowed"));
+        assert!(!field(3, "sized"), "a tape has a layer");
+        assert!(!field(4, "sized"), "an empty slot has no length");
+        sh.lp(5).loop_len.store(100, Ordering::Release);
+        assert!(field(5, "sized"), "a length and no layers");
+        assert!(!field(5, "alt"));
+        sh.lp(5).alt.store(true, Ordering::Relaxed);
+        assert!(field(5, "alt"));
     }
 
     /// **The top level is the rig and nothing else.** Its keys, in the order
