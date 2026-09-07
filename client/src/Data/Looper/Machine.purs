@@ -208,8 +208,13 @@ perform rig subject = case _ of
     Nothing -> [ notInSnapshot i ]
     Just st
       | st.armed -> [ Handled ("loop " <> show (i + 1) <> " is already listening") ]
-      | Looper.phaseOf st /= Looper.Idle ->
-          [ Unavailable ("loop " <> show (i + 1) <> " is busy — close it first") ]
+      -- Only a loop being written refuses. A playing loop arms — the daemon
+      -- goes Playing → Armed and, if the arm is taken back before a sound,
+      -- Armed → Playing with what it had (review step 5b, 2026-09-06). From
+      -- 2026-08-21 to 2026-09-07 this refused anything but an idle loop,
+      -- which made the Arm switch useless on every loop with material.
+      | Looper.isWriting st ->
+          [ Unavailable ("loop " <> show (i + 1) <> " is recording — close it first") ]
       | otherwise ->
           gridded rig i
             <> [ Command (cmd i (Verb.LevelArm true)), Command (cmd i Verb.Record) ]
