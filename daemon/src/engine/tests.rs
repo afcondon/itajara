@@ -1674,3 +1674,17 @@ fn a_multiply_ends_at_the_boundary_the_sleep_would_have_woken_on() {
     assert_eq!(t.waited, 0);
     assert!(commit::finish_take(&sh, 0, sr, t).ends_with("(1 cycles of 0.800 s) — 3 layers playing."));
 }
+
+/// A slot's window belongs to the audio that was in it. Clear the loop,
+/// record again into the same slot, and the new layer plays whole — before
+/// 2026-09-07 it inherited the old window and sounded only where that fell.
+#[test]
+fn a_fresh_take_into_a_windowed_slot_plays_whole() {
+    let sh = rig(LEN);
+    one_layer_loop(&sh, 0, 100, 0.0);
+    assert!(dispatch(&sh, 48_000, "0lw1:-50:80").contains("with silence"));
+    assert!(sh.lp(0).layer_window(0).is_some());
+    sh.lp(0).cleared(0);
+    sh.lp(0).set_layer_shape(0, Shape { len: 60, tail: 0, born: 0 });
+    assert_eq!(sh.lp(0).layer_window(0), None, "the window went with the old audio");
+}

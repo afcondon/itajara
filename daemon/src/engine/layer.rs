@@ -170,6 +170,15 @@ impl Layer {
         self.born.store(s.born, Ordering::Release);
         self.gain.store(1.0f32.to_bits(), Ordering::Release);
         self.on.store(true, Ordering::Release);
+        // **The window goes with the audio it was cut from.** A slot keeps
+        // its window across `c` and undo — a fresh take into it then played
+        // only where the old window fell: a 13 s Arbhar window slid to
+        // -5.2 s on a 6 s layer sounded for the last second, from the
+        // layer's first, and the picture showed the whole layer (2026-09-07).
+        // Copy and duplicate set the shape first and copy the window after,
+        // so a window that should travel still does.
+        self.win_in.store(0, Ordering::Release);
+        self.win_out.store(0, Ordering::Release);
     }
     /// Where in the layer's own buffer the loop position `pos` falls — or `None`
     /// when the layer is silent there.
