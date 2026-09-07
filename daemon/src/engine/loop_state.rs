@@ -282,6 +282,26 @@ pub struct Loop {
     /// because a take that has been recorded over is not recoverable and
     /// offering to redo it would be a lie.
     pub(crate) redo_to: AtomicUsize,
+    /// **This loop's layers are alternates**: takes of one scene, of which
+    /// one sounds at a time — the newest, until a hand says otherwise.
+    ///
+    /// A property of the loop rather than a page rule (TAXONOMY §6,
+    /// decision 1). The Friend used to silence the sounding layer before a
+    /// take and solo the new one when it landed, keeping `growing` and
+    /// `soloed` to know which loops were its own; the pedalboard did not,
+    /// and a snapshot diff from one surface silenced the other's layers.
+    /// Here both surfaces see one fact and the rule runs on the control
+    /// lane: `hush` when a new layer is asked for, `solo` when it lands,
+    /// `repair_alt` after an undo, and `ly` as a solo. Nothing in the
+    /// audio callbacks reads it — they read the layers' `on`, as before.
+    ///
+    /// Describes what is in the loop, so `cleared` forgets it: a cleared
+    /// slot recorded into by another surface must not inherit it.
+    pub alt: AtomicBool,
+    /// Which layers sounded before `hush` silenced them, one bit each, so a
+    /// request taken back (`disarm`) can give them back. Zero when nothing
+    /// is owed.
+    pub(crate) alt_was_on: AtomicU64,
     /// **Which layer the take in hand writes into.**
     ///
     /// `n_layers` — a new layer, which is what every take was until now —
@@ -499,6 +519,8 @@ impl Loop {
             reached: AtomicUsize::new(0),
             rec_reached: AtomicI64::new(0),
             redo_to: AtomicUsize::new(0),
+            alt: AtomicBool::new(false),
+            alt_was_on: AtomicU64::new(0),
             rec_slot: AtomicUsize::new(0),
             overflowed: AtomicBool::new(false),
             rec_from: AtomicI64::new(0),
@@ -796,6 +818,12 @@ impl Loop {
         self.chance_sounds.store(true, Ordering::Relaxed);
         self.n_layers.store(0, Ordering::Release);
         self.redo_to.store(0, Ordering::Release);
+        // Alternates describe what is in the loop, and nothing is. A slot
+        // the Friend had marked and the board then records into would
+        // otherwise silence every layer but the newest for a reason no
+        // pedal could show.
+        self.alt.store(false, Ordering::Relaxed);
+        self.alt_was_on.store(0, Ordering::Release);
         self.rec_slot.store(0, Ordering::Release);
         self.loop_len.store(0, Ordering::Release);
         // **Everything that says how long this loop is, together.**
@@ -932,6 +960,57 @@ impl Loop {
             || self.threaded.load(Ordering::Relaxed);
         self.enter(if held { Phase::Playing } else { Phase::Idle }, at);
         self.next.clear();
+        // The layers an alternate loop silenced to listen come back: the
+        // take they made way for is not going to happen.
+        self.unhush();
+    }
+
+    /// Silence every layer while the next one goes down (an alternate
+    /// loop's rule a), keeping which were on so `unhush` can give them
+    /// back if the request is taken back. `n` is `n_layers`.
+    pub(crate) fn hush(&self, n: usize) {
+        let mut mask = 0u64;
+        for l in 0..n.min(64) {
+            if self.layers[l].on() {
+                mask |= 1 << l;
+            }
+            self.layers[l].on.store(false, Ordering::Release);
+        }
+        self.alt_was_on.store(mask, Ordering::Release);
+    }
+
+    /// Give back what `hush` took. A no-op when nothing is owed, so every
+    /// road out of a request can call it without asking.
+    pub(crate) fn unhush(&self) {
+        let mask = self.alt_was_on.swap(0, Ordering::AcqRel);
+        if mask == 0 {
+            return;
+        }
+        for l in 0..self.layers.len().min(64) {
+            if mask & (1 << l) != 0 {
+                self.layers[l].on.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// Layer `k` sounds alone among the `n` playing (rule b, and what `ly`
+    /// means on an alternate loop). Nothing is owed after it: the take the
+    /// hush made way for has landed.
+    pub(crate) fn solo(&self, k: usize, n: usize) {
+        for l in 0..n {
+            self.layers[l].on.store(l == k, Ordering::Release);
+        }
+        self.alt_was_on.store(0, Ordering::Release);
+    }
+
+    /// After an undo on an alternate loop: if nothing sounds, the newest
+    /// remaining does (rule c). An alternate loop with layers and no voice
+    /// is a loop that looks like it stopped.
+    pub(crate) fn repair_alt(&self) {
+        let n = self.n_layers.load(Ordering::Acquire);
+        if n > 0 && !(0..n).any(|l| self.layers[l].on()) {
+            self.layers[n - 1].on.store(true, Ordering::Release);
+        }
     }
 
     /// The close slot, poisoning ignored: nothing it holds can be half

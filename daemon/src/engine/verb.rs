@@ -99,6 +99,7 @@ pub(crate) const VERBS: &[Verb] = &[
     Verb { word: "z", arg: Arg::None },
     // Layers, and the next take's shape.
     Verb { word: "ly", arg: Arg::Text },
+    Verb { word: "alt", arg: Arg::Flag },
     Verb { word: "lw", arg: Arg::Text },
     Verb { word: "dp", arg: Arg::Int },
     Verb { word: "lq", arg: Arg::Int },

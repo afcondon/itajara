@@ -221,7 +221,7 @@ fn loop_json(sh: &Shared, li: usize, sr: u32, cur: i64) -> String {
             r#""speed":{:.4},"pendulum":{},"oneShot":{},"levelArm":{},"#,
             r#""firing":{},"chance":{:.4},"skipping":{},"fadeMs":{:.1},"decayDb":{:.2},"#,
             r#""volDb":{:.2},"revox":{},"fbDb":{:.2},"toneHz":{:.0},"cycles":{},"winIn":{},"winOut":{},"rot":{},"#,
-            r#""src":{},"mono":{},"pendingAt":{},"recFrames":{},"recEnv":[{}],"shapes":[{}]}}"#
+            r#""src":{},"mono":{},"alt":{},"pendingAt":{},"recFrames":{},"recEnv":[{}],"shapes":[{}]}}"#
         ),
         li,
         lp.state_name(),
@@ -307,6 +307,10 @@ fn loop_json(sh: &Shared, li: usize, sr: u32, cur: i64) -> String {
         // being carried; a field added today should not add to it.
         sh.src_of(li) + 1,
         lp.mono.load(Ordering::Relaxed),
+        // Whether the layers are alternates — one sounds, the newest. A
+        // fact about the loop that both surfaces read, where it used to be
+        // a rule one of them kept.
+        lp.alt.load(Ordering::Relaxed),
         lp.pending_in(cur),
         lp.rec_frames(sh.out_frames.load(Ordering::Acquire) as i64),
         // **The take in hand, drawn while it is being played.** Empty
@@ -526,7 +530,7 @@ mod tests {
             loop_json(&sh, 2, 48_000, cur),
             format!(
                 concat!(
-                    r#"{{"index":2,"state":"idle","layers":1,"loopFrames":1000,"loopSecs":0.0208,"pos":0,"phase":0.00000,"armed":false,"recording":false,"quant":false,"muted":false,"reverse":false,"pan":30,"speed":0.7500,"pendulum":false,"oneShot":false,"levelArm":false,"firing":false,"chance":1.0000,"skipping":false,"fadeMs":0.0,"decayDb":0.00,"volDb":-1.94,"revox":false,"fbDb":-3.00,"toneHz":6500,"cycles":0,"winIn":0,"winOut":0,"rot":0,"src":1,"mono":true,"pendingAt":-1,"recFrames":0,"recEnv":[],"#,
+                    r#"{{"index":2,"state":"idle","layers":1,"loopFrames":1000,"loopSecs":0.0208,"pos":0,"phase":0.00000,"armed":false,"recording":false,"quant":false,"muted":false,"reverse":false,"pan":30,"speed":0.7500,"pendulum":false,"oneShot":false,"levelArm":false,"firing":false,"chance":1.0000,"skipping":false,"fadeMs":0.0,"decayDb":0.00,"volDb":-1.94,"revox":false,"fbDb":-3.00,"toneHz":6500,"cycles":0,"winIn":0,"winOut":0,"rot":0,"src":1,"mono":true,"alt":false,"pendingAt":-1,"recFrames":0,"recEnv":[],"#,
                     r#""shapes":[{{"len":250,"period":4,"phase":2,"tail":0,"gain":1.00000,"born":0,"on":true,"lwIn":0,"lwOut":0,"env":[{}]}}]}}"#
                 ),
                 ["229"; ENV_BUCKETS].join(",")
@@ -534,7 +538,7 @@ mod tests {
         );
         assert_eq!(
             loop_json(&sh, 4, 48_000, cur),
-            r#"{"index":4,"state":"idle","layers":0,"loopFrames":0,"loopSecs":0.0000,"pos":0,"phase":0.00000,"armed":false,"recording":false,"quant":false,"muted":false,"reverse":false,"pan":64,"speed":1.0000,"pendulum":false,"oneShot":false,"levelArm":false,"firing":false,"chance":1.0000,"skipping":false,"fadeMs":0.0,"decayDb":0.00,"volDb":0.00,"revox":false,"fbDb":-3.00,"toneHz":6500,"cycles":0,"winIn":0,"winOut":0,"rot":0,"src":1,"mono":false,"pendingAt":-1,"recFrames":0,"recEnv":[],"shapes":[]}"#
+            r#"{"index":4,"state":"idle","layers":0,"loopFrames":0,"loopSecs":0.0000,"pos":0,"phase":0.00000,"armed":false,"recording":false,"quant":false,"muted":false,"reverse":false,"pan":64,"speed":1.0000,"pendulum":false,"oneShot":false,"levelArm":false,"firing":false,"chance":1.0000,"skipping":false,"fadeMs":0.0,"decayDb":0.00,"volDb":0.00,"revox":false,"fbDb":-3.00,"toneHz":6500,"cycles":0,"winIn":0,"winOut":0,"rot":0,"src":1,"mono":false,"alt":false,"pendingAt":-1,"recFrames":0,"recEnv":[],"shapes":[]}"#
         );
     }
 

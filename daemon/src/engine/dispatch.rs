@@ -424,6 +424,21 @@ fn perform(sh: &Shared, sr: u32, line: &str, from: Caller, later: &mut Option<Jo
                         // Anything above this layer has just been made
                         // unrecoverable, so redo must not offer it.
                         lp.redo_to.store(layer, Ordering::Release);
+                        // **Silence while the next one goes down.** On an
+                        // alternate loop the layers are takes of one scene,
+                        // and the one that sounds is not what the next one
+                        // is played against — it is what the next one
+                        // replaces. Silenced at the request, so a loop that
+                        // listens for a sound listens in silence too; given
+                        // back by `disarm` if the request is taken back, and
+                        // superseded by the solo when the take lands. Not a
+                        // tape: a Revox pass goes over its one layer.
+                        if lp.alt.load(Ordering::Relaxed)
+                            && layer > 0
+                            && !lp.revox.load(Ordering::Relaxed)
+                        {
+                            lp.hush(layer);
+                        }
                         // Kept until the recording closes, because the pre-roll
                         // shift that spends it happens at commit.
                         lp.started_late.store(late, Ordering::Release);
@@ -775,8 +790,25 @@ fn perform(sh: &Shared, sr: u32, line: &str, from: Caller, later: &mut Option<Jo
                 let n = lp.n_layers.load(Ordering::Acquire);
                 return match num.parse::<usize>() {
                     Ok(l) if l >= 1 && l <= n => {
-                        lp.layers[l - 1].on.store(on, Ordering::Release);
-                        format!("loop {} layer {} is {}.", li, l, if on { "on" } else { "off" })
+                        // On an alternate loop, on means *this one*: the
+                        // others go off, because one sounds at a time is
+                        // what the loop declared. Off is allowed to leave
+                        // it silent, and the ack says so rather than
+                        // leaving a quiet loop to be diagnosed.
+                        let alt = lp.alt.load(Ordering::Relaxed);
+                        if alt && on {
+                            lp.solo(l - 1, n);
+                        } else {
+                            lp.layers[l - 1].on.store(on, Ordering::Release);
+                        }
+                        let silent = alt && !on && !(0..n).any(|x| lp.layers[x].on());
+                        format!(
+                            "loop {} layer {} is {}{}.",
+                            li,
+                            l,
+                            if on { "on" } else { "off" },
+                            if silent { " — nothing sounds now" } else { "" }
+                        )
                     }
                     Ok(l) => format!(
                         "loop {} has {} layer{}, not a layer {}.",
@@ -866,6 +898,11 @@ fn perform(sh: &Shared, sr: u32, line: &str, from: Caller, later: &mut Option<Jo
                         sh.rebuild_env(li, n);
                         lp.n_layers.store(n + 1, Ordering::Release);
                         lp.redo_to.store(n + 1, Ordering::Release);
+                        // The newest sounds alone on an alternate loop,
+                        // however it arrived.
+                        if lp.alt.load(Ordering::Relaxed) {
+                            lp.solo(n, n + 1);
+                        }
                         format!("loop {} layer {} duplicated as layer {}.", li, k, n + 1)
                     }
                     Ok(k) => format!("loop {} has {} layer{}, not a layer {}.", li, n, if n == 1 { "" } else { "s" }, k),
@@ -958,6 +995,11 @@ fn perform(sh: &Shared, sr: u32, line: &str, from: Caller, later: &mut Option<Jo
                     };
                 }
                 lp.n_layers.store(n + 1, Ordering::Release);
+                // The layer put back is the newest again, and on an
+                // alternate loop the newest sounds alone.
+                if lp.alt.load(Ordering::Relaxed) {
+                    lp.solo(n, n + 1);
+                }
                 return format!("loop {} redone: {} layers playing.", li, n + 1);
             }
             "u" => {
@@ -972,6 +1014,12 @@ fn perform(sh: &Shared, sr: u32, line: &str, from: Caller, later: &mut Option<Jo
                     return format!("loop {} has nothing to undo.", li);
                 } else {
                     lp.n_layers.store(n - 1, Ordering::Release);
+                    // On an alternate loop the layer that went was the one
+                    // that sounded, as a rule; the one under it comes back
+                    // rather than the loop going quiet with layers in it.
+                    if lp.alt.load(Ordering::Relaxed) {
+                        lp.repair_alt();
+                    }
                     // **Not zeroed.** Undo used to destroy the audio as well as
                     // remove the layer, which made redo impossible — and the
                     // destruction was redundant: recording zeroes its layer
@@ -1215,6 +1263,35 @@ fn perform(sh: &Shared, sr: u32, line: &str, from: Caller, later: &mut Option<Jo
                 } else {
                     format!("loop {} turns for ever again.", li)
                 };
+            }
+            // **The layers are alternates**: takes of one scene, one of
+            // which sounds at a time. A property of the loop rather than a
+            // rule a page keeps (TAXONOMY §6, decision 1), so the Friend and
+            // the board see the same thing and neither has to diff the
+            // snapshot to guess what the other did. On, the newest sounds
+            // alone, as the ack says; off changes no layer's switch — what
+            // sounded goes on sounding, and `ly` puts the rest back.
+            "alt" => {
+                let on = match arg {
+                    "1" => true,
+                    "0" => false,
+                    _ => !lp.alt.load(Ordering::Relaxed),
+                };
+                lp.alt.store(on, Ordering::Relaxed);
+                if on {
+                    // Not under a take: the one being laid solos itself
+                    // when it lands, and one that is listening has the
+                    // others hushed already.
+                    let n = lp.n_layers.load(Ordering::Acquire);
+                    if n > 0 && !lp.is_recording() && !lp.is_armed() {
+                        lp.solo(n - 1, n);
+                    }
+                    return format!(
+                        "loop {}'s layers are alternates: one sounds, the newest.",
+                        li
+                    );
+                }
+                return format!("loop {}'s layers all sound again.", li);
             }
             // Wait for a sound instead of starting on the press.
             "lev" => {

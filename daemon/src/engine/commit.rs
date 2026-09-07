@@ -540,6 +540,11 @@ pub(crate) fn finish_take(sh: &Shared, li: usize, sr: u32, t: Take) -> String {
     lp.set_layer_shape(layer, Shape { len, tail, born: lp.pass_index(closed_at, len) });
     sh.rebuild_env(li, layer);
     lp.add_layer();
+    // **The newest sounds alone** on an alternate loop: the take that just
+    // landed is the scene now, and the ones hushed for it stay off.
+    if lp.alt.load(Ordering::Relaxed) {
+        lp.solo(layer, layer + 1);
+    }
     if len > 0 {
         draw_layer(sh, li, layer, len, sr);
     }
@@ -753,6 +758,10 @@ pub(crate) fn take(sh: &Shared, li: usize, sr: u32, secs: f64, late: i64) -> Str
     lp.set_layer_shape(taken, Shape { len: taken_len, tail, born: lp.pass_index(cur, taken_len) });
     sh.rebuild_env(li, taken);
     lp.add_layer();
+    // A claimed layer is the newest, and on an alternate loop sounds alone.
+    if lp.alt.load(Ordering::Relaxed) {
+        lp.solo(taken, taken + 1);
+    }
     draw_layer(sh, li, taken, lp.loop_len.load(Ordering::Acquire), sr);
     format!(
         "{}{} — {} layer{} playing.",

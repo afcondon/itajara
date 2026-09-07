@@ -786,6 +786,7 @@ fn a_cleared_slot_has_nobody_s_habits() {
     lp.vol.store(0.001f32.to_bits(), Ordering::Relaxed);
     lp.n_layers.store(3, Ordering::Release);
     lp.loop_len.store(LEN, Ordering::Release);
+    lp.alt.store(true, Ordering::Relaxed);
 
     lp.cleared(0);
 
@@ -802,6 +803,10 @@ fn a_cleared_slot_has_nobody_s_habits() {
     assert_eq!(f32::from_bits(lp.vol.load(Ordering::Relaxed)), 1.0, "level");
     assert_eq!(lp.n_layers.load(Ordering::Acquire), 0, "layers");
     assert_eq!(lp.loop_len.load(Ordering::Acquire), 0, "length");
+    // Alternates describe what is in the loop, and a cleared loop has
+    // nothing in it; a slot the Friend marked must not silence the board's
+    // next take but the newest.
+    assert!(!lp.alt.load(Ordering::Relaxed), "alternates");
 }
 
 /// How long one pass lasts, which is the only number a one-shot needs and
@@ -1173,7 +1178,8 @@ fn the_fixture_renders_to_a_known_hash() {
 /// to hit. The constant moved once, on purpose, at step 6 (2026-09-06): the
 /// top level stopped repeating the selected loop's nine fields, so the text
 /// shrank; `ws::tests` holds the per-loop and per-layer objects to literals
-/// captured before that, and the render hash above did not move.
+/// captured before that, and the render hash above did not move. It moved
+/// again on 2026-09-07, when `alt` joined the per-loop object.
 #[test]
 fn the_fixture_snapshots_to_a_known_hash() {
     let sh = fixture();
@@ -1188,7 +1194,7 @@ fn the_fixture_snapshots_to_a_known_hash() {
         "{}",
         text
     );
-    assert_eq!(fnv(FNV_SEED, text.as_bytes()), 3623273475480213597, "snapshot hash");
+    assert_eq!(fnv(FNV_SEED, text.as_bytes()), 6041819821108414677, "snapshot hash");
 }
 
 /// **A plan does not outlive the loop it was made for.** The stale-plan
@@ -1687,4 +1693,153 @@ fn a_fresh_take_into_a_windowed_slot_plays_whole() {
     sh.lp(0).cleared(0);
     sh.lp(0).set_layer_shape(0, Shape { len: 60, tail: 0, born: 0 });
     assert_eq!(sh.lp(0).layer_window(0), None, "the window went with the old audio");
+}
+
+/// A loop of `n` layers, playing, declared alternates: the newest sounds
+/// alone from the moment it says so, as its ack promises.
+fn alt_loop(sh: &Shared, li: usize, n: usize) {
+    one_layer_loop(sh, li, 100, 0.5);
+    for l in 1..n {
+        lay(sh, li, l, 100, 0.25);
+    }
+    sh.lp(li).redo_to.store(n, Ordering::Release);
+    sh.lp(li).enter(Phase::Playing, 0);
+    let ack = dispatch(sh, 1000, &format!("{}alt1", li));
+    assert!(ack.contains("alternates") && ack.contains("the newest"), "{}", ack);
+    assert!(sh.lp(li).alt.load(Ordering::Relaxed));
+}
+
+/// Which layers of loop `li` are in the mix, as a string of `1`s and `0`s
+/// over the playing ones, so a failure reads as a picture.
+fn sounding(sh: &Shared, li: usize) -> String {
+    let lp = sh.lp(li);
+    (0..lp.n_layers.load(Ordering::Acquire))
+        .map(|l| if lp.layer_on(l) { '1' } else { '0' })
+        .collect()
+}
+
+/// **An alternate loop is silent while the next one goes down, and gets its
+/// voice back if the request is taken back.** By both roads out of the arm:
+/// the second press, and `lev0` under the wait. The layers that were on
+/// come back, not all of them — the loop is what it held.
+#[test]
+fn an_alternate_loop_is_silent_while_it_listens_and_gets_its_voice_back_if_it_stops() {
+    let sh = rig(LEN);
+    alt_loop(&sh, 0, 2);
+    assert_eq!(sounding(&sh, 0), "01", "declaring alternates solos the newest");
+    assert!(dispatch(&sh, 1000, "0lev1").contains("waits for a sound"));
+    assert!(dispatch(&sh, 1000, "0fix0.1").contains("one layer"));
+    assert!(dispatch(&sh, 1000, "0r").contains("listening"));
+    assert_eq!(sounding(&sh, 0), "00", "silent while it listens");
+    assert_eq!(dispatch(&sh, 1000, "0r"), "loop 0 has stopped listening.");
+    assert_eq!(sounding(&sh, 0), "01", "the layer that sounded sounds again");
+    assert_eq!(sh.lp(0).alt_was_on.load(Ordering::Relaxed), 0, "nothing owed");
+    // The other road out: `lev0` under the wait.
+    assert!(dispatch(&sh, 1000, "0ly11").contains("on"));
+    assert_eq!(sounding(&sh, 0), "10", "`ly` on an alternate loop is a solo");
+    assert!(dispatch(&sh, 1000, "0r").contains("listening"));
+    assert_eq!(sounding(&sh, 0), "00");
+    assert_eq!(dispatch(&sh, 1000, "0lev0"), "loop 0 records on the press again.");
+    assert_eq!(sounding(&sh, 0), "10", "back to what it held, not to the newest");
+    // A loop that is not alternates is untouched by any of this.
+    one_layer_loop(&sh, 1, 100, 0.5);
+    lay(&sh, 1, 1, 100, 0.25);
+    sh.lp(1).enter(Phase::Playing, 0);
+    dispatch(&sh, 1000, "1lev1");
+    dispatch(&sh, 1000, "1fix0.1");
+    assert!(dispatch(&sh, 1000, "1r").contains("listening"));
+    assert_eq!(sounding(&sh, 1), "11", "both still sound while it listens");
+}
+
+/// **The newest sounds alone when it lands**, however it arrives: a
+/// one-pass take through the callback and the commit, a duplicate, and a
+/// copy onto an empty loop that had declared itself alternates.
+#[test]
+fn the_newest_layer_of_an_alternate_loop_sounds_alone_when_it_lands() {
+    let sh = rig(LEN);
+    let sr = 1000;
+    alt_loop(&sh, 0, 2);
+    assert!(dispatch(&sh, sr, "0fix0.1").contains("one layer"));
+    let ack = dispatch(&sh, sr, "0r");
+    assert!(ack.contains("adds layer 3, one pass"), "{}", ack);
+    assert_eq!(sounding(&sh, 0), "00", "silent while the next one goes down");
+    assert_eq!(sh.lp(0).rec_slot.load(Ordering::Acquire), 2, "a new layer");
+    let now = sh.out_frames.load(Ordering::Acquire);
+    callbacks::stamp(&sh, 0, now, 16);
+    assert_eq!(sh.lp(0).phase(), Phase::Overdub);
+    assert_eq!(commit::commit(&sh, 0, sr, 0), "loop 0 committed: 0.100 s, 3 layers playing.");
+    assert_eq!(sounding(&sh, 0), "001", "the take that landed is the scene");
+    assert_eq!(sh.lp(0).alt_was_on.load(Ordering::Relaxed), 0, "nothing owed");
+    // A duplicate is the newest too.
+    assert!(dispatch(&sh, sr, "0dp1").contains("duplicated as layer 4"));
+    assert_eq!(sounding(&sh, 0), "0001");
+    // And a copy onto a loop that said so while empty.
+    assert!(dispatch(&sh, sr, "1alt1").contains("alternates"));
+    assert!(dispatch(&sh, sr, "1cp0").contains("copied 4 layers"));
+    assert_eq!(sounding(&sh, 1), "0001");
+    // A multiply on an alternate loop: silent across the cycles, then the
+    // multiplied layer alone.
+    let sh = rig(2000);
+    alt_loop(&sh, 0, 2);
+    sh.lp(0).origin.store(0, Ordering::Release);
+    sh.out_frames.store(250, Ordering::Release);
+    assert!(dispatch(&sh, sr, "0x").contains("multiplying"));
+    assert_eq!(sounding(&sh, 0), "00", "silent while the multiply goes down");
+    sh.out_frames.store(400, Ordering::Release);
+    assert!(dispatch(&sh, sr, "0x").ends_with("3 layers playing."));
+    assert_eq!(sounding(&sh, 0), "001");
+}
+
+/// **Undo and redo repair an alternate loop.** The layer that goes is, as
+/// a rule, the one that sounded; the one under it comes back rather than
+/// the loop going quiet with layers in it. Redo puts the newest back, and
+/// the newest sounds alone.
+#[test]
+fn undo_and_redo_keep_an_alternate_loop_sounding() {
+    let sh = rig(LEN);
+    alt_loop(&sh, 0, 3);
+    assert_eq!(sounding(&sh, 0), "001");
+    assert!(dispatch(&sh, 1000, "0u").contains("2 left"));
+    assert_eq!(sounding(&sh, 0), "01", "the one under it comes back");
+    assert!(dispatch(&sh, 1000, "0u").contains("1 left"));
+    assert_eq!(sounding(&sh, 0), "1");
+    assert!(dispatch(&sh, 1000, "0y").contains("2 layers playing"));
+    assert_eq!(sounding(&sh, 0), "01", "the redone layer is the newest and sounds alone");
+    assert!(dispatch(&sh, 1000, "0y").contains("3 layers playing"));
+    assert_eq!(sounding(&sh, 0), "001");
+    // Undo leaves a hand's choice alone when something still sounds.
+    assert!(dispatch(&sh, 1000, "0ly11").contains("on"));
+    assert_eq!(sounding(&sh, 0), "100");
+    assert!(dispatch(&sh, 1000, "0u").contains("2 left"));
+    assert_eq!(sounding(&sh, 0), "10", "layer 1 still sounds; nothing to repair");
+    // The last layer going leaves an empty loop, and nothing to repair.
+    dispatch(&sh, 1000, "0u");
+    assert!(dispatch(&sh, 1000, "0u").contains("Empty now"));
+    assert_eq!(sounding(&sh, 0), "");
+}
+
+/// **`ly` on an alternate loop is a solo.** On means this one and no other;
+/// off is allowed to leave the loop silent, and says so.
+#[test]
+fn a_layer_switched_on_in_an_alternate_loop_sounds_alone() {
+    let sh = rig(LEN);
+    alt_loop(&sh, 0, 3);
+    assert_eq!(dispatch(&sh, 1000, "0ly11"), "loop 0 layer 1 is on.");
+    assert_eq!(sounding(&sh, 0), "100");
+    assert_eq!(dispatch(&sh, 1000, "0ly21"), "loop 0 layer 2 is on.");
+    assert_eq!(sounding(&sh, 0), "010");
+    assert_eq!(dispatch(&sh, 1000, "0ly20"), "loop 0 layer 2 is off — nothing sounds now.");
+    assert_eq!(sounding(&sh, 0), "000");
+    assert_eq!(sh.render_loop(0).expect("renders")[0], 0.0, "and nothing does");
+    assert_eq!(dispatch(&sh, 1000, "0ly31"), "loop 0 layer 3 is on.");
+    assert_eq!(sounding(&sh, 0), "001");
+    // Turning alternates off changes no switch; `ly` is a switch again.
+    assert_eq!(dispatch(&sh, 1000, "0alt0"), "loop 0's layers all sound again.");
+    assert_eq!(sounding(&sh, 0), "001", "what sounded goes on sounding");
+    assert_eq!(dispatch(&sh, 1000, "0ly11"), "loop 0 layer 1 is on.");
+    assert_eq!(sounding(&sh, 0), "101");
+    assert_eq!(dispatch(&sh, 1000, "0ly30"), "loop 0 layer 3 is off.");
+    // And the bare word toggles, as the other flags do.
+    assert!(dispatch(&sh, 1000, "0alt").contains("alternates"));
+    assert_eq!(sounding(&sh, 0), "001", "declaring it solos the newest");
 }

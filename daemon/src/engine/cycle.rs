@@ -44,6 +44,11 @@ pub(crate) fn multiply_start(sh: &Shared, li: usize, sr: u32) -> String {
     let layer = lp.n_layers.load(Ordering::Acquire);
     lp.rec_slot.store(layer, Ordering::Release);
     sh.zero_layer(li, layer);
+    // An alternate loop is silent while the next one goes down, a multiply
+    // included: what it makes is a new layer, and the newest sounds alone.
+    if lp.alt.load(Ordering::Relaxed) && layer > 0 {
+        lp.hush(layer);
+    }
     lp.rec_from.store(from, Ordering::Release);
     lp.reached.store(0, Ordering::Release);
     lp.enter(Phase::Multiply, cur);
@@ -106,6 +111,9 @@ pub(crate) fn end_multiply(sh: &Shared, li: usize, sr: u32, from: Caller) -> Clo
     let new_len = n * loop_len;
     if new_len > sh.max_frames {
         lp.enter(Phase::Playing, cur);
+        // No layer lands, so the ones an alternate loop hushed for it
+        // come back.
+        lp.unhush();
         return Closed::Said(format!(
             "loop {}: {} cycles would be {:.1} s, past the --max-secs ceiling of {:.1} s. \
              Stopping at the old length.",
@@ -194,6 +202,9 @@ pub(crate) fn finish_multiply(sh: &Shared, li: usize, sr: u32, t: &Take) -> Stri
     lp.set_layer_shape(layer, Shape { len: new_len, tail: 0, born: 0 });
     sh.rebuild_env(li, layer);
     lp.add_layer();
+    if lp.alt.load(Ordering::Relaxed) {
+        lp.solo(layer, layer + 1);
+    }
     draw_layer(sh, li, layer, new_len, sr);
     format!(
         "loop {} x{}: now {:.3} s ({} cycles of {:.3} s){} — {} layers playing.",

@@ -108,6 +108,12 @@ pub(crate) fn copy_layers(sh: &Shared, dst: usize, src: usize, layer: Option<usi
     to.threaded.store(false, Ordering::Relaxed);
     to.n_layers.store(chosen.len(), Ordering::Release);
     to.redo_to.store(chosen.len(), Ordering::Release);
+    // A destination that had declared its layers alternates keeps the
+    // declaration — it describes how the loop plays, and an empty loop can
+    // say it before anything lands — so the last layer copied sounds alone.
+    if to.alt.load(Ordering::Relaxed) {
+        to.solo(chosen.len() - 1, chosen.len());
+    }
     to.enter(Phase::Playing, sh.out_frames.load(Ordering::Acquire) as i64);
 
     match layer {

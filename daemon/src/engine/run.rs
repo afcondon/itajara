@@ -553,6 +553,9 @@ pub(super) fn drop_takes(sh: &Shared) {
             },
             sh.out_frames.load(Ordering::Acquire) as i64,
         );
+        // The take never landed, so the layers an alternate loop hushed
+        // for it are what the loop holds again.
+        lp.unhush();
         eprintln!("  the recording in progress on loop {} was dropped — it would have had a gap", li);
     }
     for li in 0..sh.n_loops {
