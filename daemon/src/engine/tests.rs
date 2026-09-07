@@ -200,6 +200,10 @@ fn exporting_layers_writes_a_take_per_loop_and_one_set_manifest() {
     assert!(wav.len() > 80 * CHANNELS * 4, "the layer was cropped to the window");
     // And `ex` still means the set: this must not have been eaten by `exl`.
     assert!(dispatch(&sh, 48_000, "exriff2").contains("exported 2 loops"));
+    // `w` saves the loop, and says so: "saved" first, for the scripts that
+    // read it, and the path last.
+    let ack = dispatch(&sh, 48_000, "0wriff3");
+    assert!(ack.starts_with("saved the loop: 2 layers (") && ack.contains(" to "), "ack was: {}", ack);
     let _ = std::fs::remove_dir_all(&sh.takes_dir);
 }
 
@@ -1923,4 +1927,35 @@ fn an_open_overdub_on_an_alternate_loop_sums_into_the_layer_that_sounds() {
     sh.lp(1).enter(Phase::Playing, 0);
     assert_eq!(dispatch(&sh, sr, "1r"), "loop 1 overdubbing onto layer 2.");
     assert_eq!(sh.lp(1).rec_slot.load(Ordering::Acquire), 1);
+}
+
+/// **`t` claims.** "Take" is the act (TAXONOMY §6, decision 5): the acks
+/// say what happened to the past, which was claimed, not taken. Through a
+/// ring that reaches back, as the input callback fills it; and on an
+/// alternate loop the claimed layer sounds alone, like any newest layer.
+#[test]
+fn claiming_the_past_says_claimed() {
+    let mut sh = rig(LEN);
+    let sr = 1000;
+    sh.ring_len = 2000;
+    sh.ring = (0..2000 * CHANNELS).map(|_| AtomicU32::new(0.5f32.to_bits())).collect();
+    sh.k_set.store(true, Ordering::Release);
+    sh.in_frames.store(500, Ordering::Release);
+    sh.out_frames.store(500, Ordering::Release);
+    let ack = dispatch(&sh, sr, "0t0.1");
+    assert!(ack.starts_with("loop 0 claimed the last 0.100 s as the loop: 100 frames"), "{}", ack);
+    assert!(ack.ends_with("— 1 layer playing."), "{}", ack);
+    assert_eq!(sh.lp(0).n_layers.load(Ordering::Acquire), 1);
+    assert_eq!(sh.read(0, 0, 50, 0), 0.5, "the past, from the ring");
+    // With a loop running, the last complete cycle is a new layer.
+    sh.in_frames.store(600, Ordering::Release);
+    sh.out_frames.store(600, Ordering::Release);
+    let ack = dispatch(&sh, sr, "0t");
+    assert_eq!(ack, "loop 0 claimed the last complete cycle as a new layer — 2 layers playing.");
+    // And on an alternate loop, alone.
+    assert!(dispatch(&sh, sr, "0alt1").contains("alternates"));
+    sh.in_frames.store(700, Ordering::Release);
+    sh.out_frames.store(700, Ordering::Release);
+    assert!(dispatch(&sh, sr, "0t").contains("claimed"));
+    assert_eq!(sounding(&sh, 0), "001");
 }

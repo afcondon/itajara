@@ -15,10 +15,10 @@ use super::shared::Shared;
 /// redirected — and `lines()` returns immediately, which must not be allowed to
 /// take the audio engine and the socket down with it.
 pub(crate) fn control_loop(sh: &Shared, lane: &Lane) -> bool {
-    println!("Commands:  r = record/overdub toggle   x = multiply   t [secs] = take");
+    println!("Commands:  r = record/overdub toggle   x = multiply   t [secs] = claim the past");
     println!("           s [n] = spread one in n   o = move it one slot   d = dense again");
     println!("           u = undo a layer   z = forget the length   c = both");
-    println!("           w [name] = save the take (one file per layer + manifest)");
+    println!("           w [name] = save the loop (one file per layer + manifest)");
     println!("           g = follow the grid (the first loop's cycle) / free");
     println!(
         "           a leading digit picks the loop: 3r records loop 3, 3s2 spreads it,\n\

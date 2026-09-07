@@ -44,8 +44,11 @@ pub(crate) fn save_take(sh: &Shared, li: usize, sr: u32, name: &str) -> Ack {
             Ok(w) => w,
             Err(e) => return e,
         };
+        // "saved" first, and the path last: scripts read the one and the
+        // app shows the other. What is saved is the loop — its layers, raw
+        // — not a take; a take is the act (TAXONOMY §6, decision 5).
         format!(
-            "saved {} layer{} ({:.3} s) to {}",
+            "saved the loop: {} layer{} ({:.3} s) to {}",
             written,
             if written == 1 { "" } else { "s" },
             loop_len as f64 / sr as f64,

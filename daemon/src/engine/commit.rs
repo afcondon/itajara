@@ -687,6 +687,10 @@ pub(crate) fn fill_from_ring(
 
 /// Claim the recent past as a loop or a layer.
 ///
+/// **"Take" means the act** (TAXONOMY §6, decision 5): `w` saves the loop,
+/// the plan is the plan, and this *claims* — the acks say so, and the name
+/// of the function is the one the callers have always used.
+///
 /// The feature no pedal can offer, and the one most likely to change how the
 /// thing gets used: you played something good and did not hit record, so hit it
 /// afterwards. With no loop yet, `secs` of the past becomes the loop and sets
@@ -760,7 +764,7 @@ pub(crate) fn take(sh: &Shared, li: usize, sr: u32, secs: f64, late: i64) -> Str
         lp.origin.store(from_out, Ordering::Release);
         lp.enter(Phase::Playing, sh.out_frames.load(Ordering::Acquire) as i64);
         headline = format!(
-            "loop {} took the last {:.3} s as the {}: {} frames, {:.1} bpm if that is one bar of 4/4",
+            "loop {} claimed the last {:.3} s as the {}: {} frames, {:.1} bpm if that is one bar of 4/4",
             li,
             len as f64 / sr as f64,
             what,
@@ -768,7 +772,7 @@ pub(crate) fn take(sh: &Shared, li: usize, sr: u32, secs: f64, late: i64) -> Str
             240.0 / (len as f64 / sr as f64)
         );
     } else {
-        headline = format!("loop {} took the last complete cycle as a new {}.", li, what);
+        headline = format!("loop {} claimed the last complete cycle as a new {}.", li, what);
     }
     let taken = lp.n_layers.load(Ordering::Acquire);
     // The continuation comes from the ring too, so a claimed layer wraps as
