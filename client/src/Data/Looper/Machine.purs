@@ -271,6 +271,9 @@ perform rig subject = case _ of
   Duty.LayerWindow k a b -> [ Command (cmd i (Verb.LayerWindow k a b)) ]
   Duty.ClearLayerWindow k -> [ Command (cmd i (Verb.ClearLayerWindow k)) ]
   Duty.DupLayer k -> [ Command (cmd i (Verb.DupLayer k)) ]
+  -- Straight through: the rule is the daemon's, and it reads the loop's own
+  -- state when the flag lands — there is nothing for the machine to decide.
+  Duty.Alternates on -> [ Command (cmd i (Verb.Alternates on)) ]
   Duty.ClearLoop -> [ Command (cmd i Verb.Clear) ]
   -- **Read from the loop, not remembered** — the same shape as the click and
   -- the monitor since `Rig` started carrying the flags, and for the same

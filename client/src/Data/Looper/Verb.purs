@@ -159,11 +159,12 @@ data Verb
   -- | the duration, rather than hard-coding 8 here and pretending it was
   -- | chosen.
   -- |
-  -- | Its arm in `dispatch` is a **char guard** — `l if l.starts_with('t')` —
-  -- | not a string match, which is worth knowing: a grep for `"t"` in engine.rs
-  -- | finds nothing and reads exactly like an unimplemented verb. It is not.
-  -- | What is true is that `take` reports only to stdout and returns unit, so a
-  -- | successful claim is silent on the ack path.
+  -- | Its arm in `dispatch` is a whole-word match on `t` like every other
+  -- | verb's, since the daemon started tokenizing commands (2026-09-06); it
+  -- | used to be a char guard, `l if l.starts_with('t')`, which a grep for
+  -- | `"t"` could not find and which read exactly like an unimplemented verb.
+  -- | And it answers on the ack path — "claimed …" — as every verb does now;
+  -- | the note that it reported only to stdout was true once and is not.
   | ClaimPast
   -- | Write the loop's layers out as WAV files, under this name; empty takes the
   -- | daemon's default. The daemon returns where it put them, which is the

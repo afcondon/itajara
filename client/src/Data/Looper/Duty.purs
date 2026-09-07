@@ -234,6 +234,13 @@ data Duty
   -- | One layer sounds and the rest are parked — the module's own way, the
   -- | Layer knob. A lone layer stays on.
   | SoloLayer Int
+  -- | **This loop's layers are alternates**: takes of one scene, one of which
+  -- | sounds at a time. The daemon's rule since 2026-09-07, not a page's: on,
+  -- | it silences the loop while the next layer goes down, solos the one that
+  -- | lands, repairs after an undo, reads `LayerOn` as a solo, and sums an
+  -- | open overdub into the layer that sounds. The Friend sets it on the
+  -- | loops it records into; the pedalboard never does.
+  | Alternates Boolean
   -- | A layer's own window (layer, in, out), its clearing, and a duplicate of
   -- | it as a new layer of the same loop.
   | LayerWindow Int Int Int
@@ -627,6 +634,7 @@ dutyLabel = case _ of
   CopyLoop s -> "Copy L" <> show (s + 1)
   CopyLayer s k -> "Copy L" <> show (s + 1) <> "/" <> show k
   SoloLayer k -> "Solo " <> show k
+  Alternates _ -> "Alternates"
   LayerWindow k _ _ -> "Win " <> show k
   ClearLayerWindow k -> "Whole " <> show k
   DupLayer k -> "Dup " <> show k
@@ -714,6 +722,7 @@ dutyName = case _ of
   CopyLoop s -> "Copy every layer of loop " <> show (s + 1) <> " here"
   CopyLayer s k -> "Copy layer " <> show k <> " of loop " <> show (s + 1) <> " here"
   SoloLayer k -> "Layer " <> show k <> " alone"
+  Alternates on -> if on then "Layers are alternates: one sounds" else "Every layer sounds"
   LayerWindow k i o -> "Layer " <> show k <> " plays " <> show i <> " to " <> show o
   ClearLayerWindow k -> "Layer " <> show k <> " plays whole"
   DupLayer k -> "Duplicate layer " <> show k
