@@ -93,19 +93,17 @@
 //!
 //! # Where the artifact and the engine disagree
 //!
-//! Skipped by name, with the reason printed, and listed here so the
-//! disagreement is not hidden in a count:
-//!
-//! - `summing × on / off / window`: the engine takes `ly` and `lw` on a
-//!   counted layer whether or not a pass is summing into it; the artifact
-//!   refuses `still-writing`. The slot's state agrees either way.
-//! - `writing × lost` with `first-take` false: the artifact keeps the
-//!   partial overdub as a layer (`set-shape`, then `sounding`); the
-//!   engine's `drop_takes` zeroes it — "a layer with a gap is worse than
-//!   no layer" — and the slot is `free`. The loop artifact says the same
-//!   as the layer's (`overdubbing-open × lost → playing [close-layer]`),
-//!   which its replay cannot see because `playing` reads the same with
-//!   one layer or two.
+//! The first replay (2026-09-07) found two, and both were settled by
+//! changing the artifact, because the engine had reasons: `summing × on /
+//! off / window` — the engine takes `ly` and `lw` on a layer a pass is
+//! summing into, and the artifact now says `stay`; and `writing × lost`
+//! for an overdub — `drop_takes` zeroes a partial layer ("a layer with a
+//! gap is worse than no layer"), and the artifact now goes to `free`
+//! whatever the take was, its `first-take` fact gone. The loop artifact's
+//! `overdubbing-open × lost → playing [close-layer]` still names the wrong
+//! command for that exit; its replay cannot see it and it is a known lie.
+//! Only the two `sum`-under-a-write vectors are skipped now, for want of a
+//! verb.
 //! - `writing × sum` and `summing × sum`: `r` under a write is the press
 //!   that closes it, and `sum` has no other verb, so the daemon cannot
 //!   receive the event.
@@ -170,17 +168,10 @@ fn by_addressing(v: &Vector) -> bool {
     }
 }
 
-/// Why a vector is not replayed, before any rig is built: a disagreement
-/// between the artifact and the engine (reported, not reconciled), or an
-/// event the daemon has no verb for from that state.
+/// Why a vector is not replayed, before any rig is built: an event the
+/// daemon has no verb for from that state.
 fn not_replayed(v: &Vector) -> Option<String> {
     match (v.from.as_str(), v.event.as_str()) {
-        ("summing", "on" | "off" | "window") => Some(
-            "disagreement: the engine takes `ly`/`lw` on a layer a pass is summing into; the artifact refuses `still-writing`".into(),
-        ),
-        ("writing", "lost") if v.fact("first-take") == Some(false) => Some(
-            "disagreement: the artifact keeps a partial overdub as a layer on device loss; the engine's `drop_takes` zeroes it".into(),
-        ),
         ("writing" | "summing", "sum") => Some(
             "no verb: `r` under a write is the press that closes it, and `sum` has no other".into(),
         ),

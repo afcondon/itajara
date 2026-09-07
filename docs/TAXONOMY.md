@@ -331,21 +331,25 @@ they change.
    sounding layer when a take starts and solos the new one when it lands,
    and both surfaces see it. This ends the `growing`/`soloed` bookkeeping
    and the two-surfaces leak at its root. The Friend sets it on the loops
-   it records into; PWYF never does. **Agreed.**
+   it records into; PWYF never does. **Agreed; in the daemon (`0a053bc`) and
+   the Friend (`111d0f5`) the same day.**
 2. **Sound-on-sound on the Friend** is a held `r` on an alternate loop,
    and the daemon gives it a meaning: **an open overdub on an alternate loop
    sums into the layer that sounds**, rather than making a new one; a
    one-pass take (`fix`) still makes a new alternate. The face gets a third
-   gesture for it. **Agreed, with the rule.**
+   gesture for it. **Agreed, with the rule; built (`3a25bdc`, the Friend's
+   Sum button).**
 3. **Say "sized" and "windowed" on the wire.** Two derived states every
-   page has to compute; the snapshot names them. **Agreed.**
+   page has to compute; the snapshot names them. **Agreed; on the wire
+   (`56367a4`).**
 4. **Retire "group", and "slaved" with it.** Three relations, three words:
    **tied** (length, to a reference loop), **ganged** (transport), **scene**
    (a musical moment). Tied is the designed one and the cheapest; ganged is
    what the pages fake today; a scene is the most expressive and the least
    designed. Build tied first, if any. **Agreed; §2 G has the words.**
 5. **"Take" means the act.** `w` saves *the loop*; `t` *claims*; the plan is
-   the plan. Rename in the acks and the pages when convenient. **Agreed.**
+   the plan. Rename in the acks and the pages when convenient. **Agreed;
+   the acks say claim and save (`2854656`).**
 6. **Replace and Insert** stay unbuilt until a gesture wants them. The write
    path could do Replace cheaply (write where the head is, gain zero
    beneath); Insert changes the length mid-loop and is the one to be
