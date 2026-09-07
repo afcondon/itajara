@@ -1,6 +1,6 @@
 # A taxonomy of loops
 
-*Draft 2, 2026-09-07 — the six decisions in §6 taken, the relations renamed, §4 corrected against the Glassbox artifact. Draft 1 was the same morning. The terms this project uses for the things a looper
+*Draft 3, 2026-09-07 — decisions 1, 2, 3 and 5 are in the daemon (`alt`, the summed pass, `sized`/`windowed` on the wire, claim/save wording); the layer's life is a Glassbox artifact. Drafts 1 and 2 were the same morning. The terms this project uses for the things a looper
 holds, the axes those things vary along, the species of loop we expect to
 support, and the life-cycle each one runs. Checked against the daemon as it
 stands after the seven refactors of 2026-09-06, not against how we remember
@@ -266,13 +266,16 @@ A layer's window, gain, period and phase are its own and survive `off` and
 `undone`; they go when the layer is dropped. `set_shape` is the moment of
 birth and is where the slot is made clean.
 
-**Not a Glassbox machine yet.** Only the loop's life is an artifact; this
-one and the plan's are drawings. The layer's is worth making one — the
-inherited-window fault of 2026-09-07 was a transition this drawing would
-have refused (`undone → sounding` without passing through `born`). The
-plan's is probably not: the loop artifact already folds it in as the
-armed and recording variants, and a second artifact would say the same
-thing twice.
+**A Glassbox artifact since 2026-09-07:** `itajara-layer.json` beside the
+loop's, six states — free, writing, summing, sounding, off, undone — 66
+vectors, replayed by the Rust runtime. It carries the rule the inherited-
+window fault needed: everything a layer holds belongs to the audio;
+`set-shape` on the way out of writing is the one moment the slot is made
+clean; undo keeps the settings because it keeps the audio; a summed pass
+enters without zeroing and leaves with only a redraw. Top, next-to-redo and
+was-on are facts the loop holds. The plan's life stays a drawing: the loop
+artifact already folds it in as the armed and recording variants, and a
+second artifact would say the same thing twice.
 
 ### The take's life (the plan)
 
