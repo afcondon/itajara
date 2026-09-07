@@ -1,4 +1,6 @@
-//! The phase machine held to the Glassbox artifact.
+//! The phase machine held to the Glassbox artifact. Its sibling,
+//! `layer_conformance`, holds one layer slot to `itajara-layer.json` the
+//! same way, and borrows the vector reader and the constants from here.
 //!
 //! `purescript-glassbox/core/machines/itajara-loop.json` is this engine's
 //! phase machine written down as data — twelve states, thirteen events,
@@ -95,19 +97,19 @@ use super::run::drop_takes;
 use super::tests::{lay, one_layer_loop, rig};
 
 /// A test sample rate, so `fix0.1` is a hundred frames.
-const SR: u32 = 1000;
+pub(super) const SR: u32 = 1000;
 /// The arena, in frames.
-const LEN: usize = 1000;
+pub(super) const LEN: usize = 1000;
 /// Where the output clock stands when a vector's rig is built: off the bar
 /// line, so a wait for the bar is a wait.
-const NOW: usize = 50;
+pub(super) const NOW: usize = 50;
 /// A bar, in frames, when a vector wants one. Past `NOW + STAMP_FRAMES`, so
 /// a settle does not fire a request meant for the boundary.
 const BAR: usize = 400;
 /// The buffer the settling `stamp` covers.
-const STAMP_FRAMES: usize = 16;
+pub(super) const STAMP_FRAMES: usize = 16;
 /// A layer's, or a sized loop's, length.
-const LOOP: usize = 100;
+pub(super) const LOOP: usize = 100;
 
 /// The artifact state the engine is in, for loop `li`. The table in the
 /// module comment, as code.
@@ -157,26 +159,27 @@ fn refusal_tag(ack: &str) -> Option<&'static str> {
         .map(|(_, tag)| *tag)
 }
 
-/// One line of the artifact's table.
-struct Vector {
-    from: String,
-    event: String,
-    config: serde_json::Map<String, Value>,
-    facts: serde_json::Map<String, Value>,
-    outcome: String,
-    refusal: Option<String>,
-    current: String,
-    commands: Vec<String>,
+/// One line of an artifact's table. The loop's and the layer's vectors
+/// share the schema, so the sibling replay reads its file with this.
+pub(super) struct Vector {
+    pub(super) from: String,
+    pub(super) event: String,
+    pub(super) config: serde_json::Map<String, Value>,
+    pub(super) facts: serde_json::Map<String, Value>,
+    pub(super) outcome: String,
+    pub(super) refusal: Option<String>,
+    pub(super) current: String,
+    pub(super) commands: Vec<String>,
 }
 
 impl Vector {
-    fn fact(&self, id: &str) -> Option<bool> {
+    pub(super) fn fact(&self, id: &str) -> Option<bool> {
         self.facts.get(id).and_then(Value::as_bool)
     }
     fn config(&self, id: &str) -> Option<bool> {
         self.config.get(id).and_then(Value::as_bool)
     }
-    fn describe(&self) -> String {
+    pub(super) fn describe(&self) -> String {
         let facts: Vec<String> = self
             .facts
             .iter()
@@ -203,21 +206,21 @@ impl Vector {
     }
 }
 
-/// Where the vectors are: `$GLASSBOX_DIR`, or the sibling checkout.
-fn vectors_path() -> PathBuf {
+/// Where a machine's vectors are: `$GLASSBOX_DIR`, or the sibling checkout.
+pub(super) fn vectors_path(machine: &str) -> PathBuf {
     let dir = match std::env::var_os("GLASSBOX_DIR") {
         Some(d) => PathBuf::from(d),
         None => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../../purescript-hylograph-libs/purescript-glassbox"),
     };
-    dir.join("conformance/vectors/itajara-loop.json")
+    dir.join(format!("conformance/vectors/{}.json", machine))
 }
 
-fn read_vectors(path: &PathBuf) -> Option<Vec<Vector>> {
+pub(super) fn read_vectors(path: &PathBuf, machine: &str) -> Option<Vec<Vector>> {
     let text = std::fs::read_to_string(path).ok()?;
     let json: Value = serde_json::from_str(&text).expect("the vectors file is JSON");
     assert_eq!(json["glassbox-vectors"], 1, "vectors schema version");
-    assert_eq!(json["machine"], "itajara-loop");
+    assert_eq!(json["machine"], machine);
     let vectors = json["vectors"]
         .as_array()
         .expect("vectors[]")
@@ -419,8 +422,8 @@ fn deliver(sh: &Shared, v: &Vector) -> Option<String> {
 /// without the sibling repository still builds and tests.
 #[test]
 fn the_engine_replays_the_artifact_s_table() {
-    let path = vectors_path();
-    let Some(vectors) = read_vectors(&path) else {
+    let path = vectors_path("itajara-loop");
+    let Some(vectors) = read_vectors(&path, "itajara-loop") else {
         println!(
             "conformance: no vectors at {} — set GLASSBOX_DIR to the purescript-glassbox checkout; nothing replayed",
             path.display()
