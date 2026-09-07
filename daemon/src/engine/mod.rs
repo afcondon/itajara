@@ -87,6 +87,12 @@ pub(crate) mod tests;
 #[cfg(test)]
 mod conformance;
 
+/// One layer slot held to its Glassbox artifact (`itajara-layer.json`):
+/// the sibling of `conformance`, for what one slot does while the loop
+/// runs its phase machine.
+#[cfg(test)]
+mod layer_conformance;
+
 /// How deep a loop can be stacked.
 ///
 /// **Four, down from eight on 2026-08-29**, because the arena is
