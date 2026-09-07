@@ -1,6 +1,6 @@
 # A taxonomy of loops
 
-*Draft 1, 2026-09-07. The terms this project uses for the things a looper
+*Draft 2, 2026-09-07 — the six decisions in §6 taken, the relations renamed, §4 corrected against the Glassbox artifact. Draft 1 was the same morning. The terms this project uses for the things a looper
 holds, the axes those things vary along, the species of loop we expect to
 support, and the life-cycle each one runs. Checked against the daemon as it
 stands after the seven refactors of 2026-09-06, not against how we remember
@@ -98,7 +98,7 @@ fixing two or three of them.
 | **claimed** | the last complete cycle, from the ring | `t` |
 | **inherited** | the loop's own cycle (an overdub, a one-pass layer) | `r` on material, `fix` on material |
 | **threaded** | a blank tape of so many seconds | `blank<secs>` |
-| **slaved** | a multiple of another loop's cycle | *not built* (DESIGN-LOOPER §18 Q4 recommends it) |
+| **tied** | a multiple of a reference loop's cycle, phase-locked | *not built* (DESIGN-LOOPER §18 Q4 recommends it, under an older word) |
 
 ### B. Boundary discipline — what the take is quantised to
 
@@ -173,12 +173,16 @@ All is six commands). The candidates for a relation:
 
 | relation | meaning | status |
 |---|---|---|
-| **slaved** | length is 1×/2×/4× another loop's cycle, phase-locked | recommended in DESIGN-LOOPER §18, not built |
-| **transport group** | start, stop, clear, fire together | pages fake it; not a daemon concept |
-| **scene** | a set of loops that is one musical moment; switching scenes swaps what sounds | not built; the Friend's "alternates" is a scene inside one loop |
+| **tied** | length is 1×/2×/4× a **reference** loop's cycle, phase-locked | recommended in DESIGN-LOOPER §18, not built |
+| **ganged** | start, stop, clear, fire together, as ganged faders move together | pages fake it; not a daemon concept |
+| **scene** | a set of loops that is one musical moment; switching scenes swaps what sounds | not built; an alternate loop is a scene inside one loop |
 
-"Group" has been used for all three. It should be used for none of them
-until one is chosen; see §6.
+Two words are retired here. **"Group"** had been used for all three and
+will always mean whichever the reader thinks of first. **"Slaved"** was the
+design doc's word for *tied*; the casual computing use is deprecated and the
+word was never precise — what it named is a length relation, and "tied to
+the reference" says which. Neither appears again in this project's docs
+or acks.
 
 ---
 
@@ -195,7 +199,7 @@ Everything not fixed is free.
 | **the tape** | threaded, or any loop re-threaded | free | tape | continuous, decaying by feedback | Revox mode; Frippertronics |
 | **the claimed loop** | claimed | — (already happened) | layer | continuous | `t`; retrospective record. Also the first take of any species can be claimed rather than played. |
 | **the clip** | any | any | any | **one-shot** | `one1` + `f`; a loop used as a sample |
-| **the slaved loop** | slaved | inherits the master's | layer | continuous | not built |
+| **the tied loop** | tied | inherits the reference's | layer | continuous | not built |
 
 A **sized** loop is not a species; it is a state every species can be in:
 a length and no material, after the last layer was undone or after
@@ -213,8 +217,14 @@ was in the ring; any loop with `one1` is a clip. What is fixed is the
 
 ### The loop's machine
 
-One machine serves every species. It is the daemon's `Phase`, held to the
-Glassbox artifact `itajara-loop.json` by replay:
+One machine serves every species. In the daemon it is `Phase`, six
+values; in Glassbox it is `itajara-loop.json`, **twelve states**, because
+the artifact names phase *and plan* together — `empty`, `sized`, `tape`,
+`armed-by-level`, `armed-for-grid`, `armed-by-sound`, `recording-open`,
+`recording-sized`, `overdubbing-open`, `overdubbing-one-pass`, `playing`,
+`multiplying` — and the daemon's conformance test replays the artifact's
+table through the engine. The drawing below is the daemon's six, with the
+plan as the edge labels:
 
 ```
             r (lev off)            r / closer
@@ -235,10 +245,10 @@ of their own: they differ in the **plan** (`NextTake`: at a boundary or
 now, one pass or open, back-dated or not) and in the **composition**, which
 is a property of the write (layer / summed / tape), not of the phase.
 
-Two states the machine does not name, and should:
+Two states the *wire* does not name, and will (decision 3):
 
-- **sized**: `Idle` or `Playing` with a length and no layers. Both pages
-  had to learn to tell it from "playing" the hard way.
+- **sized**: `Idle` or `Playing` with a length and no layers. The artifact
+  already has it as a state; both pages had to derive it and got it wrong.
 - **windowed**: not a phase, but a loop with a window refuses `x` and `t`,
   which makes it behave like one from a page's point of view.
 
@@ -255,6 +265,14 @@ Two states the machine does not name, and should:
 A layer's window, gain, period and phase are its own and survive `off` and
 `undone`; they go when the layer is dropped. `set_shape` is the moment of
 birth and is where the slot is made clean.
+
+**Not a Glassbox machine yet.** Only the loop's life is an artifact; this
+one and the plan's are drawings. The layer's is worth making one — the
+inherited-window fault of 2026-09-07 was a transition this drawing would
+have refused (`undone → sounding` without passing through `born`). The
+plan's is probably not: the loop artifact already folds it in as the
+armed and recording variants, and a second artifact would say the same
+thing twice.
 
 ### The take's life (the plan)
 
@@ -290,7 +308,7 @@ where the species acquire their behaviour:
 | **Frippertronics** | the tape (`rvx`) with a long `blank` | two Revoxes = one tape with feedback |
 | Loopy Pro **clip** | the clip (`one1` + `f`) | |
 | Loopy Pro **start nudge** | not needed: the ring back-dates | DESIGN-LOOPER §6 |
-| Loopy Pro **independent loops** | rejected for slaved | §18 Q4 |
+| Loopy Pro **independent loops** | rejected for tied | §18 Q4 |
 | Ableton **Looper "Overdub"** | held `r` | modular sum |
 | Boss RC **track** | loop | |
 | Morphagene **reel / splice / gene** | loop / layer-with-window / (sub-window, not built) | daemon-debt review: granular reading may belong in the browser |
@@ -300,34 +318,35 @@ where the species acquire their behaviour:
 
 ---
 
-## 6. Decisions this asks for
+## 6. Decisions
 
-Ordered by how much they would change.
+Asked in draft 1; taken by Andrew the same morning. Ordered by how much
+they change.
 
 1. **Alternate as a loop property, not a page rule.** A loop declares that
-   its layers are alternates (`alt1`, say); the daemon then silences the
+   its layers are alternates (`alt1`); the daemon then silences the
    sounding layer when a take starts and solos the new one when it lands,
    and both surfaces see it. This ends the `growing`/`soloed` bookkeeping
    and the two-surfaces leak at its root. The Friend sets it on the loops
-   it records into; PWYF never does. *Recommended.*
-2. **Sound-on-sound on the Friend** is a held `r` with the alternate rule
-   not applied: a third gesture on the face ("Overdub", hold to sum), or a
-   face setting. No daemon change. If (1) is done, the daemon must let a
-   held `r` on an alternate loop mean "sum into the sounding layer" — which
-   is a small rule: an overdub on an alternate loop writes into the layer
-   that sounds, rather than a new one.
+   it records into; PWYF never does. **Agreed.**
+2. **Sound-on-sound on the Friend** is a held `r` on an alternate loop,
+   and the daemon gives it a meaning: **an open overdub on an alternate loop
+   sums into the layer that sounds**, rather than making a new one; a
+   one-pass take (`fix`) still makes a new alternate. The face gets a third
+   gesture for it. **Agreed, with the rule.**
 3. **Say "sized" and "windowed" on the wire.** Two derived states every
-   page has to compute; the snapshot can name them.
-4. **Retire "group" until one relation is chosen.** Slaved lengths are the
-   designed one and the cheapest; a transport group is what the pages fake
-   today; a scene is the most expressive and the least designed. Pick
-   slaved first if any.
+   page has to compute; the snapshot names them. **Agreed.**
+4. **Retire "group", and "slaved" with it.** Three relations, three words:
+   **tied** (length, to a reference loop), **ganged** (transport), **scene**
+   (a musical moment). Tied is the designed one and the cheapest; ganged is
+   what the pages fake today; a scene is the most expressive and the least
+   designed. Build tied first, if any. **Agreed; §2 G has the words.**
 5. **"Take" means the act.** `w` saves *the loop*; `t` *claims*; the plan is
-   the plan. Rename in the acks and the pages when convenient.
+   the plan. Rename in the acks and the pages when convenient. **Agreed.**
 6. **Replace and Insert** stay unbuilt until a gesture wants them. The write
    path could do Replace cheaply (write where the head is, gain zero
    beneath); Insert changes the length mid-loop and is the one to be
-   suspicious of.
+   suspicious of. **Agreed.**
 
 *Not asked, because answered:* the machine is one; the species are plans
 and compositions; nothing found in the refactors needs undoing.
