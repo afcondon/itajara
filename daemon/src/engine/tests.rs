@@ -1959,3 +1959,24 @@ fn claiming_the_past_says_claimed() {
     assert!(dispatch(&sh, sr, "0t").contains("claimed"));
     assert_eq!(sounding(&sh, 0), "001");
 }
+
+/// `y` waits like `u`: under a summed pass with an undone layer above the
+/// one being written into, redo used to raise that layer over a live
+/// write, because a summed pass leaves `redo_to` where it was.
+#[test]
+fn redo_waits_for_the_summed_pass_in_hand() {
+    let sh = rig(LEN);
+    one_layer_loop(&sh, 0, 100, 0.25);
+    lay(&sh, 0, 1, 100, 0.25);
+    sh.lp(0).redo_to.store(2, Ordering::Release);
+    sh.lp(0).enter(Phase::Playing, 0);
+    assert!(dispatch(&sh, 48_000, "0u").contains("removed"));
+    assert!(dispatch(&sh, 48_000, "0alt1").contains("alternates"));
+    assert!(dispatch(&sh, 48_000, "0r").contains("sums into layer 1"));
+    // The request is consumed by the next output buffer; run one.
+    super::callbacks::stamp(&sh, 0, 0, 16);
+    assert!(sh.lp(0).is_recording(), "the pass is under way");
+    let ack = dispatch(&sh, 48_000, "0y");
+    assert!(ack.contains("finish that first"), "{}", ack);
+    assert_eq!(sh.lp(0).n_layers.load(Ordering::Acquire), 1, "nothing raised over the write");
+}

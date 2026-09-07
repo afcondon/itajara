@@ -1002,6 +1002,15 @@ fn perform(sh: &Shared, sr: u32, line: &str, from: Caller, later: &mut Option<Jo
             // removes: the layer is still there with its shape intact, so this
             // is one number going back up.
             "y" => {
+                // Not under a live write either. A plain take moves `redo_to`
+                // down to `n`, so `y` refused by arithmetic; a summed pass
+                // does not, and with an undone layer above the one being
+                // summed into, `y` raised that layer over a live write. The
+                // layer artifact's `summing × redo → still-writing` is about
+                // exactly this (found by its replay, 2026-09-07).
+                if let Some(no) = still_recording(lp, li) {
+                    return no;
+                }
                 let n = lp.n_layers.load(Ordering::Acquire);
                 let ceiling = lp.redo_to.load(Ordering::Acquire);
                 if n >= ceiling {
