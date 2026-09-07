@@ -25,6 +25,9 @@ pub(crate) fn selftest(sh: &Shared, sr: u32, secs: f64) -> Result<(), Box<dyn Er
     println!("Self-test: {} frame loop ({:.2} s), recording one cycle.", len, secs);
 
     lp.loop_len.store(len, Ordering::Release);
+    // The request is set by hand here rather than through `r`, so the slot
+    // the take writes into is said by hand too, as `r` would say it.
+    lp.rec_slot.store(0, Ordering::Release);
     lp.next.set(ARMED, i64::MIN);
     std::thread::sleep(Duration::from_secs_f64(secs * 2.0 + 0.3));
     commit(sh, li, sr, 0);
@@ -47,6 +50,7 @@ pub(crate) fn selftest(sh: &Shared, sr: u32, secs: f64) -> Result<(), Box<dyn Er
     // not, every overdub would sit a little further out than the last.
     println!("\nOverdub pass: click off, recording layer 0's own playback.");
     sh.click.store(false, Ordering::Relaxed);
+    lp.rec_slot.store(lp.n_layers.load(Ordering::Acquire), Ordering::Release);
     lp.next.set(ARMED, i64::MIN);
     std::thread::sleep(Duration::from_secs_f64(secs * 2.0 + 0.3));
     commit(sh, li, sr, 0);

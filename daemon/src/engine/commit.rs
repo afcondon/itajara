@@ -359,7 +359,7 @@ pub(crate) fn finish_take(sh: &Shared, li: usize, sr: u32, t: Take) -> String {
                 sh.preroll.load(Ordering::Acquire)
             }
         };
-        let layer = lp.n_layers.load(Ordering::Acquire);
+        let layer = lp.rec_slot.load(Ordering::Acquire);
         let origin = lp.origin.load(Ordering::Acquire);
         let new_origin = origin - pre as i64;
         if pre > 0 && reached.max(len) + pre > sh.max_frames {
@@ -472,7 +472,7 @@ pub(crate) fn finish_take(sh: &Shared, li: usize, sr: u32, t: Take) -> String {
     // The material is not discarded, because it is the thing a seamless loop is
     // made of.
     if state == Phase::Overdub && late > 0 {
-        let layer = lp.n_layers.load(Ordering::Acquire);
+        let layer = lp.rec_slot.load(Ordering::Acquire);
         let len = lp.loop_len.load(Ordering::Acquire);
         let k = sh.k.load(Ordering::Acquire);
         let rec_from = lp.rec_from.load(Ordering::Acquire);
@@ -517,7 +517,8 @@ pub(crate) fn finish_take(sh: &Shared, li: usize, sr: u32, t: Take) -> String {
         }
     }
 
-    let layer = lp.n_layers.load(Ordering::Acquire);
+    // The slot the take was written into, as the request said it.
+    let layer = lp.rec_slot.load(Ordering::Acquire);
     let len = lp.loop_len.load(Ordering::Acquire);
 
     // **A Revox pass makes no layer.** It went over the tape, so what changed

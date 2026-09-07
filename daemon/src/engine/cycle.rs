@@ -42,6 +42,7 @@ pub(crate) fn multiply_start(sh: &Shared, li: usize, sr: u32) -> String {
     let from = origin + cyc * loop_len as i64;
 
     let layer = lp.n_layers.load(Ordering::Acquire);
+    lp.rec_slot.store(layer, Ordering::Release);
     sh.zero_layer(li, layer);
     lp.rec_from.store(from, Ordering::Release);
     lp.reached.store(0, Ordering::Release);

@@ -271,7 +271,10 @@ pub(super) fn stamp(sh: &Shared, li: usize, base: usize, frames: usize) {
                     .store((stamp - want).max(0), Ordering::Release),
             }
             let n = lp.n_layers.load(Ordering::Acquire);
-            if n < sh.max_layers {
+            // The slot the take writes into, as the request said it: the
+            // next free one, or a layer that already sounds. The ceiling
+            // is a question about the slot, not about the count.
+            if lp.rec_slot.load(Ordering::Acquire) < sh.max_layers {
                 // **Layers, not length.** This asked whether the
                 // loop had a length, which was the same question
                 // while the only way to have one was to have
@@ -479,7 +482,11 @@ pub(super) fn input(
     let k = sh.k.load(Ordering::Acquire);
     let origin = lp.rec_from.load(Ordering::Acquire);
     let loop_len = lp.loop_len.load(Ordering::Acquire);
-    let layer = lp.n_layers.load(Ordering::Acquire);
+    // Where this take goes, as the request said: `n_layers` for a new
+    // layer, or the layer that sounds when an alternate loop's passes sum
+    // into it. Read, not derived — the callback used to count the layers
+    // and assume the next one.
+    let layer = lp.rec_slot.load(Ordering::Acquire);
     let revox = lp.revox.load(Ordering::Relaxed);
     // Whether the playhead is anywhere other than where a linear
     // write would put it. Once a buffer, because it is a property of

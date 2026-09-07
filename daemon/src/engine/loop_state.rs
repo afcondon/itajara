@@ -282,6 +282,15 @@ pub struct Loop {
     /// because a take that has been recorded over is not recoverable and
     /// offering to redo it would be a lie.
     pub(crate) redo_to: AtomicUsize,
+    /// **Which layer the take in hand writes into.**
+    ///
+    /// `n_layers` — a new layer, which is what every take was until now —
+    /// or, for an open overdub on an alternate loop, the layer that sounds:
+    /// the passes sum into it (TAXONOMY §2C, sound-on-sound). Set by
+    /// `dispatch` at request time, so the input callback and `commit` read
+    /// it rather than assuming `n_layers`. One more atomic for the callback,
+    /// beside the dozen it already reads.
+    pub(crate) rec_slot: AtomicUsize,
     pub(crate) overflowed: AtomicBool,
     /// How late the press that started this recording was, in frames.
     ///
@@ -490,6 +499,7 @@ impl Loop {
             reached: AtomicUsize::new(0),
             rec_reached: AtomicI64::new(0),
             redo_to: AtomicUsize::new(0),
+            rec_slot: AtomicUsize::new(0),
             overflowed: AtomicBool::new(false),
             rec_from: AtomicI64::new(0),
             started_late: AtomicI64::new(0),
@@ -786,6 +796,7 @@ impl Loop {
         self.chance_sounds.store(true, Ordering::Relaxed);
         self.n_layers.store(0, Ordering::Release);
         self.redo_to.store(0, Ordering::Release);
+        self.rec_slot.store(0, Ordering::Release);
         self.loop_len.store(0, Ordering::Release);
         // **Everything that says how long this loop is, together.**
         //

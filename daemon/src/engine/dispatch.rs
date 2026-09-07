@@ -410,6 +410,10 @@ fn perform(sh: &Shared, sr: u32, line: &str, from: Caller, later: &mut Option<Jo
                             li, sh.max_layers
                         );
                     } else {
+                        // Said, not assumed: the take writes into the next
+                        // free slot, and the callback and the commit read
+                        // which rather than counting the layers again.
+                        lp.rec_slot.store(layer, Ordering::Release);
                         // An overdub sums into its layer, so anything left there
                         // from an undone take would bleed into the new one.
                         sh.zero_layer(li, layer);
