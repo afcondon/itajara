@@ -182,7 +182,19 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     // A source naming a channel the device does not have would record silence
     // and say nothing, which is the shape of failure this engine exists to
     // refuse. Said at startup, where it can still be fixed.
-    for s in &sources {
+    // An interface that is configured in and not switched on is named once,
+    // loudly, at the top — where it can be acted on — rather than discovered
+    // when a take comes back empty.
+    let missing: Vec<&Source> = sources.iter().filter(|s| !s.available).collect();
+    if !missing.is_empty() {
+        println!(
+            "NOT AVAILABLE: {} — the looper runs without {}.",
+            missing.iter().map(|s| s.describe()).collect::<Vec<_>>().join(", "),
+            if missing.len() == 1 { "it" } else { "them" }
+        );
+    }
+
+    for s in sources.iter().filter(|s| s.available) {
         for c in s.ch {
             if c >= in_channels {
                 return Err(format!(

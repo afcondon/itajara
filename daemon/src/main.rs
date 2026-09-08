@@ -411,7 +411,7 @@ fn parse_source(v: &str) -> Result<engine::Source, String> {
     if parts.len() == 1 {
         ch[1] = ch[0];
     }
-    Ok(engine::Source { name: name.to_string(), ch, on })
+    Ok(engine::Source { name: name.to_string(), ch, on, available: true })
 }
 
 /// Turn every `DEVICE:channel` source into a channel of the device being
@@ -441,6 +441,16 @@ fn resolve_sources(opts: &mut engine::Opts) -> Result<(), String> {
             let m = layout
                 .member(&dev)
                 .map_err(|e| format!("--out-ch: {}", e))?;
+            // Unlike a source, the output has nowhere to degrade to: a looper
+            // whose playback goes nowhere is not a looper running without one
+            // interface, it is a looper you cannot hear.
+            if m.absent {
+                return Err(format!(
+                    "--out-ch names {}, which is configured into {} and not switched on. \
+                     Playback has to go somewhere you can hear it.",
+                    m.name, layout.name
+                ));
+            }
             let want = opts.out_ch + 1;
             if want as u32 > m.out_ch {
                 return Err(format!(
@@ -460,6 +470,21 @@ fn resolve_sources(opts: &mut engine::Opts) -> Result<(), String> {
         }
     }
 
+    if !layout.consistent() {
+        return Err(format!(
+            "{}: its members add up to {} inputs and the device reports {}. The channel \
+             order is not understood — probably because a member is configured in and not \
+             switched on — and resolving a source against a layout that is not understood \
+             is how a session gets recorded off the wrong input. Run `itajara sources \
+             --device {:?}` to see it, and either switch the missing interface on or name \
+             a device that is all there.",
+            layout.name,
+            layout.members.iter().map(|m| m.in_ch).sum::<u32>(),
+            layout.in_ch,
+            layout.name
+        ));
+    }
+
     for s in opts.sources.iter_mut() {
         let Some(dev) = s.on.clone() else { continue };
         // A source may name the device itself, which is how a plain interface
@@ -477,6 +502,17 @@ fn resolve_sources(opts: &mut engine::Opts) -> Result<(), String> {
         let m = layout
             .member(&dev)
             .map_err(|e| format!("--source {}: {}", s.name, e))?;
+        // **An interface that is not switched on is not an error.** The source
+        // keeps its place — `src<n>` counts positions and dropping one would
+        // renumber the rest — but it cannot be selected, and its channels are
+        // parked somewhere in bounds so nothing can read past the buffer. The
+        // looper runs on what IS there, which is what makes the modular
+        // optional rather than load-bearing.
+        if m.absent {
+            s.available = false;
+            s.ch = [0; engine::CHANNELS];
+            continue;
+        }
         for i in 0..engine::CHANNELS {
             let want = s.ch[i] + 1;
             if want as u32 > m.in_ch {

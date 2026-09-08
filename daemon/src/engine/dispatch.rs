@@ -626,6 +626,18 @@ fn perform(sh: &Shared, sr: u32, line: &str, from: Caller, later: &mut Option<Jo
                 }
                 match arg.parse::<usize>() {
                     Ok(n) if n >= 1 && n <= sh.sources.len() => {
+                        // An input whose interface is not switched on keeps its
+                        // number so nothing else is renumbered, and refuses to
+                        // be chosen — recording from it would be recording
+                        // whatever happens to sit at channel one.
+                        if !sh.sources[n - 1].available {
+                            return format!(
+                                "loop {} cannot record from {}: {}",
+                                li,
+                                sh.sources[n - 1].name,
+                                sh.sources[n - 1].describe()
+                            );
+                        }
                         if lp.is_recording() || lp.is_armed() {
                             return format!(
                                 "loop {} is listening or writing; changing its input \

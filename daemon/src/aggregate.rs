@@ -59,6 +59,9 @@ pub struct Member {
     /// playback into the modular instead of to the monitors.
     pub out_ch: u32,
     pub first_out: u32,
+    /// The aggregate lists this member, and the system will not describe it:
+    /// it is configured into the aggregate and not currently there.
+    pub absent: bool,
 }
 
 /// A device, and what it is made of if it is an aggregate.
@@ -76,6 +79,31 @@ pub struct Layout {
 impl Layout {
     pub fn is_aggregate(&self) -> bool {
         !self.members.is_empty()
+    }
+
+    /// **Does our model of the channel order match what the device says?**
+    ///
+    /// The members' channels are laid end to end in the order the sub-device
+    /// list gives, which is how a member's first channel is worked out. That
+    /// is an assumption about what CoreAudio does when a member is *missing*:
+    /// it may drop the absent device's channels, in which case the ones after
+    /// it move up, or it may keep a silent placeholder, in which case they do
+    /// not — and the two give different answers for every source.
+    ///
+    /// Rather than pick one and hope, the arithmetic is checked against the
+    /// aggregate's own channel count. When they disagree the layout is not
+    /// understood, and a source resolved from a layout that is not understood
+    /// is exactly the wrong-input failure this module exists to prevent. So
+    /// disagreement is a refusal, and it says what it saw.
+    pub fn consistent(&self) -> bool {
+        !self.is_aggregate()
+            || (self.members.iter().map(|m| m.in_ch).sum::<u32>() == self.in_ch
+                && self.members.iter().map(|m| m.out_ch).sum::<u32>() == self.out_ch)
+    }
+
+    /// Members the system could not describe — unplugged, or powered off.
+    pub fn absent(&self) -> Vec<&Member> {
+        self.members.iter().filter(|m| m.absent).collect()
     }
 
     /// The member whose name contains this, case-insensitively — the same
@@ -134,10 +162,21 @@ impl Layout {
         );
         for m in &self.members {
             s.push_str(&format!(
-                "  {}{}  {}\n",
+                "  {}{}  {}{}\n",
                 span(m.first_in, m.in_ch),
                 span(m.first_out, m.out_ch),
-                m.name
+                m.name,
+                if m.absent { "   NOT THERE" } else { "" }
+            ));
+        }
+        if !self.consistent() {
+            s.push_str(&format!(
+                "\n  ** the members add up to {} in and {} out, and the device reports {} and {}.\n\
+                 ** the channel order is not understood, so nothing will be resolved against it.\n",
+                self.members.iter().map(|m| m.in_ch).sum::<u32>(),
+                self.members.iter().map(|m| m.out_ch).sum::<u32>(),
+                self.in_ch,
+                self.out_ch
             ));
         }
         s
@@ -334,15 +373,16 @@ pub fn layouts() -> Vec<Layout> {
             let mut next_in = 1u32;
             let mut next_out = 1u32;
             for sub in sub_device_uids(*id) {
-                let (mname, m_in, m_out) = by_uid
-                    .iter()
-                    .find(|(u, _, _, _, _)| *u == sub)
-                    // A member the system lists but will not describe is a
-                    // member that is not plugged in. Named, sized zero, and
-                    // kept in place, because dropping it would silently shift
-                    // everything after it.
-                    .map(|(_, n, i, o, _)| (n.clone(), *i, *o))
-                    .unwrap_or_else(|| (format!("{sub} (absent)"), 0, 0));
+                let found = by_uid.iter().find(|(u, _, _, _, _)| *u == sub);
+                // A member the system lists but will not describe is one that
+                // is configured in and not currently there. Kept in place and
+                // sized zero rather than dropped — and its UID stands in for
+                // its name, which is legible enough to match on, since Apple
+                // builds it out of the maker and the model.
+                let (mname, m_in, m_out, absent) = match found {
+                    Some((_, n, i, o, _)) => (n.clone(), *i, *o, false),
+                    None => (sub.clone(), 0, 0, true),
+                };
                 members.push(Member {
                     uid: sub,
                     name: mname,
@@ -350,6 +390,7 @@ pub fn layouts() -> Vec<Layout> {
                     first_in: next_in,
                     out_ch: m_out,
                     first_out: next_out,
+                    absent,
                 });
                 next_in += m_in;
                 next_out += m_out;
@@ -388,6 +429,7 @@ mod tests {
             first_in,
             out_ch: in_ch,
             first_out: first_in,
+            absent: false,
         }
     }
 
@@ -460,5 +502,56 @@ mod tests {
         let l = Layout { name: "AUDIO4c".into(), uid: "u".into(), in_ch: 8, out_ch: 8, members: vec![] };
         assert!(!l.is_aggregate());
         assert!(l.describe().contains("not an aggregate"));
+    }
+}
+
+#[cfg(test)]
+mod absence {
+    use super::*;
+
+    fn m(name: &str, i: u32, fi: u32, o: u32, fo: u32, absent: bool) -> Member {
+        Member { uid: name.into(), name: name.into(), in_ch: i, first_in: fi,
+                 out_ch: o, first_out: fo, absent }
+    }
+
+    /// **The ES-9 switched off, if CoreAudio drops its channels.** The Audio4c
+    /// moves up to 1, and `board=AUDIO4c:1,2` follows it — which is the whole
+    /// point of naming the interface instead of writing 17.
+    #[test]
+    fn a_source_follows_its_interface_when_a_member_goes_away() {
+        let gone = Layout {
+            name: "ES9 then A4C".into(), uid: "agg".into(), in_ch: 8, out_ch: 10,
+            members: vec![
+                m("…:ES-9:1100000:2,3", 0, 1, 0, 1, true),
+                m("AUDIO4c", 8, 1, 8, 1, false),
+                m("MacBook Pro Speakers", 0, 9, 2, 9, false),
+            ],
+        };
+        assert!(gone.consistent(), "8 in and 10 out is what the members add to");
+        assert_eq!(gone.member("AUDIO4c").unwrap().first_in, 1);
+        // And the ES-9 is still matchable, because Apple builds the UID out of
+        // the maker and the model — so the refusal names it rather than a
+        // string of hex.
+        let es9 = gone.member("ES-9").unwrap();
+        assert!(es9.absent);
+        assert_eq!(es9.in_ch, 0, "a source on it must be refused, not resolved");
+    }
+
+    /// **And if CoreAudio keeps a placeholder instead**, the members no longer
+    /// add up to what the device reports — which is the case we cannot test
+    /// without switching the interface off, and therefore the case that must
+    /// not be guessed at.
+    #[test]
+    fn a_layout_that_does_not_add_up_is_not_understood() {
+        let held = Layout {
+            name: "ES9 then A4C".into(), uid: "agg".into(), in_ch: 24, out_ch: 26,
+            members: vec![
+                m("…:ES-9:1100000:2,3", 0, 1, 0, 1, true),
+                m("AUDIO4c", 8, 1, 8, 1, false),
+                m("MacBook Pro Speakers", 0, 9, 2, 9, false),
+            ],
+        };
+        assert!(!held.consistent(), "8 in against a reported 24 is not understood");
+        assert!(held.describe().contains("not understood"));
     }
 }

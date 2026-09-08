@@ -445,7 +445,12 @@ fn rig_json(sh: &Shared, sr: u32, alive: bool) -> String {
         // "input 2" on an encoder is the numbering problem all over again.
         sh.sources
             .iter()
-            .map(|s| format!(r#"{{"name":"{}","mono":{}}}"#, escape(&s.name), s.is_mono()))
+            .map(|s| format!(
+                r#"{{"name":"{}","mono":{},"available":{}}}"#,
+                escape(&s.name),
+                s.is_mono(),
+                s.available
+            ))
             .collect::<Vec<_>>()
             .join(","),
         each.join(","),

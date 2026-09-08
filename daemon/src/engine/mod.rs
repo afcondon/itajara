@@ -235,14 +235,29 @@ pub struct Source {
     /// it landed. An aggregate's channel order is not stable across a power
     /// cycle, so the number is a fact about today and the name is not.
     pub on: Option<String>,
+    /// **False when the interface it names is not currently there.**
+    ///
+    /// The source keeps its place in the list — `src<n>` counts positions, so
+    /// dropping one would renumber every source after it and put a loop on an
+    /// input it did not choose. Instead it stays, cannot be selected, and says
+    /// why. The looper still runs on the interfaces that ARE there, which is
+    /// the difference between a rig that works without the modular and one
+    /// that will not start without it.
+    pub available: bool,
 }
 
 impl Source {
     pub fn mono(name: &str, ch: usize) -> Self {
-        Source { name: name.to_string(), ch: [ch, ch], on: None }
+        Source { name: name.to_string(), ch: [ch, ch], on: None, available: true }
     }
     pub fn is_mono(&self) -> bool { self.ch[0] == self.ch[1] }
     pub fn describe(&self) -> String {
+        if !self.available {
+            return match &self.on {
+                Some(d) => format!("{} ({} is not switched on)", self.name, d),
+                None => format!("{} (unavailable)", self.name),
+            };
+        }
         let where_ = match &self.on {
             Some(d) => format!(" on {d}"),
             None => String::new(),

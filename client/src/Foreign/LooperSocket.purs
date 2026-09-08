@@ -186,7 +186,11 @@ type LooperState =
   -- | What a loop can record from, in the order `src` counts them. Named
   -- | rather than numbered, because "input 2" on an encoder is the loop
   -- | numbering problem all over again.
-  , sources :: Array { name :: String, mono :: Boolean }
+  -- | The inputs, in the order `src<n>` counts them. `available` is false for
+  -- | an interface configured into an aggregate and not switched on: it keeps
+  -- | its place, because dropping it would renumber every source after it and
+  -- | put a loop on an input nobody chose, and it refuses to be selected.
+  , sources :: Array { name :: String, mono :: Boolean, available :: Boolean }
   -- | The loop a console verb with no loop digit addresses. Once also the
   -- | loop whose fields were repeated at this level; now only that, and no
   -- | surface reads it — a page keeps its own focus.
