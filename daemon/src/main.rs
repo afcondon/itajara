@@ -239,6 +239,23 @@ fn main() -> ExitCode {
                         println!("  {}", src.describe());
                     }
                 }
+                // The output is as capable of moving as an input, and moving
+                // it is not silence — it is the loop and the click arriving
+                // somewhere else, which sounds like a patch problem.
+                let out_where = match &opts.out_on {
+                    Some(d) => format!(" on {d}"),
+                    None => String::new(),
+                };
+                println!(
+                    "\n  playback → out {}{}{}",
+                    opts.out_ch + 1,
+                    if opts.dual { "+" } else { "" },
+                    if opts.dual {
+                        format!("{}{}", opts.out_ch + 2, out_where)
+                    } else {
+                        out_where.clone()
+                    }
+                );
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -404,7 +421,7 @@ fn parse_source(v: &str) -> Result<engine::Source, String> {
 /// sample rate is touched — which matters on a machine running a DAW, where
 /// interfaces appearing and disappearing is the thing that upsets one.
 fn resolve_sources(opts: &mut engine::Opts) -> Result<(), String> {
-    if !opts.sources.iter().any(|s| s.on.is_some()) {
+    if !opts.sources.iter().any(|s| s.on.is_some()) && opts.out_on.is_none() {
         return Ok(());
     }
     let layout = aggregate::layout_of(&opts.device).ok_or_else(|| {
@@ -413,6 +430,35 @@ fn resolve_sources(opts: &mut engine::Opts) -> Result<(), String> {
             opts.device
         )
     })?;
+
+    // **The output moves too, and independently.** A member's inputs and its
+    // outputs shift by the same amount only by coincidence. On this rig the
+    // wrong answer is not silence — it is loop playback and the click going
+    // into the modular instead of to the monitors, which sounds like a patch
+    // problem and is not one.
+    if let Some(dev) = opts.out_on.clone() {
+        if layout.is_aggregate() {
+            let m = layout
+                .member(&dev)
+                .map_err(|e| format!("--out-ch: {}", e))?;
+            let want = opts.out_ch + 1;
+            if want as u32 > m.out_ch {
+                return Err(format!(
+                    "--out-ch: {} has {} output{}, so there is no channel {}",
+                    m.name,
+                    m.out_ch,
+                    if m.out_ch == 1 { "" } else { "s" },
+                    want
+                ));
+            }
+            opts.out_ch += (m.first_out - 1) as usize;
+        } else if !layout.name.to_lowercase().contains(&dev.to_lowercase()) {
+            return Err(format!(
+                "--out-ch: {:?} is not an aggregate, so it has no member {:?}",
+                layout.name, dev
+            ));
+        }
+    }
 
     for s in opts.sources.iter_mut() {
         let Some(dev) = s.on.clone() else { continue };
@@ -496,7 +542,29 @@ fn parse_loop(args: &[String]) -> Result<engine::Opts, String> {
             // pedalboard is two jacks. One channel means a mono jack, which is
             // recorded to both sides and folded back by a loop set to `mono`.
             "--source" => opts.sources.push(parse_source(&value)?),
-            "--out-ch" => opts.out_ch = value.parse().map_err(|_| "--out-ch wants an integer")?,
+            // `--out-ch AUDIO4c:1` for the same reason `--source` takes one:
+            // an aggregate's output order is no more stable than its input
+            // order, and the failure is playback arriving somewhere else.
+            "--out-ch" => {
+                let (dev, n) = match value.rsplit_once(':') {
+                    Some((d, r)) if !d.is_empty() && !r.is_empty() =>
+                        (Some(d.trim().to_string()), r.to_string()),
+                    _ => (None, value.clone()),
+                };
+                // One-based when it names an interface, because that is how
+                // the jacks are numbered; bare, it stays the zero-based index
+                // every existing command line uses.
+                let raw: usize = n.trim().parse().map_err(|_| "--out-ch wants an integer")?;
+                if dev.is_some() {
+                    if raw == 0 {
+                        return Err("--out-ch: an interface's channels count from 1".into());
+                    }
+                    opts.out_ch = raw - 1;
+                } else {
+                    opts.out_ch = raw;
+                }
+                opts.out_on = dev;
+            }
             "--residual" => {
                 opts.residual = value.parse().map_err(|_| "--residual wants a number")?;
                 opts.residual_given = true;

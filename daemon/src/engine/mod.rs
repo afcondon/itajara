@@ -262,6 +262,10 @@ pub struct Opts {
     /// which is what an existing command line gets.
     pub sources: Vec<Source>,
     pub out_ch: usize,
+    /// The interface `out_ch` was counted on, when it was written that way —
+    /// `--out-ch AUDIO4c:1`. Resolved at start against the aggregate's real
+    /// layout, for the same reason a source is.
+    pub out_on: Option<String>,
     pub residual: f64,
     /// Whether `--residual` was actually given, as against left at its default.
     ///
@@ -330,6 +334,7 @@ impl Default for Opts {
             in_ch: 0,
             sources: Vec::new(),
             out_ch: 0,
+            out_on: None,
             residual: 252.0,
             residual_given: false,
             max_secs: 300.0,

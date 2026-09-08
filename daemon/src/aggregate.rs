@@ -32,7 +32,8 @@ use coreaudio_sys::{
     kAudioAggregateDevicePropertyFullSubDeviceList, kAudioDevicePropertyDeviceUID,
     kAudioDevicePropertyStreamConfiguration, kAudioHardwarePropertyDevices,
     kAudioObjectPropertyElementMain, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyScopeInput, kAudioObjectSystemObject, AudioBufferList, AudioObjectID,
+    kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
+    AudioBufferList, AudioObjectID,
     AudioObjectGetPropertyData, AudioObjectPropertyAddress,
 };
 use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
@@ -51,6 +52,13 @@ pub struct Member {
     /// The aggregate channel its first input is, one-based — what a `--source`
     /// has to say to reach it *today*.
     pub first_in: u32,
+    /// The same for outputs, which drift independently: a member with sixteen
+    /// inputs and sixteen outputs shifts both by the same amount only by
+    /// coincidence, and `--out-ch` is as capable of pointing at the wrong
+    /// interface as a source is. On this rig the wrong answer sends loop
+    /// playback into the modular instead of to the monitors.
+    pub out_ch: u32,
+    pub first_out: u32,
 }
 
 /// A device, and what it is made of if it is an aggregate.
@@ -59,6 +67,7 @@ pub struct Layout {
     pub name: String,
     pub uid: String,
     pub in_ch: u32,
+    pub out_ch: u32,
     /// Empty for a plain device. In aggregate order, which is the order the
     /// channels appear in.
     pub members: Vec<Member>,
@@ -109,22 +118,27 @@ impl Layout {
     /// How it reads on a page: the channel ranges, in order.
     pub fn describe(&self) -> String {
         if !self.is_aggregate() {
-            return format!("{} — {} in, not an aggregate", self.name, self.in_ch);
+            return format!(
+                "{} — {} in, {} out, not an aggregate\n",
+                self.name, self.in_ch, self.out_ch
+            );
         }
-        let mut s = format!("{} — {} in, made of:\n", self.name, self.in_ch);
+        let span = |first: u32, n: u32| match n {
+            0 => "     —    ".to_string(),
+            1 => format!("{:>5}     ", first),
+            _ => format!("{:>4}-{:<4} ", first, first + n - 1),
+        };
+        let mut s = format!(
+            "{} — {} in, {} out, made of:\n           in         out\n",
+            self.name, self.in_ch, self.out_ch
+        );
         for m in &self.members {
-            if m.in_ch == 0 {
-                s.push_str(&format!("  (no inputs)     {}\n", m.name));
-            } else if m.in_ch == 1 {
-                s.push_str(&format!("  {:>3}            {}\n", m.first_in, m.name));
-            } else {
-                s.push_str(&format!(
-                    "  {:>3}-{:<3}        {}\n",
-                    m.first_in,
-                    m.first_in + m.in_ch - 1,
-                    m.name
-                ));
-            }
+            s.push_str(&format!(
+                "  {}{}  {}\n",
+                span(m.first_in, m.in_ch),
+                span(m.first_out, m.out_ch),
+                m.name
+            ));
         }
         s
     }
@@ -189,10 +203,15 @@ fn cf_string(cf: CFStringRef) -> Option<String> {
 /// bytes rather than the struct — the struct's single-element array is a C
 /// idiom that Rust will not size correctly on its own.
 fn input_channels(id: AudioObjectID) -> u32 {
-    let a = addr(
-        kAudioDevicePropertyStreamConfiguration,
-        kAudioObjectPropertyScopeInput,
-    );
+    channels(id, kAudioObjectPropertyScopeInput)
+}
+
+fn output_channels(id: AudioObjectID) -> u32 {
+    channels(id, kAudioObjectPropertyScopeOutput)
+}
+
+fn channels(id: AudioObjectID, scope: u32) -> u32 {
+    let a = addr(kAudioDevicePropertyStreamConfiguration, scope);
     let mut size: u32 = 0;
     let st = unsafe {
         coreaudio_sys::AudioObjectGetPropertyDataSize(id, &a, 0, std::ptr::null(), &mut size)
@@ -299,42 +318,47 @@ pub fn layouts() -> Vec<Layout> {
     let ids = device_ids();
     // UID → (name, input channels), so a member can be named and sized without
     // asking the system again for each.
-    let by_uid: Vec<(String, String, u32, AudioObjectID)> = ids
+    let by_uid: Vec<(String, String, u32, u32, AudioObjectID)> = ids
         .iter()
         .filter_map(|&id| {
             let uid = string_prop(id, kAudioDevicePropertyDeviceUID)?;
             let name = string_prop(id, kAudioObjectPropertyName)?;
-            Some((uid, name, input_channels(id), id))
+            Some((uid, name, input_channels(id), output_channels(id), id))
         })
         .collect();
 
     by_uid
         .iter()
-        .map(|(uid, name, in_ch, id)| {
+        .map(|(uid, name, in_ch, out_ch, id)| {
             let mut members = Vec::new();
-            let mut next = 1u32;
+            let mut next_in = 1u32;
+            let mut next_out = 1u32;
             for sub in sub_device_uids(*id) {
-                let (mname, mch) = by_uid
+                let (mname, m_in, m_out) = by_uid
                     .iter()
-                    .find(|(u, _, _, _)| *u == sub)
+                    .find(|(u, _, _, _, _)| *u == sub)
                     // A member the system lists but will not describe is a
                     // member that is not plugged in. Named, sized zero, and
                     // kept in place, because dropping it would silently shift
                     // everything after it.
-                    .map(|(_, n, c, _)| (n.clone(), *c))
-                    .unwrap_or_else(|| (format!("{sub} (absent)"), 0));
+                    .map(|(_, n, i, o, _)| (n.clone(), *i, *o))
+                    .unwrap_or_else(|| (format!("{sub} (absent)"), 0, 0));
                 members.push(Member {
                     uid: sub,
                     name: mname,
-                    in_ch: mch,
-                    first_in: next,
+                    in_ch: m_in,
+                    first_in: next_in,
+                    out_ch: m_out,
+                    first_out: next_out,
                 });
-                next += mch;
+                next_in += m_in;
+                next_out += m_out;
             }
             Layout {
                 name: name.clone(),
                 uid: uid.clone(),
                 in_ch: *in_ch,
+                out_ch: *out_ch,
                 members,
             }
         })
@@ -357,7 +381,14 @@ mod tests {
     use super::*;
 
     fn member(name: &str, in_ch: u32, first_in: u32) -> Member {
-        Member { uid: format!("uid-{name}"), name: name.into(), in_ch, first_in }
+        Member {
+            uid: format!("uid-{name}"),
+            name: name.into(),
+            in_ch,
+            first_in,
+            out_ch: in_ch,
+            first_out: first_in,
+        }
     }
 
     /// The real one, as it stood on 2026-09-08. Third member contributes no
@@ -368,6 +399,7 @@ mod tests {
             name: "ES9 then A4C".into(),
             uid: "agg".into(),
             in_ch: 24,
+            out_ch: 26,
             members: vec![
                 member("ES-9", 16, 1),
                 member("AUDIO4c", 8, 17),
@@ -393,6 +425,7 @@ mod tests {
             name: "A4C then ES9".into(),
             uid: "agg".into(),
             in_ch: 24,
+            out_ch: 26,
             members: vec![member("AUDIO4c", 8, 1), member("ES-9", 16, 9)],
         };
         assert_eq!(forward.member("AUDIO4c").unwrap().first_in, 17);
@@ -414,6 +447,7 @@ mod tests {
             name: "two".into(),
             uid: "agg".into(),
             in_ch: 4,
+            out_ch: 4,
             members: vec![member("ES-9 A", 2, 1), member("ES-9 B", 2, 3)],
         };
         assert_eq!(l.member("ES-9 B").unwrap().first_in, 3, "an exact name wins outright");
@@ -423,7 +457,7 @@ mod tests {
 
     #[test]
     fn a_plain_device_has_no_members_and_says_so() {
-        let l = Layout { name: "AUDIO4c".into(), uid: "u".into(), in_ch: 8, members: vec![] };
+        let l = Layout { name: "AUDIO4c".into(), uid: "u".into(), in_ch: 8, out_ch: 8, members: vec![] };
         assert!(!l.is_aggregate());
         assert!(l.describe().contains("not an aggregate"));
     }
