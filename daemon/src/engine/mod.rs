@@ -227,18 +227,30 @@ const MAX_FADE_MS: f64 = 500.0;
 pub struct Source {
     pub name: String,
     pub ch: [usize; CHANNELS],
+    /// **The interface these channels were counted on**, when the source was
+    /// written that way — `board=AUDIO4c:1,2` rather than `board=17,18`.
+    ///
+    /// Kept after resolution so the daemon can say what it worked out, and so
+    /// a snapshot can show where a source *came from* rather than only where
+    /// it landed. An aggregate's channel order is not stable across a power
+    /// cycle, so the number is a fact about today and the name is not.
+    pub on: Option<String>,
 }
 
 impl Source {
     pub fn mono(name: &str, ch: usize) -> Self {
-        Source { name: name.to_string(), ch: [ch, ch] }
+        Source { name: name.to_string(), ch: [ch, ch], on: None }
     }
     pub fn is_mono(&self) -> bool { self.ch[0] == self.ch[1] }
     pub fn describe(&self) -> String {
+        let where_ = match &self.on {
+            Some(d) => format!(" on {d}"),
+            None => String::new(),
+        };
         if self.is_mono() {
-            format!("{} (in {})", self.name, self.ch[0] + 1)
+            format!("{} (in {}{})", self.name, self.ch[0] + 1, where_)
         } else {
-            format!("{} (in {}+{})", self.name, self.ch[0] + 1, self.ch[1] + 1)
+            format!("{} (in {}+{}{})", self.name, self.ch[0] + 1, self.ch[1] + 1, where_)
         }
     }
 }

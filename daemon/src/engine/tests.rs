@@ -623,7 +623,7 @@ fn a_one_channel_source_reads_the_same_input_twice() {
     assert!(s.is_mono());
     assert_eq!(s.describe(), "di (in 3)");
 
-    let board = Source { name: "board".into(), ch: [0, 1] };
+    let board = Source { name: "board".into(), ch: [0, 1], on: None };
     assert!(!board.is_mono());
     assert_eq!(board.describe(), "board (in 1+2)");
 }

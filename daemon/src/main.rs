@@ -6,6 +6,7 @@
 //! before writing any overdub code. This is that.
 
 mod align;
+mod aggregate;
 mod devices;
 mod engine;
 mod ws;
@@ -22,7 +23,17 @@ itajara — looper engine for producing-with-your-feet
 USAGE
   itajara devices
       List the audio devices CoreAudio can see, with channel counts and the
-      sample rates each will accept.
+      sample rates each will accept. For an aggregate it also says what it is
+      made of and where each member's channels landed — which is a fact about
+      today, not about the aggregate's name.
+
+  itajara sources --device <name> [--source ...]
+      Where every source lands, resolved against the device's real layout.
+      Opens nothing, starts no stream, changes no sample rate. Run it before
+      a session on a rig with an aggregate: the failure that costs a whole
+      session is the silent one, where an interface came back in a different
+      order, the absolute channel numbers still parse, the meters still move,
+      and every take is off the wrong input.
 
   itajara levels --device <name> [--seconds <n>]
       Live peak meter on every input channel, with a peak hold. Play into
@@ -114,6 +125,13 @@ USAGE
                         `--source di=3`. Channels count from 1. One channel is
                         a mono jack. Without any, `--in-ch` becomes one source
                         called `in`. A loop chooses with `<n>src<i>`.
+                        On an aggregate prefer `--source board=AUDIO4c:1,2` —
+                        which interface, and which of ITS jacks, resolved at
+                        start against what CoreAudio reports. An aggregate's
+                        channel order is not stable across a power cycle, and
+                        an absolute number that has moved records the wrong
+                        input in silence. Named, a missing interface is a
+                        refusal to start instead.
       --preroll-ms <n>  how far before the tap the first loop actually
                         starts, pulled from the pre-roll           (default 0)
       --arm-db <n>      dBFS a sound must reach to start a level-armed
@@ -197,6 +215,37 @@ fn main() -> ExitCode {
             devices::list();
             ExitCode::SUCCESS
         }
+        // **Does this command line still mean what it meant?**
+        //
+        // Takes the same `--device` and `--source` flags as `loop`, resolves
+        // them, prints where every source landed, and exits — opening nothing.
+        // Worth running before a session on a rig with an aggregate, because
+        // the one failure that costs a whole session is the silent one: an
+        // interface that came back in a different order, absolute channel
+        // numbers that still parse, meters that still move, and the wrong
+        // input on every take.
+        "sources" => match parse_loop(&args[1..]) {
+            Ok(opts) => {
+                match aggregate::layout_of(&opts.device) {
+                    Some(l) => print!("{}", l.describe()),
+                    None => println!("{} — cannot read its layout", opts.device),
+                }
+                println!();
+                if opts.sources.is_empty() {
+                    println!("no --source given: one mono source called `in` on channel {}",
+                        opts.in_ch);
+                } else {
+                    for src in &opts.sources {
+                        println!("  {}", src.describe());
+                    }
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                ExitCode::FAILURE
+            }
+        },
         "levels" => match parse_levels(&args[1..]) {
             Ok(opts) => match levels::run(opts) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -286,11 +335,26 @@ fn main() -> ExitCode {
     }
 }
 
-/// `name=l` or `name=l,r` — a source's name and the input channels it reads.
+/// `name=l`, `name=l,r`, or `name=DEVICE:l[,r]` — a source's name and the
+/// input channels it reads.
 ///
 /// One-based on the command line and zero-based inside, because the jacks on
 /// the interface are numbered from one and nothing about the engine's indexing
 /// is the operator's problem.
+///
+/// # The third form, and why it is the one to use on an aggregate
+///
+/// `board=17,18` says where the pedalboard is *today*. An aggregate presents
+/// its members' channels end to end, and that order is a property of the
+/// aggregate as it currently stands — not of its name. Rebuild it, power-cycle
+/// an interface, plug something in that was not there when it was made, and 17
+/// is somewhere else. Nothing then fails: the meters move, the takes have
+/// audio in them, and a whole session is recorded off the wrong input.
+///
+/// `board=AUDIO4c:1,2` says which interface and which of *its* jacks, and is
+/// resolved against what CoreAudio reports at start. If that interface is not
+/// in the aggregate, the daemon refuses to start rather than recording
+/// whatever is at those numbers.
 fn parse_source(v: &str) -> Result<engine::Source, String> {
     let (name, chans) = v
         .split_once('=')
@@ -298,6 +362,13 @@ fn parse_source(v: &str) -> Result<engine::Source, String> {
     if name.is_empty() {
         return Err(format!("--source `{}` has no name", v));
     }
+    // A colon means the channels are counted on one interface rather than on
+    // the whole device. Split from the right, so a device name may contain one.
+    let (on, chans) = match chans.rsplit_once(':') {
+        Some((dev, rest)) if !dev.is_empty() && !rest.is_empty() =>
+            (Some(dev.trim().to_string()), rest),
+        _ => (None, chans),
+    };
     let mut ch = [0usize; engine::CHANNELS];
     let parts: Vec<&str> = chans.split(',').collect();
     if parts.is_empty() || parts.len() > engine::CHANNELS {
@@ -323,7 +394,59 @@ fn parse_source(v: &str) -> Result<engine::Source, String> {
     if parts.len() == 1 {
         ch[1] = ch[0];
     }
-    Ok(engine::Source { name: name.to_string(), ch })
+    Ok(engine::Source { name: name.to_string(), ch, on })
+}
+
+/// Turn every `DEVICE:channel` source into a channel of the device being
+/// opened, using what CoreAudio says the aggregate holds **now**.
+///
+/// Reads properties only; nothing is opened, no stream is started and no
+/// sample rate is touched — which matters on a machine running a DAW, where
+/// interfaces appearing and disappearing is the thing that upsets one.
+fn resolve_sources(opts: &mut engine::Opts) -> Result<(), String> {
+    if !opts.sources.iter().any(|s| s.on.is_some()) {
+        return Ok(());
+    }
+    let layout = aggregate::layout_of(&opts.device).ok_or_else(|| {
+        format!(
+            "cannot read the layout of {:?}, so a source named by interface cannot be placed",
+            opts.device
+        )
+    })?;
+
+    for s in opts.sources.iter_mut() {
+        let Some(dev) = s.on.clone() else { continue };
+        // A source may name the device itself, which is how a plain interface
+        // takes the same spelling as an aggregate. Then the channels are
+        // already the device's own.
+        if !layout.is_aggregate() {
+            if layout.name.to_lowercase().contains(&dev.to_lowercase()) {
+                continue;
+            }
+            return Err(format!(
+                "--source {}: {:?} is not an aggregate, so it has no member {:?}",
+                s.name, layout.name, dev
+            ));
+        }
+        let m = layout
+            .member(&dev)
+            .map_err(|e| format!("--source {}: {}", s.name, e))?;
+        for i in 0..engine::CHANNELS {
+            let want = s.ch[i] + 1;
+            if want as u32 > m.in_ch {
+                return Err(format!(
+                    "--source {}: {} has {} input{}, so there is no channel {}",
+                    s.name,
+                    m.name,
+                    m.in_ch,
+                    if m.in_ch == 1 { "" } else { "s" },
+                    want
+                ));
+            }
+            s.ch[i] += (m.first_in - 1) as usize;
+        }
+    }
+    Ok(())
 }
 
 fn parse_loop(args: &[String]) -> Result<engine::Opts, String> {
@@ -423,6 +546,7 @@ fn parse_loop(args: &[String]) -> Result<engine::Opts, String> {
     if opts.device.is_empty() {
         return Err("loop needs --device".into());
     }
+    resolve_sources(&mut opts)?;
     if opts.max_secs <= 0.0 {
         return Err("--max-secs must be positive".into());
     }

@@ -104,6 +104,27 @@ pub fn list() {
         println!("\n{}{}", c.name, suffix);
         println!("  in {:>2} ch   out {:>2} ch", c.max_in, c.max_out);
 
+        // **What an aggregate is made of, and where each member's channels
+        // landed.** The order is a property of the aggregate as it stands
+        // today, not of its name — so this is the difference between knowing a
+        // source's channel numbers and assuming them.
+        if let Some(l) = crate::aggregate::layout_of(&c.name) {
+            for m in &l.members {
+                if m.in_ch == 0 {
+                    println!("  (no inputs)      {}", m.name);
+                } else if m.in_ch == 1 {
+                    println!("  in ch {:>2}         {}", m.first_in, m.name);
+                } else {
+                    println!(
+                        "  in ch {:>2}-{:<3}     {}",
+                        m.first_in,
+                        m.first_in + m.in_ch - 1,
+                        m.name
+                    );
+                }
+            }
+        }
+
         // Sample-rate ranges are the thing that bites later: a device that will
         // not do 48k, or will only do it on some channel counts, produces a
         // resampled loop whose length drifts against the cycle.

@@ -7,6 +7,12 @@ description = "Itajara \u2014 the looper engine (Epinephelus itajara, the goliat
 
 [dependencies]
 cpal = "0.15"
+# Already in the tree under cpal; named here because the daemon asks CoreAudio
+# directly for one thing cpal does not expose — what an aggregate device is
+# made of, and in what order. See `src/aggregate.rs` for why that is not
+# optional on a rig with more than one interface.
+coreaudio-sys = "0.2"
+core-foundation-sys = "0.8"
 tungstenite = "0.24"
 # For /link/anchor only. Hand-decoding was the obvious move given the WAV header
 # next door, but OSC has padding rules and — unlike a WAV — there is no

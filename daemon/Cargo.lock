@@ -356,6 +356,8 @@ dependencies = [
 name = "itajara"
 version = "0.1.0"
 dependencies = [
+ "core-foundation-sys",
+ "coreaudio-sys",
  "cpal",
  "rand",
  "rosc",
