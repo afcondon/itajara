@@ -190,7 +190,12 @@ type LooperState =
   -- | an interface configured into an aggregate and not switched on: it keeps
   -- | its place, because dropping it would renumber every source after it and
   -- | put a loop on an input nobody chose, and it refuses to be selected.
-  , sources :: Array { name :: String, mono :: Boolean, available :: Boolean }
+  -- | `db` is this source's own peak since the last snapshot, not the rig's.
+  -- | One number for every input cannot answer the question a level-armed take
+  -- | turns on — *is THIS input quiet?* — and on a rig where the board sits at
+  -- | -74 and a DC-coupled modular input sits at -32, the single maximum said
+  -- | -32 for both.
+  , sources :: Array { name :: String, mono :: Boolean, available :: Boolean, db :: Number }
   -- | The loop a console verb with no loop digit addresses. Once also the
   -- | loop whose fields were repeated at this level; now only that, and no
   -- | surface reads it — a page keeps its own focus.
