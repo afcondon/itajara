@@ -364,11 +364,20 @@ fn rig_json(sh: &Shared, sr: u32, alive: bool) -> String {
     // The loudest of every source. One number for a strip that has one meter;
     // per-source metering is a display question and this is the honest summary
     // until there is somewhere to put four of them.
-    let in_peak = sh
+    // **Per source, and then the loudest of them.**
+    //
+    // The engine has always measured each source separately; the wire folded
+    // them into one number, which is the right summary for a strip with one
+    // meter and useless for the question that actually matters — *is the input
+    // I am about to record from quiet right now?* A level-armed take answers
+    // that question with a threshold, and a threshold set against the loudest
+    // thing in the rig fires on something else entirely.
+    let in_each: Vec<f32> = sh
         .in_peak
         .iter()
         .map(|p| f32::from_bits(p.swap(0, Ordering::Relaxed)))
-        .fold(0.0f32, f32::max);
+        .collect();
+    let in_peak = in_each.iter().copied().fold(0.0f32, f32::max);
     let out_peak = f32::from_bits(sh.out_peak.swap(0, Ordering::Relaxed));
 
     // The last thing a command said, carried in every snapshot rather than sent
@@ -445,11 +454,13 @@ fn rig_json(sh: &Shared, sr: u32, alive: bool) -> String {
         // "input 2" on an encoder is the numbering problem all over again.
         sh.sources
             .iter()
-            .map(|s| format!(
-                r#"{{"name":"{}","mono":{},"available":{}}}"#,
+            .enumerate()
+            .map(|(i, s)| format!(
+                r#"{{"name":"{}","mono":{},"available":{},"db":{:.1}}}"#,
                 escape(&s.name),
                 s.is_mono(),
-                s.available
+                s.available,
+                db(in_each.get(i).copied().unwrap_or(0.0))
             ))
             .collect::<Vec<_>>()
             .join(","),

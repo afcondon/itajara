@@ -418,6 +418,10 @@ pub(super) fn input(
         sh.k_set.store(true, Ordering::Release);
     }
 
+    // A one-pole high-pass at about 5 Hz: fast enough to settle in ~40 ms at
+    // startup, far enough below audio that nothing musical is touched.
+    const DC_ALPHA: f32 = 5.0e-4;
+
     // **Every source, always, regardless of transport state.**
     // This is what makes the past claimable — and it is why the
     // source is a per-loop choice rather than a rig-wide one. A
@@ -425,13 +429,27 @@ pub(super) fn input(
     // on whichever input it happened on.
     for (si, src) in sh.sources.iter().enumerate() {
         let mut peak = 0.0f32;
+        // The DC estimate this buffer starts from, one per channel. Tracked
+        // across buffers because it is a property of the input, not of the
+        // block — see `Shared::in_dc` for why an ear and a peak meter disagree
+        // about a DC-coupled input.
+        let mut dc = [0.0f32; CHANNELS];
+        for (ch, d) in dc.iter_mut().enumerate() {
+            *d = f32::from_bits(sh.in_dc[si * CHANNELS + ch].load(Ordering::Relaxed));
+        }
         for f in 0..frames {
             let i = (si * sh.ring_len + (base + f) % sh.ring_len) * CHANNELS;
             for ch in 0..CHANNELS {
                 let v = data[f * in_channels + src.ch[ch]];
-                peak = peak.max(v.abs());
+                // **The ring keeps what arrived**, offset and all. Flattening
+                // early is how a recording stops being a record of the input.
                 sh.ring[i + ch].store(v.to_bits(), Ordering::Relaxed);
+                dc[ch] += (v - dc[ch]) * DC_ALPHA;
+                peak = peak.max((v - dc[ch]).abs());
             }
+        }
+        for (ch, d) in dc.iter().enumerate() {
+            sh.in_dc[si * CHANNELS + ch].store(d.to_bits(), Ordering::Relaxed);
         }
         sh.in_peak[si].fetch_max(peak.to_bits(), Ordering::Relaxed);
     }
@@ -457,9 +475,16 @@ pub(super) fn input(
         let asrc = &sh.sources[sh.src_of(li)];
         let apeak = f32::from_bits(sh.in_peak[sh.src_of(li)].load(Ordering::Relaxed));
         if apeak >= thresh {
+            // Against the same DC-blocked value the meter reported, or the
+            // scan would look for a crossing the peak said was there and not
+            // find it — and on a DC-coupled input it would find one in the
+            // first frame of every buffer.
+            let adc: [f32; CHANNELS] = std::array::from_fn(|c| {
+                f32::from_bits(sh.in_dc[sh.src_of(li) * CHANNELS + c].load(Ordering::Relaxed))
+            });
             if let Some(f) = (0..frames).find(|&f| {
                 (0..CHANNELS)
-                    .any(|c| data[f * in_channels + asrc.ch[c]].abs() >= thresh)
+                    .any(|c| (data[f * in_channels + asrc.ch[c]] - adc[c]).abs() >= thresh)
             })
             {
                 let k = sh.k.load(Ordering::Acquire);

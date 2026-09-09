@@ -286,6 +286,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         ring: zeroed_atomics(ring_elems),
         ring_len,
         in_peak: (0..sources.len()).map(|_| AtomicU32::new(0)).collect(),
+        in_dc: (0..sources.len() * CHANNELS).map(|_| AtomicU32::new(0)).collect(),
         sources,
         loops: (0..opts.loops).map(|i| Loop::new(i, opts.layers)).collect(),
         selected: AtomicUsize::new(0),

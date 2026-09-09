@@ -87,6 +87,20 @@ pub struct Shared {
     /// drum loop should wait for a drum and a guitar loop for a guitar, and one
     /// shared peak would have each of them starting on the other.
     pub in_peak: Vec<AtomicU32>,
+    /// **A running DC estimate per source per channel**, `source * CHANNELS + ch`.
+    ///
+    /// The ES-9's inputs are DC-coupled, because they carry CV — so an idle
+    /// input sits at a constant offset rather than at zero. Measured on the
+    /// rig: ES-9 input 1 reads a steady -0.0234, which is -32.6 dBFS to a peak
+    /// meter and **silence to an ear**; the AC content underneath it is
+    /// -51.7 dBFS. A level-armed take at the -36 dBFS default therefore fired
+    /// the instant it was armed, every time, on a signal that was not a sound.
+    ///
+    /// So the meter and the arm detector work on `v - dc`, and **the recording
+    /// does not**: the offset is real content on a DC-coupled input and
+    /// removing it from what is stored would be flattening early. This is a
+    /// one-pole high-pass at about 5 Hz, which no audio notices.
+    pub in_dc: Vec<AtomicU32>,
     /// Latched by cpal's stream error callback. Unplugging the USB bus kills
     /// both streams, and until this existed the daemon carried on serving a
     /// confident socket from a dead engine: `r` set the request, no output

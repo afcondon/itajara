@@ -30,6 +30,7 @@ pub(super) fn rig(max_frames: usize) -> Shared {
         ring: (0..CHANNELS).map(|_| AtomicU32::new(0)).collect(),
         ring_len: 1,
         in_peak: vec![AtomicU32::new(0)],
+        in_dc: vec![AtomicU32::new(0), AtomicU32::new(0)],
         sources: vec![Source::mono("test", 0)],
         loops: (0..DEFAULT_LOOPS).map(|i| Loop::new(i, DEFAULT_LAYERS)).collect(),
         selected: AtomicUsize::new(0),
@@ -1187,7 +1188,10 @@ fn the_fixture_renders_to_a_known_hash() {
 /// more the same day for `sized` and `windowed`. And on 2026-09-08, when
 /// `available` joined each source — an interface configured into an aggregate
 /// and not switched on keeps its place in the list, so the app has to be told
-/// which of them can actually be recorded from.
+/// which of them can actually be recorded from. And again the next day for
+/// `db`: the engine always metered each source separately and the wire folded
+/// them into one number, which cannot answer "is the input I am about to
+/// record from quiet right now?".
 #[test]
 fn the_fixture_snapshots_to_a_known_hash() {
     let sh = fixture();
@@ -1202,7 +1206,7 @@ fn the_fixture_snapshots_to_a_known_hash() {
         "{}",
         text
     );
-    assert_eq!(fnv(FNV_SEED, text.as_bytes()), 153543895479020797, "snapshot hash");
+    assert_eq!(fnv(FNV_SEED, text.as_bytes()), 5809849548276491503, "snapshot hash");
 }
 
 /// **A plan does not outlive the loop it was made for.** The stale-plan
