@@ -132,6 +132,15 @@ pub(crate) const VERBS: &[Verb] = &[
     Verb { word: "pan", arg: Arg::Int },
     Verb { word: "h", arg: Arg::Flag },
     Verb { word: "c", arg: Arg::None },
+    // **Capture: recording that is not looping.** Rig-wide, never addressed
+    // to a loop, because a capture is not one. See `crate::capture`.
+    Verb { word: "cap", arg: Arg::Int },
+    Verb { word: "cend", arg: Arg::None },
+    Verb { word: "cdrop", arg: Arg::None },
+    Verb { word: "carm", arg: Arg::Flag },
+    Verb { word: "cstop", arg: Arg::Int },
+    Verb { word: "cpk", arg: Arg::Int },
+    Verb { word: "cw", arg: Arg::Name },
     // Rig-wide, and the console's readouts.
     Verb { word: "k", arg: Arg::Flag },
     Verb { word: "m", arg: Arg::Flag },

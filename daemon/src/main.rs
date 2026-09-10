@@ -7,6 +7,7 @@
 
 mod align;
 mod aggregate;
+mod capture;
 mod devices;
 mod engine;
 mod ws;
@@ -118,6 +119,9 @@ USAGE
       --ws              serve the app on ws://127.0.0.1:3028
       --ws-port <n>     ...on a different port
       --ring-secs <s>   how much of the past stays claimable      (default 60)
+      --capture-secs <s> longest one capture may run              (default 900)
+                        Costs nothing until something captures: the buffer is
+                        allocated on the first one, never on startup.
       --takes-dir <p>   where `w` saves takes         (default ~/.itajara/takes)
       --link            take the bar from link-spike's /link/anchor, on 57125
       --link-port <n>   ...on a different port
@@ -634,6 +638,7 @@ fn parse_loop(args: &[String]) -> Result<engine::Opts, String> {
                 opts.ws_port = Some(value.parse().map_err(|_| "--ws-port wants a port number")?)
             }
             "--ring-secs" => opts.ring_secs = value.parse().map_err(|_| "--ring-secs wants a number")?,
+            "--capture-secs" => opts.capture_secs = value.parse().map_err(|_| "--capture-secs wants a number")?,
             "--takes-dir" => opts.takes_dir = value.into(),
             "--link-port" => {
                 opts.link_port = Some(value.parse().map_err(|_| "--link-port wants a port number")?)

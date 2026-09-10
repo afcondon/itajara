@@ -454,6 +454,14 @@ pub(super) fn input(
         sh.in_peak[si].fetch_max(peak.to_bits(), Ordering::Relaxed);
     }
 
+    // **The capture, if there is one.** One atomic load when there is not.
+    //
+    // After the ring and before anything about loops, because a capture is not
+    // one: it neither consults nor is consulted by phase, arm, layer or
+    // length. This line and one field on `Shared` are the whole of the
+    // coupling — see `crate::capture`.
+    sh.capture.take(data, in_channels);
+
     // A level-armed loop is *listening*, not recording — it is not
     // `recording_loop()` and nothing below will write for it. What it
     // needs is the frame the sound crossed the threshold, found here

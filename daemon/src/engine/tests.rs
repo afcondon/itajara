@@ -29,6 +29,9 @@ pub(super) fn rig(max_frames: usize) -> Shared {
         fixed_frames: 0,
         ring: (0..CHANNELS).map(|_| AtomicU32::new(0)).collect(),
         ring_len: 1,
+        // A capture's buffer is allocated on the first `cap`, so the fixture
+        // pays nothing for the tests that never make one.
+        capture: crate::capture::Capture::new(max_frames),
         in_peak: vec![AtomicU32::new(0)],
         in_dc: vec![AtomicU32::new(0), AtomicU32::new(0)],
         sources: vec![Source::mono("test", 0)],
@@ -1191,7 +1194,9 @@ fn the_fixture_renders_to_a_known_hash() {
 /// which of them can actually be recorded from. And again the next day for
 /// `db`: the engine always metered each source separately and the wire folded
 /// them into one number, which cannot answer "is the input I am about to
-/// record from quiet right now?".
+/// record from quiet right now?". And on 2026-09-10, when `capture` joined
+/// the rig — recording that is not looping, and so an object of its own
+/// beside `loops` rather than a tenth field on every loop.
 #[test]
 fn the_fixture_snapshots_to_a_known_hash() {
     let sh = fixture();
@@ -1206,7 +1211,7 @@ fn the_fixture_snapshots_to_a_known_hash() {
         "{}",
         text
     );
-    assert_eq!(fnv(FNV_SEED, text.as_bytes()), 5809849548276491503, "snapshot hash");
+    assert_eq!(fnv(FNV_SEED, text.as_bytes()), 14201698775272748083, "snapshot hash");
 }
 
 /// **A plan does not outlive the loop it was made for.** The stale-plan

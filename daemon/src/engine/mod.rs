@@ -316,6 +316,15 @@ pub struct Opts {
     pub click: bool,
     pub selftest: Option<f64>,
     pub ring_secs: f64,
+    /// **How long one capture may run**, in seconds. Its own number, and not
+    /// `max_secs`, because a capture and a loop are sized by different things:
+    /// a loop by what is musical to play, a capture by what is tolerable to
+    /// record unattended. A 12 x 16 grid at two seconds a hit is over six
+    /// minutes and is a perfectly ordinary thing to ask for.
+    ///
+    /// Costs nothing until something captures — the buffer is allocated on the
+    /// first one. See `crate::capture`.
+    pub capture_secs: f64,
     /// How far before the press the first recording actually begins, pulled
     /// from the ring. A tap is always a little late; this makes that harmless
     /// instead of clipping the attack off the front of the loop.
@@ -363,6 +372,7 @@ impl Default for Opts {
             click: false,
             selftest: None,
             ring_secs: 60.0,
+            capture_secs: 900.0,
             preroll_ms: 0.0,
             dual: true,
             monitor: false,

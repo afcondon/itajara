@@ -200,6 +200,31 @@ data Verb
   -- | matches it ahead of `ex` so the `l` cannot be read as a name.
   | ExportLayers String
 
+  -- | **Capture: recording that is not looping.**
+  -- |
+  -- | Rig-wide, never addressed to a loop — send them with `render`, not
+  -- | `at`. A capture has a start and an end and that is the whole of its
+  -- | state: no phase, no layer, no length, no undo, no alternates, no grid.
+  -- |
+  -- | The Workshop drove loop 7 for this and spent `Alternates false`,
+  -- | `Sounding false`, `OnGrid false` and a `Clear` before every take
+  -- | turning the looper off to do it. Those four are what these replace, and
+  -- | the five-hits-of-twelve bug they caused is written up in the daemon's
+  -- | `capture` module.
+  | Capture Int
+  | EndCapture
+  | DropCapture
+  -- | **Trim the head to the first sound when it is written.** Not a level
+  -- | arm: the recording begins the moment you ask either way, and this only
+  -- | decides where the file starts. That difference is the whole fix — a
+  -- | quiet first hit can no longer be missed, because nothing waits for it.
+  | CaptureArm Boolean
+  -- | Close the capture after this many FRAMES, or zero to run until told.
+  -- | Frames rather than bars because the caller is the one holding the tempo.
+  | CaptureStop Int
+  | CapturePeaks Int
+  | WriteCapture String
+
   -- | Copy another loop's layers onto this one — all of them, or one, by the
   -- | number the slot shows (from one, like `LayerOn`). Onto an empty loop
   -- | only; the daemon refuses otherwise and says so. The source loop is the
@@ -387,6 +412,13 @@ render = case _ of
   SaveTake name -> "w" <> name
   ExportSet name -> "ex" <> name
   ExportLayers name -> "exl" <> name
+  Capture src -> "cap" <> show src
+  EndCapture -> "cend"
+  DropCapture -> "cdrop"
+  CaptureArm on -> flag "carm" on
+  CaptureStop f -> "cstop" <> show f
+  CapturePeaks n -> "cpk" <> show n
+  WriteCapture name -> "cw" <> name
   CopyLoop src -> "cp" <> show src
   CopyLayer src k -> "cp" <> show src <> "l" <> show k
   LayerWindow k i o -> "lw" <> show k <> ":" <> show i <> ":" <> show o

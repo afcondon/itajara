@@ -22,6 +22,7 @@ module Foreign.LooperSocket
   , SocketStatus
   , connect
   , send
+  , Capture
   , latest
   , latestPeaks
   , status
@@ -131,6 +132,34 @@ phaseOf st = case st.state of
 -- | `pos`, `phase`, `armed`, `recording`, `shapes` — were repeated at this
 -- | level for a page written when there was one loop. Every surface reads
 -- | `loops[i]` now, and the daemon stopped sending them: review step 6.)
+-- | **Recording that is not looping.**
+-- |
+-- | Its own type rather than a loop, because it is not one: eight fields and
+-- | no phase, no layer, no length, no undo, no alternates, no grid. The
+-- | Workshop drove loop 7 for this and spent three verbs turning the looper
+-- | off to do it — see the daemon's `capture` module for what that cost.
+type Capture =
+  { on :: Boolean
+  -- | Which source, 1-based, or zero for none yet.
+  , src :: Int
+  , frames :: Int
+  , secs :: Number
+  -- | How long a capture may run at all.
+  , capSecs :: Number
+  -- | **It filled and the rest was dropped.** Said loudly, because an
+  -- | unattended run that quietly recorded the first six minutes of a
+  -- | nine-minute grid would produce a set that looks complete.
+  , full :: Boolean
+  -- | The head will be trimmed to the first sound when it is written. **Not a
+  -- | level arm**: the recording begins the moment you ask either way, and
+  -- | this only decides where the file starts.
+  , armed :: Boolean
+  -- | Frames after which it closes itself, or zero to run until told.
+  , stopAt :: Int
+  -- | Something is captured and not yet written or discarded.
+  , holds :: Boolean
+  }
+
 type LooperState =
   { maxLayers :: Int
   , sampleRate :: Int
@@ -195,6 +224,8 @@ type LooperState =
   -- | turns on — *is THIS input quiet?* — and on a rig where the board sits at
   -- | -74 and a DC-coupled modular input sits at -32, the single maximum said
   -- | -32 for both.
+  -- | **Recording that is not looping.** See `Capture`.
+  , capture :: Capture
   , sources :: Array { name :: String, mono :: Boolean, available :: Boolean, db :: Number }
   -- | The loop a console verb with no loop digit addresses. Once also the
   -- | loop whose fields were repeated at this level; now only that, and no

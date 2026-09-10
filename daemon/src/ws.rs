@@ -397,7 +397,15 @@ fn rig_json(sh: &Shared, sr: u32, alive: bool) -> String {
             r#""ack":"{}","ackSeq":{},"linkTempo":{:.4},"linkQuantum":{:.4},"#,
             r#""linkBarFrames":{},"linkAnchors":{},"linkRejected":{},"#,
             r#""barFrames":{},"barOrigin":{},"launchQ":{},"#,
-            r#""maxSecs":{:.3},"fixedSecs":{:.3},"ringSecs":{:.3},"selected":{},"nLoops":{},"sources":[{}],"loops":[{}]}}"#
+            r#""maxSecs":{:.3},"fixedSecs":{:.3},"ringSecs":{:.3},"selected":{},"nLoops":{},"sources":[{}],"#,
+            // **The capture, which is not a loop and so is not in `loops`.**
+            //
+            // Six numbers and that is the whole of its state: on or not, which
+            // source, how far in, whether it filled, whether the head will be
+            // trimmed, and where it closes itself. Nothing here has a phase, a
+            // layer, a length or an undo — see `crate::capture`.
+            r#""capture":{{"on":{},"src":{},"frames":{},"secs":{:.4},"capSecs":{:.1},"full":{},"armed":{},"stopAt":{},"holds":{}}},"#,
+            r#""loops":[{}]}}"#
         ),
         sh.max_layers,
         sr,
@@ -464,6 +472,17 @@ fn rig_json(sh: &Shared, sr: u32, alive: bool) -> String {
             ))
             .collect::<Vec<_>>()
             .join(","),
+        // The capture. Read here in one place and one instant, like everything
+        // else in this snapshot.
+        sh.capture.is_on(),
+        sh.capture.source(),
+        sh.capture.frames(),
+        sh.capture.frames() as f64 / sr as f64,
+        sh.capture.cap_frames as f64 / sr as f64,
+        sh.capture.full(),
+        sh.capture.armed(),
+        sh.capture.stop_at(),
+        sh.capture.holds(),
         each.join(","),
     )
 }
@@ -578,6 +597,14 @@ mod tests {
         let purs = include_str!("../../client/src/Foreign/LooperSocket.purs");
         // The fields of `type <name> = { ... }`: one per line, opened by
         // `{` or `,`, up to the `::`; doc comments skipped; closed by `}`.
+        // **Every record on the wire is a NAMED type on the other side.**
+        //
+        // `capture` could have been an inline record inside `LooperState`,
+        // and this scanner — which reads flat lines until the first `}` —
+        // would have taken `on` and `src` for fields of the rig and then
+        // stopped before `sources`, reporting the wire wrong in two
+        // directions at once. Naming it costs one line and keeps the check
+        // exact: a nested object is another entry in the loop below.
         let declared = |name: &str| -> Vec<String> {
             let head = format!("type {} =", name);
             let at = purs.find(&head).unwrap_or_else(|| panic!("no `{}` in LooperSocket.purs", head));
@@ -607,6 +634,10 @@ mod tests {
         let sh = fixture();
         let cur = sh.out_frames.load(Ordering::Acquire) as i64;
         assert_eq!(keys(&rig_json(&sh, 48_000, true)), declared("LooperState"), "LooperState");
+        {
+            let v: serde_json::Value = serde_json::from_str(&rig_json(&sh, 48_000, true)).unwrap();
+            assert_eq!(keys(&v["capture"].to_string()), declared("Capture"), "Capture");
+        }
         assert_eq!(keys(&loop_json(&sh, 0, 48_000, cur)), declared("LoopState"), "LoopState");
         assert_eq!(keys(&layer_json(&sh.lp(0).layers[0])), declared("LayerShape"), "LayerShape");
     }
@@ -651,7 +682,7 @@ mod tests {
             "calibrated", "k", "audioAlive", "deviceLost", "reopens", "ack", "ackSeq",
             "linkTempo", "linkQuantum", "linkBarFrames", "linkAnchors", "linkRejected",
             "barFrames", "barOrigin", "launchQ", "maxSecs", "fixedSecs", "ringSecs",
-            "selected", "nLoops", "sources", "loops",
+            "selected", "nLoops", "sources", "capture", "loops",
         ];
         expected.sort_unstable();
         assert_eq!(keys, expected);

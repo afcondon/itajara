@@ -1004,6 +1004,147 @@ fn perform(sh: &Shared, sr: u32, line: &str, from: Caller, later: &mut Option<Jo
                     _ => format!("`{}` wants a source loop, and optionally `l<layer>` from one.", rest),
                 };
             }
+            // ---------------------------------------------------------------
+            // **Capture: recording that is not looping.**
+            //
+            // Rig-wide, never addressed to a loop — a leading digit is
+            // accepted and ignored here as it is for `exl`, because a capture
+            // has no loop to be in. See `crate::capture` for why this exists
+            // beside the engine rather than inside it.
+            "cap" => {
+                if sh.capture.is_on() {
+                    return "a capture is already running; `cend` it first.".into();
+                }
+                let n: usize = match arg.parse() {
+                    Ok(n) if n >= 1 && n <= sh.sources.len() => n,
+                    _ => return format!(
+                        "`cap<n>` wants a source from 1 to {}: {}.",
+                        sh.sources.len(),
+                        sh.sources
+                            .iter()
+                            .enumerate()
+                            .map(|(i, s)| format!("{}={}", i + 1, s.name))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                };
+                let src = &sh.sources[n - 1];
+                sh.capture.start(n, src.ch);
+                return format!(
+                    "capturing {} — up to {:.0} s.",
+                    src.name,
+                    sh.capture.cap_frames as f64 / sr as f64
+                );
+            }
+            "cend" => {
+                if !sh.capture.is_on() {
+                    return "nothing is capturing.".into();
+                }
+                let n = sh.capture.stop();
+                return format!("captured {:.3} s.", n as f64 / sr as f64);
+            }
+            "cdrop" => {
+                if sh.capture.is_on() {
+                    return "still capturing; `cend` it first.".into();
+                }
+                sh.capture.discard();
+                return "the capture is discarded.".into();
+            }
+            // **Trim the head, not the recording.**
+            //
+            // The looper's level-arm does not record until a sound arrives,
+            // and that is what lost five hits of a swept take. Here the
+            // recording starts when asked and this only decides where the
+            // FILE begins, resolved at write time over audio already in hand.
+            "carm" => {
+                let on = match arg {
+                    "" => !sh.capture.armed(),
+                    "1" => true,
+                    _ => false,
+                };
+                sh.capture.set_armed(on);
+                return if on {
+                    "the next capture will begin at its first sound.".into()
+                } else {
+                    "the next capture will be kept whole.".into()
+                };
+            }
+            // A length in FRAMES, because the caller is the one holding the
+            // tempo — see `bars` on the client side. Zero runs until told.
+            "cstop" => {
+                let f: usize = match arg.parse() {
+                    Ok(f) => f,
+                    Err(_) => return format!("`cstop<frames>` wants a whole number: {}.", rest),
+                };
+                sh.capture.set_stop_at(f);
+                return if f == 0 {
+                    "the next capture runs until it is stopped.".into()
+                } else {
+                    format!("the next capture closes itself after {:.3} s.", f as f64 / sr as f64)
+                };
+            }
+            // The picture, published exactly as `pk` publishes a loop's, so
+            // the surfaces draw a capture with the code they already have.
+            "cpk" => {
+                let n = sh.capture.frames();
+                if n == 0 {
+                    return "the capture holds nothing to draw.".into();
+                }
+                let buckets: usize = arg.parse().unwrap_or(600).clamp(16, 4000);
+                *later = Some(Box::new(move |sh: &Shared| {
+                    let (lo, hi) = sh.capture.picture(0, n, buckets);
+                    let json = format!(
+                        r#"{{"peaks":{{"loop":-1,"frames":{},"from":0,"to":{},"buckets":{},"winIn":0,"winOut":0,"rot":0,"lo":[{}],"hi":[{}]}}}}"#,
+                        n,
+                        n,
+                        buckets,
+                        lo.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
+                        hi.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
+                    );
+                    if let Ok(mut slot) = sh.peaks.lock() {
+                        *slot = json;
+                    }
+                    sh.peaks_seq.fetch_add(1, Ordering::Release);
+                    format!("peaks for the capture: {} buckets over {:.3} s.", buckets, n as f64 / sr as f64)
+                }));
+                return String::new();
+            }
+            "cw" => {
+                if sh.capture.is_on() {
+                    return "still capturing; `cend` it first.".into();
+                }
+                let n = sh.capture.frames();
+                if n == 0 {
+                    return "nothing captured, so there is nothing to write.".into();
+                }
+                let dir = sh.takes_dir.join(super::export::safe_name(arg));
+                let thresh = f32::from_bits(sh.arm_thresh.load(Ordering::Relaxed));
+                let reach = sh.arm_reach.load(Ordering::Relaxed);
+                let from = sh.capture.head(thresh, reach);
+                let peak = sh.capture.peak();
+                *later = Some(Box::new(move |sh: &Shared| {
+                    match sh.capture.write(&dir, sr, from, n) {
+                        Err(e) => e,
+                        // "saved" first and the path last, as `w` does: scripts
+                        // read the one and the app shows the other.
+                        Ok(len) => format!(
+                            "saved the capture: {:.3} s{}{} to {}",
+                            len as f64 / sr as f64,
+                            if from > 0 {
+                                format!(", head trimmed by {:.3} s", from as f64 / sr as f64)
+                            } else {
+                                String::new()
+                            },
+                            // **A capture that heard nothing is worth saying so
+                            // about**, because a file of silence looks exactly
+                            // like a file of quiet playing until it is opened.
+                            if peak < 1.0e-3 { ", and it is silent" } else { "" },
+                            dir.display()
+                        ),
+                    }
+                }));
+                return String::new();
+            }
             // The three name verbs. A name runs straight into its verb on the
             // wire (`exlriff`), and `tokenize` reads it back by the longest
             // name-verb, so `exl` and `ex` no longer care which is first.

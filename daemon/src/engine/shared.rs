@@ -47,6 +47,14 @@ pub struct Shared {
     pub ring_len: usize,
     /// What each source is called and which input channels it reads.
     pub sources: Vec<Source>,
+    /// **Recording that is not looping.** See `crate::capture`.
+    ///
+    /// Here because this struct is "everything both callbacks and the control
+    /// thread touch", and a capture is touched by both — not because a capture
+    /// is part of the engine. It shares the device, the input callback and
+    /// `aggregate.rs`'s idea of a source, and nothing else: no loop, no phase,
+    /// no layer, no length. The module is beside `engine/` for that reason.
+    pub capture: crate::capture::Capture,
     pub loops: Vec<Loop>,
     /// Which loop bare commands address.
     ///

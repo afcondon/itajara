@@ -455,7 +455,7 @@ fn len_of(lp: &Loop) -> usize {
     lp.loop_len.load(Ordering::Acquire)
 }
 
-fn safe_name(raw: &str) -> String {
+pub(crate) fn safe_name(raw: &str) -> String {
     let cleaned: String = raw
         .trim()
         .chars()

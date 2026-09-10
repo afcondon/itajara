@@ -288,6 +288,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         in_peak: (0..sources.len()).map(|_| AtomicU32::new(0)).collect(),
         in_dc: (0..sources.len() * CHANNELS).map(|_| AtomicU32::new(0)).collect(),
         sources,
+        capture: crate::capture::Capture::new((opts.capture_secs * sr_f).round() as usize),
         loops: (0..opts.loops).map(|i| Loop::new(i, opts.layers)).collect(),
         selected: AtomicUsize::new(0),
         anchor: AtomicUsize::new(NO_ANCHOR),
