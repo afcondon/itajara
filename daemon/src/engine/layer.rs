@@ -95,6 +95,28 @@ pub(crate) struct Layer {
     pub(crate) win_out: AtomicI64,
     pub(crate) period: AtomicUsize,
     pub(crate) phase: AtomicUsize,
+    /// **The furthest frame ever written into this slot, plus one.**
+    ///
+    /// Not a musical fact — `len` and `tail` are those — but a fact about the
+    /// *arena*, and the two diverge. `len`/`tail` describe the take that is
+    /// currently believed to be here; `written` describes what is physically
+    /// in the memory, including audio whose shape has been forgotten: a take
+    /// that was undone (undo moves a layer count, it does not erase), a take
+    /// abandoned when the device went away, or whatever a longer previous take
+    /// left in a slot now claimed by a shorter one.
+    ///
+    /// It exists so `zero_layer` can erase exactly that and no more. Erasing
+    /// less would let an undone take bleed into the next overdub — the bug
+    /// `dispatch.rs`'s `summed` branch is written to prevent. Erasing more
+    /// (the whole `--max-secs` slot, as it did until 2026-09-22) is correct
+    /// but commits the entire arena to resident memory the first time each
+    /// slot is cleared, which defeats the lazy allocation in `run.rs` and cost
+    /// 4.5 GB of RSS on a rig that had recorded a fraction of that.
+    ///
+    /// Raised in `Shared::write`/`add`, which are the only two ways a sample
+    /// reaches the arena; reset by `zero_layer`, which writes through `cell`
+    /// and so does not raise it again.
+    pub(crate) written: AtomicUsize,
 }
 
 impl Layer {
@@ -110,6 +132,7 @@ impl Layer {
             win_in: AtomicI64::new(0),
             win_out: AtomicI64::new(0),
             phase: AtomicUsize::new(0),
+            written: AtomicUsize::new(0),
         }
     }
 

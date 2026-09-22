@@ -1992,3 +1992,82 @@ fn redo_waits_for_the_summed_pass_in_hand() {
     assert!(ack.contains("finish that first"), "{}", ack);
     assert_eq!(sh.lp(0).n_layers.load(Ordering::Acquire), 1, "nothing raised over the write");
 }
+
+// ---------------------------------------------------------------------------
+// zero_layer's bound (2026-09-22)
+// ---------------------------------------------------------------------------
+
+/// The bug that made the bound necessary, and the one a naive bound reopens.
+///
+/// `zero_layer` used to run to `--max-secs`, which was always correct and
+/// committed the whole arena to resident memory the first time each slot was
+/// cleared. Bounding it by `len + tail` is the obvious fix and is WRONG: three
+/// callers zero a slot whose shape describes something other than its
+/// contents. This is that case — audio physically present past a shorter
+/// declared shape, exactly as an undone take leaves it — and it must still be
+/// erased, or it bleeds into the next overdub.
+#[test]
+fn clearing_erases_audio_the_shape_has_forgotten() {
+    let sh = rig(LEN);
+    let (li, layer) = (0, 0);
+
+    // A long take goes down...
+    for p in 0..800 {
+        for ch in 0..CHANNELS {
+            sh.write(li, layer, p, ch, 0.5);
+        }
+    }
+    // ...and is then undone, which moves a layer count and erases nothing.
+    // The slot now claims to be far shorter than it is.
+    sh.lp(li).set_layer_shape(layer, Shape { len: 100, tail: 0, born: 0 });
+
+    sh.zero_layer(li, layer);
+
+    for p in 0..800 {
+        for ch in 0..CHANNELS {
+            assert_eq!(
+                sh.read(li, layer, p, ch), 0.0,
+                "frame {p} ch {ch} survived the clear — it would bleed into the next take"
+            );
+        }
+    }
+}
+
+/// And the half that makes it cheap: the clear stops at the high-water mark,
+/// so pages past it are never touched and never become resident. Asserted
+/// through the mark itself, since RSS is not observable from in here.
+#[test]
+fn clearing_stops_at_what_was_written() {
+    let sh = rig(LEN);
+    let (li, layer) = (0, 3);
+
+    assert_eq!(sh.lp(li).layers[layer].written.load(Ordering::Acquire), 0,
+        "an untouched slot has nothing to erase");
+
+    for p in 0..64 {
+        sh.write(li, layer, p, 0, 0.25);
+    }
+    assert_eq!(sh.lp(li).layers[layer].written.load(Ordering::Acquire), 64,
+        "the mark is the furthest frame written, plus one");
+
+    sh.zero_layer(li, layer);
+    assert_eq!(sh.lp(li).layers[layer].written.load(Ordering::Acquire), 0,
+        "and an erased slot is untouched again");
+}
+
+/// An overdub sums rather than stores, so it has to raise the mark too — and
+/// it can reach further than the take it sums into.
+#[test]
+fn an_overdub_raises_the_mark_it_passes() {
+    let sh = rig(LEN);
+    let (li, layer) = (0, 1);
+
+    for p in 0..50 { sh.write(li, layer, p, 0, 0.1); }
+    for p in 0..120 { sh.add(li, layer, p, 0, 0.1); }
+
+    assert_eq!(sh.lp(li).layers[layer].written.load(Ordering::Acquire), 120);
+    sh.zero_layer(li, layer);
+    for p in 0..120 {
+        assert_eq!(sh.read(li, layer, p, 0), 0.0, "frame {p} survived");
+    }
+}

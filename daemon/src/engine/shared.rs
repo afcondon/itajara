@@ -397,12 +397,31 @@ impl Shared {
         f32::from_bits(self.cell(li, layer, pos, ch).load(Ordering::Relaxed))
     }
     pub(crate) fn write(&self, li: usize, layer: usize, pos: usize, ch: usize, v: f32) {
-        self.cell(li, layer, pos, ch).store(v.to_bits(), Ordering::Relaxed)
+        self.cell(li, layer, pos, ch).store(v.to_bits(), Ordering::Relaxed);
+        self.touched(li, layer, pos);
     }
     pub(crate) fn add(&self, li: usize, layer: usize, pos: usize, ch: usize, v: f32) {
         let c = self.cell(li, layer, pos, ch);
         let cur = f32::from_bits(c.load(Ordering::Relaxed));
-        c.store((cur + v).to_bits(), Ordering::Relaxed)
+        c.store((cur + v).to_bits(), Ordering::Relaxed);
+        self.touched(li, layer, pos);
+    }
+
+    /// Raise the layer's high-water mark. See `Layer::written`.
+    ///
+    /// In the audio callback, so: a relaxed load, a branch, and a store only
+    /// while the mark is actually advancing — which during a sequential
+    /// recording is once a frame, the same order of cost as the sample store
+    /// it follows. No allocation, no fence, no contention (one writer per
+    /// slot at a time). Relaxed is enough because only the control thread
+    /// reads it, and only in `zero_layer`, which never runs while that slot
+    /// is being recorded into.
+    #[inline]
+    fn touched(&self, li: usize, layer: usize, pos: usize) {
+        let hw = &self.loops[li].layers[layer].written;
+        if pos >= hw.load(Ordering::Relaxed) {
+            hw.store(pos + 1, Ordering::Relaxed);
+        }
     }
     /// The captured sample for an input frame, if the ring still holds it.
     pub(crate) fn ring_at(&self, src: usize, in_frame: i64, ch: usize) -> Option<f32> {
@@ -499,12 +518,35 @@ impl Shared {
         wrap_mix(v, self.read(li, layer, len + p, ch), p, n)
     }
 
+    /// Erase a layer's audio — exactly what was written into it, and no more.
+    ///
+    /// **Bounded by the high-water mark, not by `--max-secs`.** It used to run
+    /// to `max_frames`, which was correct and expensive in a way nothing
+    /// reported: the arena is allocated with `alloc_zeroed` precisely so pages
+    /// commit as loops fill (`run.rs` says as much), and writing zeros across
+    /// a whole 300-second slot commits every page of it whether or not a note
+    /// was ever recorded there. Clearing all 48 slots of an 8x6 rig therefore
+    /// made the entire 5.5 GB arena resident. Found 2026-09-22 at 4.5 GB RSS
+    /// after six days up.
+    ///
+    /// **Not bounded by `len + tail`**, which is the obvious choice and is
+    /// wrong: three callers zero a slot whose shape describes something other
+    /// than its contents — the next free slot (`cycle.rs`), a slot holding an
+    /// undone take (`dispatch.rs`, whose comment names the bleed this
+    /// prevents), and a take abandoned mid-record when the device went away
+    /// (`run.rs::drop_takes`, where the shape was never set at all). Only the
+    /// high-water mark knows about audio whose shape has been forgotten.
     pub(crate) fn zero_layer(&self, li: usize, layer: usize) {
-        for i in 0..self.max_frames {
+        let hw = &self.loops[li].layers[layer].written;
+        let n = hw.load(Ordering::Acquire).min(self.max_frames);
+        for i in 0..n {
             for ch in 0..CHANNELS {
                 self.cell(li, layer, i, ch).store(0, Ordering::Relaxed);
             }
         }
+        // After the audio, so a concurrent reader never sees a zero mark over
+        // audio that is still there.
+        hw.store(0, Ordering::Release);
     }
 
     /// Redraw a layer's envelope from what is actually in the arena.
