@@ -165,6 +165,23 @@ pub fn spawn_listener(sh: Arc<Shared>, sr: u32, port: u16) {
             // arrival and cannot be recovered later.
             let at = sh.out_frames.load(Ordering::Acquire);
             sh.link_frame.store(at, Ordering::Relaxed);
+            // **Where the beat is HEARD, on the audio's own clock.** The
+            // anchor says which beat it was at a wall-clock instant; its age on
+            // arrival puts that instant on the host clock, and the newest
+            // buffer's playback stamp puts the host clock on frames. Labelling
+            // it with `at` instead — the write head — put every bar line the
+            // output latency late (measured 2026-09-24: 15 to 25 ms, averaging
+            // 20.4, on a kick on the one), and let it wander by a buffer from
+            // one anchor to the next. `at` stays the fallback before the first
+            // buffer has been stamped.
+            let heard = {
+                let unix_now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_micros() as i64)
+                    .unwrap_or(micros);
+                let mach_at_beat = crate::engine::mach_now_nanos() - (unix_now - micros) * 1000;
+                sh.heard_frame_at(mach_at_beat, sr).unwrap_or(at as i64)
+            };
 
             // **And here is the other half, finally joined.** The engine has
             // had the tempo since Link landed and has never been able to use
@@ -182,7 +199,7 @@ pub fn spawn_listener(sh: Arc<Shared>, sr: u32, port: u16) {
             match crate::engine::bar_frames(tempo, quantum, sr) {
                 Some(bar) => {
                     sh.link_bar_origin.store(
-                        crate::engine::bar_origin(beat, quantum, tempo, at, sr),
+                        crate::engine::bar_origin(beat, quantum, tempo, heard, sr),
                         Ordering::Relaxed,
                     );
                     sh.link_bar_frames.store(bar, Ordering::Relaxed);

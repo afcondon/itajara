@@ -46,6 +46,23 @@ pub(super) fn output(
     sh.buffer_frames.store(frames as u32, Ordering::Relaxed);
 
     let base = sh.out_frames.load(Ordering::Acquire);
+    // **When this buffer will be heard**, published for the Link listener —
+    // see `Shared::heard_frame_at`. The reference is taken once, on the first
+    // buffer; after that this is a subtraction and three atomic stores.
+    {
+        // CoreAudio's own host time for this buffer, not cpal's `playback`,
+        // which is that plus a guessed buffer; the device's reported latency
+        // says which frame is being heard at that instant.
+        let cb = info.timestamp().callback;
+        let r = *sh.out_ref.get_or_init(|| cb);
+        if let Some(d) = cb.duration_since(&r) {
+            let lat = sh.out_lat_frames.load(Ordering::Relaxed);
+            sh.out_seq.fetch_add(1, Ordering::AcqRel);
+            sh.out_heard_frame.store(base as i64 - lat, Ordering::Relaxed);
+            sh.out_heard_nanos.store(d.as_nanos() as i64, Ordering::Relaxed);
+            sh.out_seq.fetch_add(1, Ordering::Release);
+        }
+    }
     if sh.p0_needed.load(Ordering::Relaxed) {
         // `try_lock` because this is the audio thread; if the lock
         // is contended the next buffer will do just as well.

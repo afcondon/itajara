@@ -146,6 +146,17 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         );
     }
 
+    // **When the output is heard**, as the device itself reports it — not as
+    // cpal guesses. See `aggregate::output_latency`.
+    let out_lat = crate::aggregate::output_latency(&candidate.name);
+    match out_lat {
+        Some((f, buf)) => println!(
+            "Output heard {} frames after its host time (device + safety offset + stream); buffer {}.",
+            f, buf
+        ),
+        None => println!("Output latency: not reported by {}; Link beats will use 0.", candidate.name),
+    }
+
     let mut in_cfg = choose_input(&device, opts.in_ch, opts.sample_rate, Width::Widest)
         .ok_or_else(|| format!("{} has no f32 input config", candidate.name))?;
     let mut out_cfg = choose_output(&device, opts.out_ch, opts.sample_rate, Width::Narrowest)
@@ -321,6 +332,11 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         link_tempo: AtomicU64::new(0),
         link_quantum: AtomicU64::new(0),
         link_frame: AtomicUsize::new(0),
+        out_ref: std::sync::OnceLock::new(),
+        out_seq: AtomicU64::new(0),
+        out_heard_frame: AtomicI64::new(0),
+        out_heard_nanos: AtomicI64::new(0),
+        out_lat_frames: AtomicI64::new(out_lat.map(|(f, _)| f as i64).unwrap_or(0)),
         link_bar_frames: AtomicUsize::new(0),
         link_bar_origin: AtomicI64::new(0),
         launch_q: AtomicI64::new(-1),

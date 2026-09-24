@@ -165,6 +165,22 @@ pub struct Shared {
     /// The output frame the newest anchor arrived on — the half of the
     /// wall-clock-to-frame join that can only be taken at the moment it lands.
     pub link_frame: AtomicUsize,
+    /// **When the output is heard**, as the audio callback last saw it: the
+    /// frame at the head of the newest buffer, and the host time CoreAudio
+    /// says that frame will be PLAYED at, in nanoseconds after `out_ref`.
+    /// Published every buffer under `out_seq` (odd while being written), so a
+    /// reader never pairs one buffer's frame with another's time.
+    ///
+    /// Refreshed every buffer rather than stamped once like `p0`, because the
+    /// interface's sample clock and the host clock drift apart by parts per
+    /// million, and a join taken at startup is milliseconds out an hour later.
+    pub out_ref: std::sync::OnceLock<cpal::StreamInstant>,
+    pub out_seq: AtomicU64,
+    pub out_heard_frame: AtomicI64,
+    pub out_heard_nanos: AtomicI64,
+    /// Frames from a buffer's host time to its first frame being heard, as the
+    /// device reports it. See `aggregate::output_latency`.
+    pub out_lat_frames: AtomicI64,
     /// **The join, done.** A bar's length in frames, and an output frame on
     /// which some bar began.
     ///
@@ -289,6 +305,37 @@ impl Shared {
             return Some((origin, bar));
         }
         played
+    }
+
+    /// **The output frame being heard at host time `mach_nanos`**, from the
+    /// newest buffer's playback stamp. `None` before the first buffer, or if
+    /// the reference instant cannot be read.
+    ///
+    /// This is the frame a Link beat belongs on. Link's convention is that a
+    /// beat's time is when it is HEARD — every Link app delays its output to
+    /// honour that — so a beat labelled with `out_frames`, which is where the
+    /// next buffer is being WRITTEN, sits the output latency late, and jitters
+    /// by up to a buffer on top because the counter only moves once a buffer.
+    pub fn heard_frame_at(&self, mach_nanos: i64, sr: u32) -> Option<i64> {
+        let r = self.out_ref.get()?;
+        let r_abs = instant_nanos(r)?;
+        let (f, n) = loop {
+            let s1 = self.out_seq.load(Ordering::Acquire);
+            if s1 == 0 {
+                return None;
+            }
+            if s1 % 2 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let f = self.out_heard_frame.load(Ordering::Relaxed);
+            let n = self.out_heard_nanos.load(Ordering::Relaxed);
+            if self.out_seq.load(Ordering::Acquire) == s1 {
+                break (f, n);
+            }
+        };
+        let dt = (mach_nanos - (r_abs + n)) as f64 / 1e9;
+        Some(f + (dt * sr as f64).round() as i64)
     }
 
     /// The grid for a quantise setting `q`, in `lq`'s terms: 0 none, -1 the
@@ -885,4 +932,26 @@ impl Shared {
         }
         Some(out)
     }
+}
+
+/// **A `StreamInstant` as host-clock nanoseconds.** cpal keeps the value
+/// private and offers only differences, but its `Debug` prints both fields, and
+/// on CoreAudio they are `mach_absolute_time` scaled to nanoseconds — the clock
+/// `CLOCK_UPTIME_RAW` reads. Called off the audio thread only: it formats.
+pub(crate) fn instant_nanos(i: &cpal::StreamInstant) -> Option<i64> {
+    let s = format!("{:?}", i);
+    let num = |key: &str| -> Option<i64> {
+        let at = s.find(key)? + key.len();
+        let digits: String = s[at..].chars().skip_while(|c| *c == ' ')
+            .take_while(|c| c.is_ascii_digit() || *c == '-').collect();
+        digits.parse().ok()
+    };
+    Some(num("secs:")? * 1_000_000_000 + num("nanos:")?)
+}
+
+/// Host-clock nanoseconds now, on the clock CoreAudio stamps buffers with.
+pub(crate) fn mach_now_nanos() -> i64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut ts) };
+    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
 }

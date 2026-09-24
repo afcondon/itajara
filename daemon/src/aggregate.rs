@@ -30,6 +30,8 @@ use std::ffi::c_void;
 
 use coreaudio_sys::{
     kAudioAggregateDevicePropertyFullSubDeviceList, kAudioDevicePropertyDeviceUID,
+    kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyLatency,
+    kAudioDevicePropertySafetyOffset, kAudioDevicePropertyStreams, kAudioStreamPropertyLatency,
     kAudioDevicePropertyStreamConfiguration, kAudioHardwarePropertyDevices,
     kAudioObjectPropertyElementMain, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
     kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
@@ -404,6 +406,63 @@ pub fn layouts() -> Vec<Layout> {
             }
         })
         .collect()
+}
+
+/// **How long after CoreAudio's host time for a buffer its first frame is
+/// heard**, in frames: the device's own latency, its safety offset and its
+/// output stream's latency, all as the device reports them. With the buffer
+/// size, for the log.
+///
+/// cpal does not ask. Its output `playback` stamp is the host time plus ONE
+/// BUFFER, under a TODO saying it assumes double buffering — which is the
+/// output half of the two buffers `measure` found it over-accounting by. A
+/// Link beat dated with that stamp landed 8.5 ms early (2026-09-24). This is
+/// the number the stamp should have added.
+pub fn output_latency(needle: &str) -> Option<(u32, u32)> {
+    let lower = needle.to_lowercase();
+    let ids = device_ids();
+    let named: Vec<(AudioObjectID, String)> = ids
+        .iter()
+        .filter_map(|&id| Some((id, string_prop(id, kAudioObjectPropertyName)?.to_lowercase())))
+        .collect();
+    let id = named.iter().find(|(_, n)| *n == lower)
+        .or_else(|| named.iter().find(|(_, n)| n.contains(&lower)))?.0;
+    let out = kAudioObjectPropertyScopeOutput;
+    let dev = u32_prop(id, kAudioDevicePropertyLatency, out).unwrap_or(0);
+    let safety = u32_prop(id, kAudioDevicePropertySafetyOffset, out).unwrap_or(0);
+    let stream = first_stream(id, out)
+        .and_then(|s| u32_prop(s, kAudioStreamPropertyLatency, kAudioObjectPropertyScopeGlobal))
+        .unwrap_or(0);
+    let buffer = u32_prop(id, kAudioDevicePropertyBufferFrameSize, out).unwrap_or(0);
+    Some((dev + safety + stream, buffer))
+}
+
+fn u32_prop(id: AudioObjectID, selector: u32, scope: u32) -> Option<u32> {
+    let a = addr(selector, scope);
+    let mut v: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let st = unsafe {
+        AudioObjectGetPropertyData(id, &a, 0, std::ptr::null(), &mut size,
+                                   &mut v as *mut u32 as *mut c_void)
+    };
+    if st == 0 { Some(v) } else { None }
+}
+
+fn first_stream(id: AudioObjectID, scope: u32) -> Option<AudioObjectID> {
+    let a = addr(kAudioDevicePropertyStreams, scope);
+    let mut size: u32 = 0;
+    let st = unsafe {
+        coreaudio_sys::AudioObjectGetPropertyDataSize(id, &a, 0, std::ptr::null(), &mut size)
+    };
+    if st != 0 || (size as usize) < std::mem::size_of::<AudioObjectID>() {
+        return None;
+    }
+    let mut ids = vec![0 as AudioObjectID; size as usize / std::mem::size_of::<AudioObjectID>()];
+    let st = unsafe {
+        AudioObjectGetPropertyData(id, &a, 0, std::ptr::null(), &mut size,
+                                   ids.as_mut_ptr() as *mut c_void)
+    };
+    if st == 0 { ids.first().copied() } else { None }
 }
 
 /// The layout of one device, by the same case-insensitive substring rule the

@@ -14,6 +14,10 @@ cpal = "0.15"
 coreaudio-sys = "0.2"
 core-foundation-sys = "0.8"
 tungstenite = "0.24"
+# `clock_gettime(CLOCK_UPTIME_RAW)`, the host clock CoreAudio stamps buffers
+# with, read in the Link listener to date an anchor on the audio's own clock.
+# Already in the tree under cpal.
+libc = "0.2"
 # For /link/anchor only. Hand-decoding was the obvious move given the WAV header
 # next door, but OSC has padding rules and — unlike a WAV — there is no
 # independent decoder to check a hand-rolled parse against. link-spike encodes

@@ -68,6 +68,7 @@ pub(crate) use next_take::NextTake;
 pub(crate) use phase::Phase;
 pub use run::run;
 pub use shared::Shared;
+pub(crate) use shared::mach_now_nanos;
 pub(crate) use run::resolve_residual;
 
 /// The playhead arithmetic, which is the one part of speed that can be checked
@@ -579,10 +580,10 @@ pub fn bar_frames(tempo_bpm: f64, quantum: f64, sr: u32) -> Option<usize> {
 /// Signed, and may be negative: an anchor arriving in the first bar of a
 /// session names a frame before the stream started, which is correct — it is a
 /// phase, not an event, and every bar line is this plus a multiple of the bar.
-pub fn bar_origin(beat: f64, quantum: f64, tempo_bpm: f64, at: usize, sr: u32) -> i64 {
+pub fn bar_origin(beat: f64, quantum: f64, tempo_bpm: f64, at: i64, sr: u32) -> i64 {
     let per_beat = 60.0 / tempo_bpm * sr as f64;
     let into_bar = beat.rem_euclid(quantum) * per_beat;
-    at as i64 - into_bar.round() as i64
+    at - into_bar.round() as i64
 }
 
 /// `AtomicU8` under a name that makes the intent obvious at the use sites.
