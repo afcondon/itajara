@@ -1029,12 +1029,47 @@ fn perform(sh: &Shared, sr: u32, line: &str, from: Caller, later: &mut Option<Jo
                     ),
                 };
                 let src = &sh.sources[n - 1];
-                sh.capture.start(n, src.ch);
-                return format!(
-                    "capturing {} — up to {:.0} s.",
-                    src.name,
-                    sh.capture.cap_frames as f64 / sr as f64
-                );
+                // **Resolve the bar once, here, for both ends.** The start and
+                // the count come from the same grid read, so they cannot
+                // disagree about how long a bar is.
+                let q = sh.capture.quant();
+                let bars = sh.capture.bars();
+                if bars > 0 {
+                    let Some((_, bar)) = sh.grid() else {
+                        return "`cbars` needs a bar, and there is none: no Link \
+                                and no loop to take one from. `cstop` takes frames."
+                            .into();
+                    };
+                    sh.capture.set_stop_at(bars * bar);
+                }
+                // An output frame, like every grid on this rig; the capture
+                // counts INPUT frames, and `k` is the join between them.
+                let now = sh.out_frames.load(std::sync::atomic::Ordering::Acquire) as i64;
+                let from_in = if q == 0 {
+                    crate::capture::NOW
+                } else {
+                    match sh.next_on(q, now) {
+                        Some(at) => at - sh.k.load(std::sync::atomic::Ordering::Acquire),
+                        None => return "`cq` needs a grid, and there is none: no Link \
+                                        and no loop to take one from."
+                            .into(),
+                    }
+                };
+                sh.capture.start(n, src.ch, from_in);
+                let wait = if from_in == crate::capture::NOW {
+                    String::new()
+                } else {
+                    let at = from_in + sh.k.load(std::sync::atomic::Ordering::Acquire);
+                    format!(" from the {} in {:.2} s",
+                            if q < 0 { "next bar".to_string() } else { format!("next {}-beat line", q) },
+                            (at - now) as f64 / sr as f64)
+                };
+                let len = match sh.capture.stop_at() {
+                    0 => format!("up to {:.0} s", sh.capture.cap_frames as f64 / sr as f64),
+                    f if bars > 0 => format!("{} bar{}, {:.3} s", bars, if bars == 1 { "" } else { "s" }, f as f64 / sr as f64),
+                    f => format!("{:.3} s", f as f64 / sr as f64),
+                };
+                return format!("capturing {}{} — {}.", src.name, wait, len);
             }
             "cend" => {
                 if !sh.capture.is_on() {
@@ -1077,10 +1112,46 @@ fn perform(sh: &Shared, sr: u32, line: &str, from: Caller, later: &mut Option<Jo
                     Err(_) => return format!("`cstop<frames>` wants a whole number: {}.", rest),
                 };
                 sh.capture.set_stop_at(f);
+                // The two ways of giving a length replace each other; a stale
+                // bar count left from another page would otherwise win at `cap`.
+                sh.capture.set_bars(0);
                 return if f == 0 {
                     "the next capture runs until it is stopped.".into()
                 } else {
                     format!("the next capture closes itself after {:.3} s.", f as f64 / sr as f64)
+                };
+            }
+            // **Where a capture starts**, in `lq`'s terms: `cq0` now, `cq-1`
+            // the next bar line, `cq<n>` the next `n`-beat line. A setting,
+            // like `carm`; resolved to a frame when `cap` starts.
+            "cq" => {
+                let q: i64 = match arg.parse() {
+                    Ok(q) if q >= -1 => q,
+                    _ => return format!("`cq` wants -1 (bar), 0 (now) or a beat count: {}.", rest),
+                };
+                sh.capture.set_quant(q);
+                return match q {
+                    0 => "the next capture starts when asked.".into(),
+                    -1 => "the next capture starts on the next bar line.".into(),
+                    n => format!("the next capture starts on the next {}-beat line.", n),
+                };
+            }
+            // **A length in the rig's own bars**, counted from the capture's
+            // first frame. Replaces `cstop`'s frames, which needed the caller
+            // to hold the tempo and counted from the press, not the downbeat.
+            "cbars" => {
+                let n: usize = match arg.parse() {
+                    Ok(n) => n,
+                    Err(_) => return format!("`cbars<n>` wants a whole number: {}.", rest),
+                };
+                sh.capture.set_bars(n);
+                if n > 0 {
+                    sh.capture.set_stop_at(0);
+                }
+                return if n == 0 {
+                    "the next capture runs until it is stopped.".into()
+                } else {
+                    format!("the next capture closes itself after {} bar{}.", n, if n == 1 { "" } else { "s" })
                 };
             }
             // The picture, published exactly as `pk` publishes a loop's, so

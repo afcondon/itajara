@@ -460,7 +460,7 @@ pub(super) fn input(
     // one: it neither consults nor is consulted by phase, arm, layer or
     // length. This line and one field on `Shared` are the whole of the
     // coupling — see `crate::capture`.
-    sh.capture.take(data, in_channels);
+    sh.capture.take(data, in_channels, base);
 
     // A level-armed loop is *listening*, not recording — it is not
     // `recording_loop()` and nothing below will write for it. What it

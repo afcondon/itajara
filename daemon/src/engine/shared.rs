@@ -291,15 +291,16 @@ impl Shared {
         played
     }
 
-    /// The grid a *launch* aligns to: the bar, subdivided or multiplied by
-    /// whatever `launch_q` asks for, and `None` when nothing should wait.
+    /// The grid for a quantise setting `q`, in `lq`'s terms: 0 none, -1 the
+    /// bar, `n` every `n` beats. Shared by the looper's launch and by a
+    /// capture's start, so "on the bar" means one thing on this rig.
     ///
     /// Beats rather than fractions of a bar, so the setting means the same
     /// thing in 3/4 as in 4/4 — a quantum of three does not make "one beat"
     /// into a third of a bar, it stays a beat.
-    fn launch_grid(&self) -> Option<(i64, usize)> {
+    pub fn quant_grid(&self, q: i64) -> Option<(i64, usize)> {
         let (origin, bar) = self.grid()?;
-        match self.launch_q.load(Ordering::Relaxed) {
+        match q {
             0 => None,
             n if n < 0 => Some((origin, bar)),
             n => {
@@ -340,7 +341,12 @@ impl Shared {
     /// different questions. `None` means nothing to wait for, and every caller
     /// already treats that as "go now".
     pub fn next_boundary(&self, from: i64) -> Option<i64> {
-        let (origin, len) = self.launch_grid()?;
+        self.next_on(self.launch_q.load(Ordering::Relaxed), from)
+    }
+
+    /// The first output frame at or after `from` on quantise `q`'s grid.
+    pub fn next_on(&self, q: i64, from: i64) -> Option<i64> {
+        let (origin, len) = self.quant_grid(q)?;
         let elapsed = from - origin;
         let cycles = elapsed.div_euclid(len as i64) + if elapsed.rem_euclid(len as i64) == 0 { 0 } else { 1 };
         Some(origin + cycles * len as i64)

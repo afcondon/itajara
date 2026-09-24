@@ -158,6 +158,9 @@ type Capture =
   , stopAt :: Int
   -- | Something is captured and not yet written or discarded.
   , holds :: Boolean
+  -- | **Started, and waiting for the bar line** (`cq`) — on, with nothing
+  -- | recorded yet. Distinct from a capture that has begun and heard silence.
+  , waits :: Boolean
   }
 
 type LooperState =

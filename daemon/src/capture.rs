@@ -46,10 +46,13 @@
 
 use std::path::Path;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
 
 /// Interleaved stereo, like everything else that reaches a file here.
 pub const CHANNELS: usize = 2;
+
+/// "Start from the first buffer", as a start frame.
+pub const NOW: i64 = i64::MIN;
 
 pub struct Capture {
     /// How much room a capture has, in frames. Fixed at startup.
@@ -73,6 +76,18 @@ pub struct Capture {
     armed: AtomicBool,
     /// Stop after this many frames, or zero to run until told.
     stop_at: AtomicUsize,
+    /// **Where to start, as the looper's `lq` says where to launch**: 0 is
+    /// now, -1 the next bar line, `n` the next `n`-beat boundary. A setting,
+    /// like `armed`, resolved to a frame when the capture starts.
+    quant: AtomicI64,
+    /// A length in the rig's own BARS, or zero to use `stop_at`. Resolved to
+    /// frames at start, from the same grid the start was resolved against, so
+    /// the count and the start cannot disagree about how long a bar is.
+    bars: AtomicUsize,
+    /// The first INPUT frame to keep, or `NOW` to keep from the first buffer.
+    /// Frames before it arrive and are skipped, so the file's frame 0 is the
+    /// downbeat itself rather than the buffer that happened to hold it.
+    start_in: AtomicI64,
     /// The extremes seen, so a capture that heard nothing can say so before
     /// anything is written.
     ///
@@ -102,6 +117,9 @@ impl Capture {
             full: AtomicBool::new(false),
             armed: AtomicBool::new(false),
             stop_at: AtomicUsize::new(0),
+            quant: AtomicI64::new(0),
+            bars: AtomicUsize::new(0),
+            start_in: AtomicI64::new(NOW),
             lo: AtomicU32::new(f32::INFINITY.to_bits()),
             hi: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
         }
@@ -125,6 +143,12 @@ impl Capture {
 
     pub fn set_armed(&self, on: bool) { self.armed.store(on, Ordering::Relaxed) }
     pub fn set_stop_at(&self, frames: usize) { self.stop_at.store(frames, Ordering::Relaxed) }
+    pub fn quant(&self) -> i64 { self.quant.load(Ordering::Relaxed) }
+    pub fn set_quant(&self, q: i64) { self.quant.store(q, Ordering::Relaxed) }
+    pub fn bars(&self) -> usize { self.bars.load(Ordering::Relaxed) }
+    pub fn set_bars(&self, n: usize) { self.bars.store(n, Ordering::Relaxed) }
+    /// On, and the frame it is waiting for has not arrived yet.
+    pub fn waiting(&self) -> bool { self.is_on() && self.frames() == 0 && self.start_in.load(Ordering::Relaxed) != NOW }
 
     /// **Begin.** Called from the control thread; allocates on the first call.
     ///
@@ -132,13 +156,14 @@ impl Capture {
     /// capture holds one take, and a take that landed on top of another is the
     /// bug this page exists to avoid. There is no undo because there is
     /// nothing a second take could be layered onto.
-    pub fn start(&self, src1: usize, ch: [usize; CHANNELS]) {
+    pub fn start(&self, src1: usize, ch: [usize; CHANNELS], from_in: i64) {
         self.buf.get_or_init(|| {
             (0..self.cap_frames * CHANNELS).map(|_| AtomicU32::new(0)).collect()
         });
         self.ch0.store(ch[0], Ordering::Relaxed);
         self.ch1.store(ch[1], Ordering::Relaxed);
         self.src.store(src1, Ordering::Relaxed);
+        self.start_in.store(from_in, Ordering::Relaxed);
         self.frames.store(0, Ordering::Release);
         self.full.store(false, Ordering::Relaxed);
         self.lo.store(f32::INFINITY.to_bits(), Ordering::Relaxed);
@@ -168,7 +193,7 @@ impl Capture {
     /// A bounds check, a copy, a peak. No locks, no allocation, no branch on
     /// anything but its own flag — so a daemon that is not capturing pays one
     /// atomic load per buffer.
-    pub fn take(&self, data: &[f32], in_channels: usize) {
+    pub fn take(&self, data: &[f32], in_channels: usize, base: usize) {
         if !self.on.load(Ordering::Acquire) {
             return;
         }
@@ -179,16 +204,36 @@ impl Capture {
         }
         let at = self.frames.load(Ordering::Acquire);
         let frames = data.len() / in_channels;
+        // **Waiting for the bar.** A buffer wholly before the start frame is
+        // skipped; the one holding it is entered part-way, so frame 0 of the
+        // file is the start frame exactly, not the head of its buffer.
+        let from = self.start_in.load(Ordering::Relaxed);
+        let skip = if from == NOW || at > 0 {
+            0
+        } else {
+            let d = from - base as i64;
+            if d >= frames as i64 {
+                return;
+            }
+            d.max(0) as usize
+        };
+        let avail = frames - skip;
         let room = self.cap_frames.saturating_sub(at);
-        let n = frames.min(room);
-        if n < frames {
+        let mut n = avail.min(room);
+        if n < avail {
             self.full.store(true, Ordering::Relaxed);
+        }
+        // Close ON the count rather than at the end of the buffer that crossed
+        // it: a bar-counted take is a loop, and a loop a buffer too long clicks.
+        let stop = self.stop_at.load(Ordering::Relaxed);
+        if stop > 0 {
+            n = n.min(stop.saturating_sub(at));
         }
         let mut lo = f32::from_bits(self.lo.load(Ordering::Relaxed));
         let mut hi = f32::from_bits(self.hi.load(Ordering::Relaxed));
         for f in 0..n {
-            let l = data[f * in_channels + c0];
-            let r = data[f * in_channels + c1];
+            let l = data[(skip + f) * in_channels + c0];
+            let r = data[(skip + f) * in_channels + c1];
             buf[(at + f) * CHANNELS].store(l.to_bits(), Ordering::Relaxed);
             buf[(at + f) * CHANNELS + 1].store(r.to_bits(), Ordering::Relaxed);
             lo = lo.min(l).min(r);
@@ -200,11 +245,10 @@ impl Capture {
         // **A capture closes itself at its count**, here rather than on a
         // timer, because this is the only place that knows the frame. Zero
         // means run until told, which is every take played by hand.
-        let stop = self.stop_at.load(Ordering::Relaxed);
         if stop > 0 && at + n >= stop {
             self.on.store(false, Ordering::Release);
         }
-        if n < frames {
+        if n < avail && (stop == 0 || at + n < stop) {
             self.on.store(false, Ordering::Release);
         }
     }
@@ -310,12 +354,17 @@ mod tests {
     /// Four buffers of a two-channel interleave, as the callback would hand
     /// them over: `n` frames, `in_channels` wide, reading channels `ch`.
     fn feed(c: &Capture, in_channels: usize, ch: [usize; 2], frames: &[[f32; 2]]) {
+        feed_at(c, in_channels, ch, frames, 0);
+    }
+
+    /// The same, as the buffer starting at input frame `base`.
+    fn feed_at(c: &Capture, in_channels: usize, ch: [usize; 2], frames: &[[f32; 2]], base: usize) {
         let mut data = vec![0.0f32; frames.len() * in_channels];
         for (f, v) in frames.iter().enumerate() {
             data[f * in_channels + ch[0]] = v[0];
             data[f * in_channels + ch[1]] = v[1];
         }
-        c.take(&data, in_channels);
+        c.take(&data, in_channels, base);
     }
 
     /// **A capture reads the channels its source names, and nothing else.**
@@ -328,7 +377,7 @@ mod tests {
     #[test]
     fn a_capture_reads_its_source_and_nothing_else() {
         let c = Capture::new(16);
-        c.start(4, [6, 7]);
+        c.start(4, [6, 7], NOW);
         feed(&c, 24, [6, 7], &[[0.5, -0.25], [0.1, 0.2]]);
         assert_eq!(c.frames(), 2);
         assert_eq!(c.at(0, 0), 0.5);
@@ -344,7 +393,7 @@ mod tests {
     #[test]
     fn filling_the_buffer_stops_and_says_so() {
         let c = Capture::new(3);
-        c.start(1, [0, 1]);
+        c.start(1, [0, 1], NOW);
         feed(&c, 2, [0, 1], &[[0.1, 0.1]; 5]);
         assert_eq!(c.frames(), 3, "kept what fitted");
         assert!(c.full(), "and said it filled");
@@ -356,7 +405,7 @@ mod tests {
     #[test]
     fn a_count_closes_the_capture() {
         let c = Capture::new(100);
-        c.start(1, [0, 1]);
+        c.start(1, [0, 1], NOW);
         c.set_stop_at(4);
         feed(&c, 2, [0, 1], &[[0.2, 0.2]; 3]);
         assert!(c.is_on(), "three of four is not four");
@@ -378,7 +427,7 @@ mod tests {
     #[test]
     fn the_head_trim_only_moves_the_start() {
         let c = Capture::new(100);
-        c.start(1, [0, 1]);
+        c.start(1, [0, 1], NOW);
         let mut frames = vec![[0.0f32, 0.0]; 20];
         frames[10] = [0.6, 0.6];
         feed(&c, 2, [0, 1], &frames);
@@ -397,7 +446,7 @@ mod tests {
     #[test]
     fn silence_is_measured_with_the_offset_removed() {
         let c = Capture::new(100);
-        c.start(1, [0, 1]);
+        c.start(1, [0, 1], NOW);
         feed(&c, 2, [0, 1], &[[-0.023, -0.023]; 8]);
         assert!(c.peak() < 1.0e-3, "a DC offset is not signal: {}", c.peak());
         feed(&c, 2, [0, 1], &[[0.477, -0.523]; 8]);
@@ -409,12 +458,50 @@ mod tests {
     #[test]
     fn starting_again_is_the_whole_of_clearing() {
         let c = Capture::new(100);
-        c.start(1, [0, 1]);
+        c.start(1, [0, 1], NOW);
         feed(&c, 2, [0, 1], &[[0.5, 0.5]; 6]);
         c.stop();
         assert!(c.holds());
-        c.start(1, [0, 1]);
+        c.start(1, [0, 1], NOW);
         assert_eq!(c.frames(), 0);
         assert!(!c.holds(), "recording, so it holds nothing finished");
+    }
+
+    /// **A quantised capture begins ON its frame**, not at the head of the
+    /// buffer that holds it: frame 0 of the file is the downbeat. Buffers of
+    /// four, the downbeat at input frame 10, so the third buffer is entered
+    /// two frames in and the first two are dropped whole.
+    #[test]
+    fn a_quantised_capture_begins_on_its_frame() {
+        let c = Capture::new(100);
+        c.start(1, [0, 1], 10);
+        for b in 0..5 {
+            let buf: Vec<[f32; 2]> = (0..4).map(|f| [(b * 4 + f) as f32, 0.0]).collect();
+            if b < 2 {
+                feed_at(&c, 2, [0, 1], &buf, b * 4);
+                assert!(c.waiting(), "still before the bar after buffer {}", b);
+                assert_eq!(c.frames(), 0);
+            } else {
+                feed_at(&c, 2, [0, 1], &buf, b * 4);
+            }
+        }
+        assert!(!c.waiting());
+        assert_eq!(c.at(0, 0), 10.0, "the file starts on the bar line");
+        assert_eq!(c.frames(), 10, "frames 10..19");
+    }
+
+    /// **A count closes ON the count**, not at the end of the buffer that
+    /// crossed it. A bar-counted take is a loop; a buffer too long clicks.
+    #[test]
+    fn a_count_closes_on_the_count() {
+        let c = Capture::new(100);
+        c.set_stop_at(6);
+        c.start(1, [0, 1], NOW);
+        feed(&c, 2, [0, 1], &[[0.1, 0.1]; 4]);
+        assert!(c.is_on());
+        feed(&c, 2, [0, 1], &[[0.1, 0.1]; 4]);
+        assert_eq!(c.frames(), 6);
+        assert!(!c.is_on());
+        assert!(!c.full(), "closing at the count is not running out of room");
     }
 }

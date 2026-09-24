@@ -139,6 +139,8 @@ pub(crate) const VERBS: &[Verb] = &[
     Verb { word: "cdrop", arg: Arg::None },
     Verb { word: "carm", arg: Arg::Flag },
     Verb { word: "cstop", arg: Arg::Int },
+    Verb { word: "cq", arg: Arg::Int },
+    Verb { word: "cbars", arg: Arg::Int },
     Verb { word: "cpk", arg: Arg::Int },
     Verb { word: "cw", arg: Arg::Name },
     // Rig-wide, and the console's readouts.

@@ -1196,7 +1196,9 @@ fn the_fixture_renders_to_a_known_hash() {
 /// them into one number, which cannot answer "is the input I am about to
 /// record from quiet right now?". And on 2026-09-10, when `capture` joined
 /// the rig — recording that is not looping, and so an object of its own
-/// beside `loops` rather than a tenth field on every loop.
+/// beside `loops` rather than a tenth field on every loop. And on 2026-09-24
+/// for `waits`: a capture told to start on the bar line (`cq`) is on and has
+/// recorded nothing, which without it reads exactly like one hearing silence.
 #[test]
 fn the_fixture_snapshots_to_a_known_hash() {
     let sh = fixture();
@@ -1211,7 +1213,7 @@ fn the_fixture_snapshots_to_a_known_hash() {
         "{}",
         text
     );
-    assert_eq!(fnv(FNV_SEED, text.as_bytes()), 14201698775272748083, "snapshot hash");
+    assert_eq!(fnv(FNV_SEED, text.as_bytes()), 15907897788941825342, "snapshot hash");
 }
 
 /// **A plan does not outlive the loop it was made for.** The stale-plan

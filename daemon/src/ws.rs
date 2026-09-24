@@ -400,11 +400,12 @@ fn rig_json(sh: &Shared, sr: u32, alive: bool) -> String {
             r#""maxSecs":{:.3},"fixedSecs":{:.3},"ringSecs":{:.3},"selected":{},"nLoops":{},"sources":[{}],"#,
             // **The capture, which is not a loop and so is not in `loops`.**
             //
-            // Six numbers and that is the whole of its state: on or not, which
-            // source, how far in, whether it filled, whether the head will be
-            // trimmed, and where it closes itself. Nothing here has a phase, a
+            // A handful of numbers and that is the whole of its state: on or
+            // not, which source, how far in, whether it filled, whether the
+            // head will be trimmed, where it closes itself, and whether it is
+            // still waiting for the bar line it was told to start on. Nothing here has a phase, a
             // layer, a length or an undo — see `crate::capture`.
-            r#""capture":{{"on":{},"src":{},"frames":{},"secs":{:.4},"capSecs":{:.1},"full":{},"armed":{},"stopAt":{},"holds":{}}},"#,
+            r#""capture":{{"on":{},"src":{},"frames":{},"secs":{:.4},"capSecs":{:.1},"full":{},"armed":{},"stopAt":{},"holds":{},"waits":{}}},"#,
             r#""loops":[{}]}}"#
         ),
         sh.max_layers,
@@ -483,6 +484,7 @@ fn rig_json(sh: &Shared, sr: u32, alive: bool) -> String {
         sh.capture.armed(),
         sh.capture.stop_at(),
         sh.capture.holds(),
+        sh.capture.waiting(),
         each.join(","),
     )
 }

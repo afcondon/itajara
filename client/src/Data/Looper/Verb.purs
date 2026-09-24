@@ -222,6 +222,13 @@ data Verb
   -- | Close the capture after this many FRAMES, or zero to run until told.
   -- | Frames rather than bars because the caller is the one holding the tempo.
   | CaptureStop Int
+  -- | **Where the next capture starts**, in `lq`'s terms: 0 when asked, -1 on
+  -- | the next bar line, `n` on the next `n`-beat line.
+  | CaptureQuantise Int
+  -- | Close after this many of the RIG'S bars, counted from the capture's
+  -- | first frame, or zero to run until told. The daemon holds the bar, so the
+  -- | page no longer converts a tempo into frames.
+  | CaptureBars Int
   | CapturePeaks Int
   | WriteCapture String
 
@@ -417,6 +424,8 @@ render = case _ of
   DropCapture -> "cdrop"
   CaptureArm on -> flag "carm" on
   CaptureStop f -> "cstop" <> show f
+  CaptureQuantise q -> "cq" <> show q
+  CaptureBars n -> "cbars" <> show n
   CapturePeaks n -> "cpk" <> show n
   WriteCapture name -> "cw" <> name
   CopyLoop src -> "cp" <> show src
