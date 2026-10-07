@@ -494,9 +494,11 @@ fn supervise<F>(
 
     let mut last_frames = sh.out_frames.load(Ordering::Acquire);
     let mut still = 0u32;
+    let mut mem = crate::memwatch::Watch::start();
 
     loop {
         std::thread::sleep(Duration::from_millis(TICK_MS));
+        mem.tick();
 
         let frames = sh.out_frames.load(Ordering::Acquire);
         if frames == last_frames {
@@ -534,6 +536,7 @@ fn supervise<F>(
         // old handle refers to something that no longer exists.
         loop {
             std::thread::sleep(Duration::from_millis(750));
+            mem.tick();
             let found = match crate::devices::find(device_name) {
                 Ok(c) => c,
                 Err(_) => continue,

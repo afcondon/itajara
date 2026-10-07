@@ -467,6 +467,15 @@ fn first_stream(id: AudioObjectID, scope: u32) -> Option<AudioObjectID> {
 
 /// The layout of one device, by the same case-insensitive substring rule the
 /// rest of the daemon matches devices with.
+/// The name of every device CoreAudio lists right now, in its order. For
+/// `memwatch`, which logs what arrived and left alongside what it cost.
+pub fn device_names() -> Vec<String> {
+    device_ids()
+        .into_iter()
+        .filter_map(|id| string_prop(id, kAudioObjectPropertyName))
+        .collect()
+}
+
 pub fn layout_of(needle: &str) -> Option<Layout> {
     let lower = needle.to_lowercase();
     let all = layouts();
