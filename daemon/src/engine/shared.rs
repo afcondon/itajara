@@ -128,6 +128,9 @@ pub struct Shared {
     /// than hiding — a rig that silently recovers six times in a session is
     /// telling you something about the cable.
     pub reopens: AtomicUsize,
+    /// WebSocket clients connected right now. One of the two things the idle
+    /// exit waits on: an open page means the daemon is wanted.
+    pub clients: AtomicUsize,
     /// Where saved takes go.
     pub takes_dir: PathBuf,
     /// The last thing a command had to say, and a counter that moves whenever

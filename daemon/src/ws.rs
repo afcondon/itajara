@@ -72,6 +72,14 @@ fn talk(
     stream.set_read_timeout(Some(Duration::from_millis(1000 / PUSH_HZ)))?;
     let mut ws = tungstenite::accept(stream)?;
     println!("  app connected.");
+    // Counted only once the handshake is done, so a bare TCP probe (Bosun's
+    // readiness check) is not a client; uncounted on every way out of here.
+    struct Counted<'a>(&'a std::sync::atomic::AtomicUsize);
+    impl Drop for Counted<'_> {
+        fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); }
+    }
+    sh.clients.fetch_add(1, Ordering::AcqRel);
+    let _counted = Counted(&sh.clients);
 
     // Liveness is measured, not assumed. This thread only reads shared atomics,
     // so it will happily serve a plausible-looking snapshot from an engine whose

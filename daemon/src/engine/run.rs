@@ -322,6 +322,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         p0_frame: AtomicUsize::new(0),
         device_lost: AtomicBool::new(false),
         reopens: AtomicUsize::new(0),
+        clients: AtomicUsize::new(0),
         takes_dir: opts.takes_dir.clone(),
         ack: Mutex::new(String::new()),
         ack_seq: AtomicUsize::new(0),
@@ -457,12 +458,47 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     // attached to a terminal, which is exactly when it is meant to be working.
     // With a socket open there is still a client to serve, so park instead.
     if opts.ws_port.is_some() {
-        supervise(&sh, &opts.device, &build_streams, &mut out_stream, &mut in_stream);
+        supervise(&sh, &opts.device, &build_streams, &mut out_stream, &mut in_stream, opts.idle_exit);
     }
 
     drop(in_stream);
     drop(out_stream);
     Ok(())
+}
+
+/// What keeps the daemon from exiting idle, or `None` if nothing does.
+///
+/// **The daemon decides, not Bosun**, because only the daemon knows what it is
+/// holding. Bosun's broker deliberately has no idle reap (RELAY-STALL-AND-
+/// BROKER-MODE §5.5: reaping a process that holds an audio interface because no
+/// request came is the failure that made WebSocket services unsafe to
+/// router-manage). Exiting by itself, the daemon is started again by the next
+/// `/where`, which every client already calls on each reconnect.
+///
+/// Why it exists at all (2026-10-07): a daemon lazily started once and never
+/// stopped ran 12½ days, and CoreAudio's buffer zone grew to 9.6 GB over that
+/// time (see `memwatch`). Exiting whenever it is not wanted bounds that by the
+/// length of a session. It is a mitigation, not the fix.
+///
+/// Held means **anything an exit would lose**: a loop with audio or a loop
+/// mid-phase, a capture running, or a capture recorded and never written.
+pub(crate) fn idle_blocker(sh: &Shared) -> Option<String> {
+    let clients = sh.clients.load(Ordering::Acquire);
+    if clients > 0 {
+        return Some(format!("{clients} app(s) connected"));
+    }
+    for (i, lp) in sh.loops.iter().enumerate() {
+        if lp.loop_len.load(Ordering::Acquire) > 0 || lp.phase() != super::phase::Phase::Idle {
+            return Some(format!("loop {i} holds audio"));
+        }
+    }
+    if sh.capture.is_on() || sh.capture.armed() {
+        return Some("a capture is running".into());
+    }
+    if sh.capture.unsaved() {
+        return Some("a capture has not been written".into());
+    }
+    None
 }
 
 /// Watch the device, and put it back when it goes.
@@ -483,6 +519,7 @@ fn supervise<F>(
     build: &F,
     out_stream: &mut cpal::Stream,
     in_stream: &mut cpal::Stream,
+    idle_exit: Option<Duration>,
 ) where
     F: Fn(&cpal::Device) -> Result<(cpal::Stream, cpal::Stream), Box<dyn Error>>,
 {
@@ -495,10 +532,27 @@ fn supervise<F>(
     let mut last_frames = sh.out_frames.load(Ordering::Acquire);
     let mut still = 0u32;
     let mut mem = crate::memwatch::Watch::start();
+    let mut idle_since: Option<std::time::Instant> = None;
 
     loop {
         std::thread::sleep(Duration::from_millis(TICK_MS));
         mem.tick();
+
+        if let Some(limit) = idle_exit {
+            match idle_blocker(sh) {
+                Some(_) => idle_since = None,
+                None => {
+                    let since = *idle_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= limit {
+                        eprintln!(
+                            "idle for {} min: no app connected, no loop or unsaved capture held — exiting; Bosun starts it again on demand.",
+                            limit.as_secs() / 60
+                        );
+                        std::process::exit(0);
+                    }
+                }
+            }
+        }
 
         let frames = sh.out_frames.load(Ordering::Acquire);
         if frames == last_frames {

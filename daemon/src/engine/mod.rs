@@ -341,6 +341,10 @@ pub struct Opts {
     pub monitor: bool,
     /// TCP port for the app to connect on. None keeps the daemon console-only.
     pub ws_port: Option<u16>,
+    /// With a socket open, exit after this long with no client and nothing
+    /// held (see `run::idle_blocker`). `None` never exits. Bosun's broker
+    /// starts the daemon again on the next `/where`.
+    pub idle_exit: Option<std::time::Duration>,
     /// Where `w` writes takes. Under `$HOME` by convention, beside `~/.es9` and
     /// `~/.fh2`.
     pub takes_dir: PathBuf,
@@ -378,6 +382,7 @@ impl Default for Opts {
             dual: true,
             monitor: false,
             ws_port: None,
+            idle_exit: Some(std::time::Duration::from_secs(15 * 60)),
             takes_dir: default_takes_dir(),
             link_port: None,
             arm_db: -36.0,

@@ -55,6 +55,7 @@ pub(super) fn rig(max_frames: usize) -> Shared {
         p0_frame: AtomicUsize::new(0),
         device_lost: AtomicBool::new(false),
         reopens: AtomicUsize::new(0),
+        clients: AtomicUsize::new(0),
         takes_dir: std::env::temp_dir().join("itajara-test-takes"),
         ack: Mutex::new(String::new()),
         ack_seq: AtomicUsize::new(0),
@@ -2077,4 +2078,32 @@ fn an_overdub_raises_the_mark_it_passes() {
     for p in 0..120 {
         assert_eq!(sh.read(li, layer, p, 0), 0.0, "frame {p} survived");
     }
+}
+
+/// The idle exit waits on everything an exit would lose, and on nothing else.
+#[test]
+fn idle_waits_for_clients_loops_and_unwritten_captures() {
+    use std::sync::atomic::Ordering;
+    use super::run::idle_blocker;
+    let sh = rig(4800);
+    assert_eq!(idle_blocker(&sh), None);
+
+    sh.clients.store(1, Ordering::Release);
+    assert!(idle_blocker(&sh).is_some());
+    sh.clients.store(0, Ordering::Release);
+
+    sh.loops[2].loop_len.store(480, Ordering::Release);
+    assert_eq!(idle_blocker(&sh).as_deref(), Some("loop 2 holds audio"));
+    sh.loops[2].loop_len.store(0, Ordering::Release);
+    assert_eq!(idle_blocker(&sh), None);
+
+    sh.capture.start(1, [0, 1], i64::MIN);
+    assert_eq!(idle_blocker(&sh).as_deref(), Some("a capture is running"));
+    sh.capture.take(&[0.5; 2 * 64], 2, 0);
+    sh.capture.stop();
+    assert_eq!(idle_blocker(&sh).as_deref(), Some("a capture has not been written"));
+    let dir = std::env::temp_dir().join("itajara-test-idle-capture");
+    sh.capture.write(&dir, 48_000, 0, sh.capture.frames()).expect("written");
+    assert_eq!(idle_blocker(&sh), None);
+    let _ = std::fs::remove_dir_all(dir);
 }

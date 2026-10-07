@@ -102,6 +102,10 @@ pub struct Capture {
     /// extreme and report half the offset as signal.
     lo: AtomicU32,
     hi: AtomicU32,
+    /// Whether what is held has been written since it was recorded. Only the
+    /// idle exit reads it: a take nobody has written is the one thing an exit
+    /// would lose that nothing else holds.
+    written: AtomicBool,
 }
 
 impl Capture {
@@ -122,6 +126,7 @@ impl Capture {
             start_in: AtomicI64::new(NOW),
             lo: AtomicU32::new(f32::INFINITY.to_bits()),
             hi: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
+            written: AtomicBool::new(false),
         }
     }
 
@@ -140,6 +145,8 @@ impl Capture {
     }
     /// True once something has been captured and not yet written or dropped.
     pub fn holds(&self) -> bool { !self.is_on() && self.frames() > 0 }
+    /// Held, and not yet written anywhere.
+    pub fn unsaved(&self) -> bool { self.holds() && !self.written.load(Ordering::Acquire) }
 
     pub fn set_armed(&self, on: bool) { self.armed.store(on, Ordering::Relaxed) }
     pub fn set_stop_at(&self, frames: usize) { self.stop_at.store(frames, Ordering::Relaxed) }
@@ -168,6 +175,7 @@ impl Capture {
         self.full.store(false, Ordering::Relaxed);
         self.lo.store(f32::INFINITY.to_bits(), Ordering::Relaxed);
         self.hi.store(f32::NEG_INFINITY.to_bits(), Ordering::Relaxed);
+        self.written.store(false, Ordering::Release);
         self.on.store(true, Ordering::Release);
     }
 
@@ -343,6 +351,7 @@ impl Capture {
         );
         std::fs::write(dir.join("take.json"), manifest)
             .map_err(|e| format!("wrote the audio but not the manifest: {}", e))?;
+        self.written.store(true, Ordering::Release);
         Ok(len)
     }
 }

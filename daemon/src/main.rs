@@ -119,6 +119,9 @@ USAGE
       --mono-out        send the mix to one channel instead of a pair
       --ws              serve the app on ws://127.0.0.1:3028
       --ws-port <n>     ...on a different port
+      --idle-exit <m>   with a socket open, exit after m minutes with no app
+                        connected and no loop or unsaved capture held; Bosun
+                        starts it again on demand. 0 never exits (default 15)
       --ring-secs <s>   how much of the past stays claimable      (default 60)
       --capture-secs <s> longest one capture may run              (default 900)
                         Costs nothing until something captures: the buffer is
@@ -637,6 +640,10 @@ fn parse_loop(args: &[String]) -> Result<engine::Opts, String> {
             "--buffer" => opts.buffer = Some(value.parse().map_err(|_| "--buffer wants an integer")?),
             "--ws-port" => {
                 opts.ws_port = Some(value.parse().map_err(|_| "--ws-port wants a port number")?)
+            }
+            "--idle-exit" => {
+                let m: f64 = value.parse().map_err(|_| "--idle-exit wants a number of minutes")?;
+                opts.idle_exit = (m > 0.0).then(|| std::time::Duration::from_secs_f64(m * 60.0));
             }
             "--ring-secs" => opts.ring_secs = value.parse().map_err(|_| "--ring-secs wants a number")?,
             "--capture-secs" => opts.capture_secs = value.parse().map_err(|_| "--capture-secs wants a number")?,
