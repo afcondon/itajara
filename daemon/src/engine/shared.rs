@@ -55,6 +55,8 @@ pub struct Shared {
     /// `aggregate.rs`'s idea of a source, and nothing else: no loop, no phase,
     /// no layer, no length. The module is beside `engine/` for that reason.
     pub capture: crate::capture::Capture,
+    /// A long recording, streamed to disk. See `crate::jam`.
+    pub jam: crate::jam::Jam,
     pub loops: Vec<Loop>,
     /// Which loop bare commands address.
     ///

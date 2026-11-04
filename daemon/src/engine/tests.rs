@@ -32,6 +32,7 @@ pub(super) fn rig(max_frames: usize) -> Shared {
         // A capture's buffer is allocated on the first `cap`, so the fixture
         // pays nothing for the tests that never make one.
         capture: crate::capture::Capture::new(max_frames),
+        jam: crate::jam::Jam::new(48_000.0),
         in_peak: vec![AtomicU32::new(0)],
         in_dc: vec![AtomicU32::new(0), AtomicU32::new(0)],
         sources: vec![Source::mono("test", 0)],
@@ -1205,6 +1206,8 @@ fn the_fixture_renders_to_a_known_hash() {
 /// beside `loops` rather than a tenth field on every loop. And on 2026-09-24
 /// for `waits`: a capture told to start on the bar line (`cq`) is on and has
 /// recorded nothing, which without it reads exactly like one hearing silence.
+/// And on 2026-11-04 for `jam`: a long recording streamed to disk, an object
+/// of its own beside `capture` for the same reason `capture` is one.
 #[test]
 fn the_fixture_snapshots_to_a_known_hash() {
     let sh = fixture();
@@ -1219,7 +1222,7 @@ fn the_fixture_snapshots_to_a_known_hash() {
         "{}",
         text
     );
-    assert_eq!(fnv(FNV_SEED, text.as_bytes()), 15907897788941825342, "snapshot hash");
+    assert_eq!(fnv(FNV_SEED, text.as_bytes()), 1687033349750738383, "snapshot hash");
 }
 
 /// **A plan does not outlive the loop it was made for.** The stale-plan

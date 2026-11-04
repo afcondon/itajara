@@ -1071,6 +1071,64 @@ fn perform(sh: &Shared, sr: u32, line: &str, from: Caller, later: &mut Option<Jo
                 };
                 return format!("capturing {}{} — {}.", src.name, wait, len);
             }
+            // ---------------------------------------------------------------
+            // **Jam: a long recording that goes to disk as it is made.**
+            //
+            // Rig-wide, like the capture, and independent of it: both may run.
+            // `jname<name>` names the next jam; `jam<n>` starts one from source
+            // n into a new take of that name; `jend` stops it, and the ack
+            // comes once the writer has emptied the ring and `take.json` is
+            // down. See `crate::jam`.
+            "jname" => {
+                let name = super::export::safe_name(arg);
+                sh.jam.set_next_name(&name);
+                return format!("the next jam will be called {}.", name);
+            }
+            "jam" => {
+                if sh.jam.busy() {
+                    return "a jam is already running; `jend` it first.".into();
+                }
+                let n: usize = match arg.parse() {
+                    Ok(n) if n >= 1 && n <= sh.sources.len() => n,
+                    _ => return format!(
+                        "`jam<n>` wants a source from 1 to {}: {}.",
+                        sh.sources.len(),
+                        sh.sources
+                            .iter()
+                            .enumerate()
+                            .map(|(i, s)| format!("{}={}", i + 1, s.name))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                };
+                let src = &sh.sources[n - 1];
+                let name = sh.jam.take_next_name();
+                let dir = sh.takes_dir.join(&name);
+                return match sh.jam.start(&name, &dir, n, src.ch, sr) {
+                    Ok(()) => format!("jamming {} into {}.", src.name, dir.display()),
+                    Err(e) => e,
+                };
+            }
+            "jend" => {
+                if !sh.jam.busy() {
+                    return "nothing is jamming.".into();
+                }
+                sh.jam.stop();
+                return defer(later, Ack::Later(Box::new(move |sh: &Shared| {
+                    match sh.jam.finish(sr) {
+                        Ok((dir, frames)) => {
+                            let dropped = sh.jam.dropped();
+                            let lost = if dropped == 0 {
+                                String::new()
+                            } else {
+                                format!(" LOST {:.3} s: the disk fell behind.", dropped as f64 / sr as f64)
+                            };
+                            format!("saved the jam: {:.3} s to {}.{}", frames as f64 / sr as f64, dir.display(), lost)
+                        }
+                        Err(e) => e,
+                    }
+                })));
+            }
             "cend" => {
                 if !sh.capture.is_on() {
                     return "nothing is capturing.".into();

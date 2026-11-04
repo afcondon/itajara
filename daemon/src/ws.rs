@@ -414,6 +414,11 @@ fn rig_json(sh: &Shared, sr: u32, alive: bool) -> String {
             // still waiting for the bar line it was told to start on. Nothing here has a phase, a
             // layer, a length or an undo — see `crate::capture`.
             r#""capture":{{"on":{},"src":{},"frames":{},"secs":{:.4},"capSecs":{:.1},"full":{},"armed":{},"stopAt":{},"holds":{},"waits":{}}},"#,
+            // **The jam**: a long recording going to disk as it is made. How
+            // far in, how far the disk is behind, and the two things it says
+            // loudly — frames lost, and a file that reached what a WAV can
+            // hold. See `crate::jam`.
+            r#""jam":{{"on":{},"src":{},"name":"{}","secs":{:.3},"behindSecs":{:.3},"droppedSecs":{:.3},"full":{}}},"#,
             r#""loops":[{}]}}"#
         ),
         sh.max_layers,
@@ -493,6 +498,13 @@ fn rig_json(sh: &Shared, sr: u32, alive: bool) -> String {
         sh.capture.stop_at(),
         sh.capture.holds(),
         sh.capture.waiting(),
+        sh.jam.is_on(),
+        sh.jam.source(),
+        sh.jam.name(),
+        sh.jam.frames() as f64 / sr as f64,
+        sh.jam.behind() as f64 / sr as f64,
+        sh.jam.dropped() as f64 / sr as f64,
+        sh.jam.full(),
         each.join(","),
     )
 }
@@ -647,6 +659,7 @@ mod tests {
         {
             let v: serde_json::Value = serde_json::from_str(&rig_json(&sh, 48_000, true)).unwrap();
             assert_eq!(keys(&v["capture"].to_string()), declared("Capture"), "Capture");
+            assert_eq!(keys(&v["jam"].to_string()), declared("Jam"), "Jam");
         }
         assert_eq!(keys(&loop_json(&sh, 0, 48_000, cur)), declared("LoopState"), "LoopState");
         assert_eq!(keys(&layer_json(&sh.lp(0).layers[0])), declared("LayerShape"), "LayerShape");
@@ -692,7 +705,7 @@ mod tests {
             "calibrated", "k", "audioAlive", "deviceLost", "reopens", "ack", "ackSeq",
             "linkTempo", "linkQuantum", "linkBarFrames", "linkAnchors", "linkRejected",
             "barFrames", "barOrigin", "launchQ", "maxSecs", "fixedSecs", "ringSecs",
-            "selected", "nLoops", "sources", "capture", "loops",
+            "selected", "nLoops", "sources", "capture", "jam", "loops",
         ];
         expected.sort_unstable();
         assert_eq!(keys, expected);

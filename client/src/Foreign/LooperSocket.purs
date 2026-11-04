@@ -23,6 +23,7 @@ module Foreign.LooperSocket
   , connect
   , send
   , Capture
+  , Jam
   , latest
   , latestPeaks
   , status
@@ -138,6 +139,25 @@ phaseOf st = case st.state of
 -- | no phase, no layer, no length, no undo, no alternates, no grid. The
 -- | Workshop drove loop 7 for this and spent three verbs turning the looper
 -- | off to do it — see the daemon's `capture` module for what that cost.
+-- | **A jam**: a long recording that goes to disk as it is made (the daemon's
+-- | `jam`, `jend`, `jname`). Not a capture: no head trim, no count, no
+-- | picture; a source, a name, a start and a stop.
+type Jam =
+  { on :: Boolean
+  -- | Which source, 1-based, or zero for none yet.
+  , src :: Int
+  -- | The take it is going into, or the last one.
+  , name :: String
+  , secs :: Number
+  -- | Recorded and not yet on disk. Near zero; growing means the disk is slow.
+  , behindSecs :: Number
+  -- | **Lost**, because the disk fell a whole ring behind. Said for the rest
+  -- | of the jam, because the file is that much shorter than the time played.
+  , droppedSecs :: Number
+  -- | The file reached what a WAV can hold, and the jam stopped itself.
+  , full :: Boolean
+  }
+
 type Capture =
   { on :: Boolean
   -- | Which source, 1-based, or zero for none yet.
@@ -229,6 +249,7 @@ type LooperState =
   -- | -32 for both.
   -- | **Recording that is not looping.** See `Capture`.
   , capture :: Capture
+  , jam :: Jam
   , sources :: Array { name :: String, mono :: Boolean, available :: Boolean, db :: Number }
   -- | The loop a console verb with no loop digit addresses. Once also the
   -- | loop whose fields were repeated at this level; now only that, and no

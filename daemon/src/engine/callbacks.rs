@@ -479,6 +479,10 @@ pub(super) fn input(
     // coupling — see `crate::capture`.
     sh.capture.take(data, in_channels, base);
 
+    // **The jam, if there is one**: the same bargain as the capture, a copy
+    // into a ring that a writer thread drains to disk. See `crate::jam`.
+    sh.jam.take(data, in_channels);
+
     // A level-armed loop is *listening*, not recording — it is not
     // `recording_loop()` and nothing below will write for it. What it
     // needs is the frame the sound crossed the threshold, found here

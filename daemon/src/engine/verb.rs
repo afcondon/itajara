@@ -143,6 +143,11 @@ pub(crate) const VERBS: &[Verb] = &[
     Verb { word: "cbars", arg: Arg::Int },
     Verb { word: "cpk", arg: Arg::Int },
     Verb { word: "cw", arg: Arg::Name },
+    // **Jam: a long recording that goes to disk as it is made.** Rig-wide,
+    // like the capture. See `crate::jam`.
+    Verb { word: "jam", arg: Arg::Int },
+    Verb { word: "jend", arg: Arg::None },
+    Verb { word: "jname", arg: Arg::Name },
     // Rig-wide, and the console's readouts.
     Verb { word: "k", arg: Arg::Flag },
     Verb { word: "m", arg: Arg::Flag },

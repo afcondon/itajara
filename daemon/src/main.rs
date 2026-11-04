@@ -8,6 +8,7 @@
 mod align;
 mod aggregate;
 mod capture;
+mod jam;
 mod devices;
 mod engine;
 mod ws;

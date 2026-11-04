@@ -231,6 +231,14 @@ data Verb
   | CaptureBars Int
   | CapturePeaks Int
   | WriteCapture String
+  -- | **Jam: a long recording that goes to disk as it is made.** Rig-wide,
+  -- | like the capture, and independent of it. `NameJam` names the next one
+  -- | (it becomes the take's directory); `Jam src` starts one from source
+  -- | `src`, 1-based; `EndJam` stops it, and the ack comes once the file and
+  -- | its `take.json` are down.
+  | NameJam String
+  | Jam Int
+  | EndJam
 
   -- | Copy another loop's layers onto this one — all of them, or one, by the
   -- | number the slot shows (from one, like `LayerOn`). Onto an empty loop
@@ -428,6 +436,9 @@ render = case _ of
   CaptureBars n -> "cbars" <> show n
   CapturePeaks n -> "cpk" <> show n
   WriteCapture name -> "cw" <> name
+  NameJam name -> "jname" <> name
+  Jam src -> "jam" <> show src
+  EndJam -> "jend"
   CopyLoop src -> "cp" <> show src
   CopyLayer src k -> "cp" <> show src <> "l" <> show k
   LayerWindow k i o -> "lw" <> show k <> ":" <> show i <> ":" <> show o

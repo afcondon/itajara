@@ -300,6 +300,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         in_dc: (0..sources.len() * CHANNELS).map(|_| AtomicU32::new(0)).collect(),
         sources,
         capture: crate::capture::Capture::new((opts.capture_secs * sr_f).round() as usize),
+        jam: crate::jam::Jam::new(sr_f),
         loops: (0..opts.loops).map(|i| Loop::new(i, opts.layers)).collect(),
         selected: AtomicUsize::new(0),
         anchor: AtomicUsize::new(NO_ANCHOR),
@@ -497,6 +498,9 @@ pub(crate) fn idle_blocker(sh: &Shared) -> Option<String> {
     }
     if sh.capture.unsaved() {
         return Some("a capture has not been written".into());
+    }
+    if sh.jam.is_on() || sh.jam.busy() {
+        return Some("a jam is recording".into());
     }
     None
 }
