@@ -218,6 +218,55 @@ fn exporting_layers_writes_a_take_per_loop_and_one_set_manifest() {
     let _ = std::fs::remove_dir_all(&sh.takes_dir);
 }
 
+/// **A saved loop says its bars only when they are facts, and carries its
+/// mix when it has layers.** With no Link the bars are not declared, so no
+/// `tape.json`; with Link running at the loop's own tempo they are, and the
+/// file says so. A two-layer loop gets `mix/mix.wav`, named in `take.json`; a
+/// one-layer loop does not, since its one layer already is the mix.
+#[test]
+fn a_saved_loop_declares_its_bars_from_link_and_keeps_its_mix() {
+    let mut sh = rig(LEN);
+    sh.takes_dir = std::env::temp_dir().join(format!("itajara-tape-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&sh.takes_dir);
+    one_layer_loop(&sh, 0, 100, 0.25);
+    lay(&sh, 0, 1, 100, 0.5);
+    sh.lp(0).n_layers.store(2, Ordering::Release);
+    sh.lp(0).cycles.store(2, Ordering::Release);
+
+    let ack = dispatch(&sh, 48_000, "0wnolink");
+    assert!(ack.contains("with its mix"), "ack was: {}", ack);
+    assert!(!ack.contains("from Link"), "no Link, no declared bars: {}", ack);
+    let dir = sh.takes_dir.join("nolink");
+    assert!(dir.join("mix/mix.wav").exists());
+    assert!(!dir.join("tape.json").exists(), "an assumed tempo is not written down as a fact");
+    let take = std::fs::read_to_string(dir.join("take.json")).unwrap();
+    assert!(take.contains("\"mix\": \"mix/mix.wav\""), "{}", take);
+    assert!(take.trim_end().ends_with('}'), "still one JSON object: {}", take);
+
+    // Two bars of 100 frames at 48 kHz, four beats a bar: Link at that tempo.
+    let tempo = super::cycle::tempo_of(100, 2, 48_000, 4.0);
+    sh.link_tempo.store(tempo.to_bits(), Ordering::Relaxed);
+    sh.link_quantum.store(4.0f64.to_bits(), Ordering::Relaxed);
+    sh.link_anchors.store(1, Ordering::Relaxed);
+    let ack = dispatch(&sh, 48_000, "0wonlink");
+    assert!(ack.contains("2 bars at"), "ack was: {}", ack);
+    let tape = std::fs::read_to_string(sh.takes_dir.join("onlink/tape.json")).unwrap();
+    assert!(tape.contains("\"bpmFrom\": \"link\"") && tape.contains("\"bars\": 2") && tape.contains("\"beats\": 4"), "{}", tape);
+
+    // Link at another tempo: the loop is not on it, so nothing is declared.
+    sh.link_tempo.store((tempo * 0.5).to_bits(), Ordering::Relaxed);
+    let ack = dispatch(&sh, 48_000, "0wonlink");
+    assert!(!ack.contains("from Link"), "ack was: {}", ack);
+    assert!(!sh.takes_dir.join("onlink/tape.json").exists(), "and a stale tape.json is removed");
+
+    // One layer: no mix.
+    one_layer_loop(&sh, 2, 80, 0.75);
+    sh.lp(2).n_layers.store(1, Ordering::Release);
+    dispatch(&sh, 48_000, "2wsingle");
+    assert!(!sh.takes_dir.join("single/mix").exists());
+    let _ = std::fs::remove_dir_all(&sh.takes_dir);
+}
+
 /// **The write head is the play head.** Through a window, a rotation,
 /// both, and a window that reaches into silence: for every frame, where
 /// an overdub would write is where the ear was — or nowhere.

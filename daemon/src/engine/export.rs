@@ -40,7 +40,7 @@ pub(crate) fn save_take(sh: &Shared, li: usize, sr: u32, name: &str) -> Ack {
     let name = safe_name(name);
     let dir = sh.takes_dir.join(&name);
     Ack::Later(Box::new(move |sh: &Shared| {
-        let (written, loop_len) = match write_take(sh, li, sr, &dir) {
+        let (written, loop_len, said) = match write_take(sh, li, sr, &dir) {
             Ok(w) => w,
             Err(e) => return e,
         };
@@ -48,10 +48,11 @@ pub(crate) fn save_take(sh: &Shared, li: usize, sr: u32, name: &str) -> Ack {
         // app shows the other. What is saved is the loop — its layers, raw
         // — not a take; a take is the act (TAXONOMY §6, decision 5).
         format!(
-            "saved the loop: {} layer{} ({:.3} s) to {}",
+            "saved the loop: {} layer{} ({:.3} s{}) to {}",
             written,
             if written == 1 { "" } else { "s" },
             loop_len as f64 / sr as f64,
+            said,
             dir.display()
         )
     }))
@@ -72,11 +73,64 @@ struct LayerFile {
 
 /// One loop's layers, raw, into `dir`: the audio and the version-1
 /// `take.json` beside it. What `w` has always written, so a folder written
-/// by `exl` is a take that reloads like any other. Returns the count written
-/// and the loop's length.
-fn write_take(sh: &Shared, li: usize, sr: u32, dir: &std::path::Path) -> Result<(usize, usize), String> {
+/// by `exl` is a take that reloads like any other. Returns the count written,
+/// the loop's length, and a few words on what else was declared (for the ack).
+///
+/// **Two things more, since 2026-11-04**, both so a loop reaches Conspicillum
+/// and Tidal cut on its own bars without anyone typing a tempo:
+///
+/// - **`tape.json`, only when the bars are facts**: the loop plays plainly, it
+///   has a bar count, Link is running and the loop's tempo is Link's. Then the
+///   tempo, the beats to a bar and the bars are written with `bpmFrom: link`,
+///   the form `project-tape.py` takes over its own assumption. Anything less
+///   writes nothing (and removes a stale one): an assumed tempo must not be
+///   sliced as if it were declared.
+/// - **The mix, when there is more than one layer**: the resolved loop, as it
+///   sounds, at `mix/mix.wav`, named in `take.json` as `"mix"`. A rendered view
+///   of the take, not a replacement for it (the layers stay the take). In a
+///   folder of its own so SuperDirt, which reads a take's top level as its
+///   bank, still finds one `n` per layer.
+fn write_take(sh: &Shared, li: usize, sr: u32, dir: &std::path::Path) -> Result<(usize, usize, String), String> {
     let layers = write_layers(sh, li, sr, dir)?;
-    let loop_len = sh.lp(li).loop_len.load(Ordering::Acquire);
+    let lp = sh.lp(li);
+    let loop_len = lp.loop_len.load(Ordering::Acquire);
+    let mut said = String::new();
+
+    let mix_field = if layers.len() > 1 && lp.plain() {
+        match sh.render_loop(li) {
+            Some(samples) => {
+                let mix_dir = dir.join("mix");
+                std::fs::create_dir_all(&mix_dir)
+                    .and_then(|_| std::fs::write(mix_dir.join("mix.wav"), crate::wav::wav_bytes(&samples, sr, CHANNELS as u16)))
+                    .map_err(|e| format!("wrote the layers but not the mix: {}", e))?;
+                said.push_str(", with its mix");
+                ",\n  \"mix\": \"mix/mix.wav\"".to_string()
+            }
+            None => String::new(),
+        }
+    } else {
+        String::new()
+    };
+
+    let tape = dir.join("tape.json");
+    let bars = lp.cycles.load(Ordering::Acquire);
+    let link_tempo = f64::from_bits(sh.link_tempo.load(Ordering::Relaxed));
+    let quantum = f64::from_bits(sh.link_quantum.load(Ordering::Relaxed));
+    let on_link = sh.link_anchors.load(Ordering::Relaxed) > 0 && link_tempo > 0.0;
+    if bars > 0 && lp.plain() && on_link && (tempo_of(loop_len, bars, sr, quantum) - link_tempo).abs() < 0.05 {
+        let beats = if quantum >= 1.0 { quantum.round() as usize } else { 4 };
+        std::fs::write(
+            &tape,
+            format!(
+                "{{\n \"version\": 1,\n \"bpm\": {:.4},\n \"bpmFrom\": \"link\",\n \"beats\": {},\n \"bars\": {},\n \"secs\": {:.6}\n}}\n",
+                link_tempo, beats, bars, loop_len as f64 / sr as f64
+            ),
+        )
+        .map_err(|e| format!("wrote the audio but not tape.json: {}", e))?;
+        said.push_str(&format!(", {} bar{} at {:.1} bpm from Link", bars, if bars == 1 { "" } else { "s" }, link_tempo));
+    } else if tape.exists() {
+        let _ = std::fs::remove_file(&tape);
+    }
     let entries: Vec<String> = layers
         .iter()
         .map(|l| {
@@ -92,17 +146,18 @@ fn write_take(sh: &Shared, li: usize, sr: u32, dir: &std::path::Path) -> Result<
     let manifest = format!(
         concat!(
             "{{\n  \"version\": 1,\n  \"sampleRate\": {},\n",
-            "  \"loopFrames\": {},\n  \"loopSecs\": {:.6},\n  \"layers\": [\n    {}\n  ]\n}}\n"
+            "  \"loopFrames\": {},\n  \"loopSecs\": {:.6},\n  \"layers\": [\n    {}\n  ]{}\n}}\n"
         ),
         sr,
         loop_len,
         loop_len as f64 / sr as f64,
-        entries.join(",\n    ")
+        entries.join(",\n    "),
+        mix_field
     );
     if let Err(e) = std::fs::write(dir.join("take.json"), manifest) {
         return Err(format!("wrote the audio but not the manifest: {}", e));
     }
-    Ok((layers.len(), loop_len))
+    Ok((layers.len(), loop_len, said))
 }
 
 /// The audio of one loop's layers, one WAV each, into `dir`. No manifest:
