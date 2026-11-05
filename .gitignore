@@ -7,3 +7,4 @@ controllers/output/
 controllers/.spago/
 __pycache__/
 .DS_Store
+controllers/dist/

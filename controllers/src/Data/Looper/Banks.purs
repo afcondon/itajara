@@ -144,6 +144,7 @@
 -- | `ActionPress` and two presses are simply two presses.
 module Data.Looper.Banks
   ( switchChannel
+  , switchesClaim
   , loopSwitches
   , switchCC
   , Gesture(..)
@@ -202,6 +203,15 @@ import Data.Maybe (Maybe(..), fromMaybe, maybe)
 -- | The channel the MC6 uses to address the app about its own switches.
 switchChannel :: Int
 switchChannel = 9
+
+-- | The name on Helm's hub held by whoever is answering these switches.
+-- |
+-- | The looper's own process claims it while it runs; a page that could also
+-- | answer them (PWYF) reads it and stands back, so a press is acted on once.
+-- | Declared rather than inferred: the claim ends with the holder's
+-- | connection, so a process that dies hands the switches back by itself.
+switchesClaim :: String
+switchesClaim = "itajara:switches"
 
 -- | How far apart two banks' CC blocks sit. Sixteen rather than twelve so the
 -- | block boundary falls on a round number and the switch index is the low

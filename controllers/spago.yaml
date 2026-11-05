@@ -8,13 +8,27 @@ package:
     so that every page on the looper (PWYF today, Quadrat's Loop page next)
     reads one layout. Plan docs/kb/plans/quadrat-the-sampler.md, phase 3.
   dependencies:
+    - aff
     - arrays
+    - console
+    - effect
+    - either
+    - exceptions
+    - foldable-traversable
     - helm
+    - integers
     - itajara-client
     - maybe
+    - nullable
     - prelude
+    - refs
   build:
     strict: true
+  bundle:
+    module: Itajara.Controllers.Main
+    platform: node
+    type: app
+    outfile: dist/itajara-controllers.mjs
 
 workspace:
   packageSet:
