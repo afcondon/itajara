@@ -18,7 +18,8 @@
             "maybe",
             "nullable",
             "prelude",
-            "refs"
+            "refs",
+            "tuples"
           ]
         },
         "test": {

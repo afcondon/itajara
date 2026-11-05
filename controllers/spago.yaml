@@ -22,6 +22,7 @@ package:
     - nullable
     - prelude
     - refs
+    - tuples
   build:
     strict: true
   bundle:
