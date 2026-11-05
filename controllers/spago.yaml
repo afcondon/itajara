@@ -1,0 +1,26 @@
+package:
+  name: itajara-controllers
+  description: The looper on Helm's controllers — what each MC6 switch and
+    (next) each Twister encoder does to the loops, and (next) the process
+    that runs them beside Helm's hub, so the looper's feet and hands work
+    whether or not a page is open or in front. The daemon still has no word
+    for an MC6 or a Twister; this package is a surface kept in the same repo,
+    so that every page on the looper (PWYF today, Quadrat's Loop page next)
+    reads one layout. Plan docs/kb/plans/quadrat-the-sampler.md, phase 3.
+  dependencies:
+    - arrays
+    - helm
+    - itajara-client
+    - maybe
+    - prelude
+  build:
+    strict: true
+
+workspace:
+  packageSet:
+    registry: 77.13.1
+  extraPackages:
+    itajara-client:
+      path: ../client
+    helm:
+      path: ../../helm

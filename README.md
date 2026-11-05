@@ -81,16 +81,24 @@ itajara/                       github.com/afcondon/itajara, MIT
     Itajara.Surface.Wave        a layer's envelope as the loop now plays it
     Itajara.Surface.Edit        the Edit panel (window, rotation, layer windows)
     looper.css                  one rendering of the class names they draw with
+  controllers/  the looper on Helm's controllers (MC6, Twister)
+    Data.Looper.Banks           what every MC6 switch on the looper's pages does
+    Data.Looper.Layout          how many loops the controllers are laid out for
   tools/      check-verbs.py, check-snapshot.py (§9)
   docs/       TAXONOMY.md, REVIEW-daemon-debt-2026-09-05.md, this file
 ```
 
-Two consumers, checked out beside this one and reaching `client/` and
-`surface/` by path (`extraPackages` with `path: ../itajara/client`):
+Two consumers, checked out beside this one and reaching `client/`,
+`surface/` and `controllers/` by path (`extraPackages` with
+`path: ../itajara/client`). `controllers/` also needs Helm
+(`music/helm`) beside it, for the MC6 model.
 
 - **`producing-with-your-feet`** — the pedalboard app; the first consumer,
-  from which this repo was split with its history on 2026-09-04. Keeps
-  everything with feet on it: the MC6 banks, the Twister, the switchboard.
+  from which this repo was split with its history on 2026-09-04. Kept
+  everything with feet on it until 2026-11-05, when the looper's own MC6
+  pages moved to `controllers/` (plan `docs/kb/plans/quadrat-the-sampler.md`,
+  phase 3, step 3): the looper's controls are leaving PWYF for a process of
+  their own and Quadrat's Loop page, and PWYF keeps the pedals.
 - **`friends-of-itajara`** — the open-source looper for people with a
   sample-playing module and no pedalboard: one page, `?face=arbhar` first,
   Notes and Harvest panels, and a zero-dependency Node server that runs
@@ -463,6 +471,7 @@ site, and what lets Glassbox's table be replayed against the engine at all.
 cd daemon && cargo build --release && cargo test --release   # 84 tests
 cd client && spago build                                      # zero warnings
 cd surface && spago build
+cd controllers && spago build                                 # needs ../../helm
 python3 tools/check-verbs.py                                  # the vocabulary → dispatch
 python3 tools/check-snapshot.py                               # the wire → the client types (needs a running daemon)
 ```

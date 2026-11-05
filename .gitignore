@@ -3,5 +3,7 @@ client/output/
 client/.spago/
 surface/output/
 surface/.spago/
+controllers/output/
+controllers/.spago/
 __pycache__/
 .DS_Store
