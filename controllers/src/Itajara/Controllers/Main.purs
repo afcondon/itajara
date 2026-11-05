@@ -18,9 +18,12 @@
 -- | so this process, PWYF and Quadrat agree on it without talking to each
 -- | other.
 -- |
--- | Not yet: the Twister's looper pages (step 3, next), and `ShowBank` (the
--- | config page on close), which needs the MC6 session PWYF holds; it is
--- | logged as not available here.
+-- | **And the looper's pages on the Twister** (`TwisterPages`), held by the
+-- | table in `Data.Looper.TwisterHolder`: the MC6's bank, read from the same
+-- | frames PWYF reads (`Helm.MC6.Read`), says when they are the looper's.
+-- |
+-- | Not yet: `ShowBank` (the config page on close), which needs the MC6
+-- | session PWYF holds; it is logged as not available here.
 -- |
 -- | Settings, from the environment: `HUB_URL` (ws://127.0.0.1:3039),
 -- | `LOOPER_URL` (Itajara's registered address), `MC6_INPUT` (a part of the
@@ -29,6 +32,7 @@ module Itajara.Controllers.Main (main) where
 
 import Prelude
 
+import Data.Array as Array
 import Data.Either (Either(..))
 import Data.Foldable (for_, traverse_)
 import Data.Int as Int
@@ -36,6 +40,9 @@ import Data.Looper.Banks as LoopBanks
 import Data.Looper.Machine as Machine
 import Data.Looper.Press as Press
 import Data.Looper.Switchboard as Switchboard
+import Data.Looper.TwisterHolder as Holder
+import Helm.MC6.Read as Read
+import Itajara.Controllers.TwisterPages as TwisterPages
 import Data.Maybe (Maybe(..), fromMaybe)
 import Effect (Effect)
 import Effect.Aff (launchAff_, attempt)
@@ -49,7 +56,7 @@ import Helm.WebMIDI as MIDI
 import Itajara.Controllers.Env (envOr, onStop, stamp)
 
 clientName :: String
-clientName = "itajara-controllers"
+clientName = Holder.looperProcess
 
 type Process =
   { access :: MIDI.MIDIAccess
@@ -60,6 +67,7 @@ type Process =
   -- Unsubscribes the MC6 input we are listening to, if any.
   , detach :: Ref (Effect Unit)
   , mc6Match :: String
+  , pages :: Ref (Maybe TwisterPages.Pages)
   }
 
 say :: String -> Effect Unit
@@ -79,10 +87,14 @@ main = launchAff_ do
       exit1
     Right access -> do
       LooperSocket.connect looperUrl
-      p <- { access, focus: _, selectedSeen: _, detach: _, mc6Match } <$> Ref.new 0 <*> Ref.new Nothing <*> Ref.new (pure unit)
+      p <- { access, focus: _, selectedSeen: _, detach: _, mc6Match, pages: _ }
+        <$> Ref.new 0 <*> Ref.new Nothing <*> Ref.new (pure unit) <*> Ref.new Nothing
       MIDI.claimName access LoopBanks.switchesClaim
       say ("up: hub " <> hubUrl <> ", looper " <> looperUrl <> "; claimed " <> LoopBanks.switchesClaim)
       attach p
+      pages <- TwisterPages.start
+        { access, focus: p.focus, adopt: adopt p, perform: run p 0.0, say }
+      Ref.write (Just pages) p.pages
       -- The hub going and coming back, or the MC6 being replugged, arrives as
       -- port changes: listen again to whatever now matches.
       void $ MIDI.onStateChange access \_ -> attach p
@@ -110,17 +122,31 @@ onMidi :: Process -> Array Int -> Effect Unit
 onMidi p = case _ of
   [ status, ccNum, val ] | status == 0xB0 + LoopBanks.switchChannel - 1 ->
     for_ (LoopBanks.decodeSwitch LoopBanks.switchChannel ccNum val) (answer p)
+  -- Which bank the MC6 is on, from the frames it volunteers while PWYF holds
+  -- its session: the same frames and the same reading as PWYF's, so the two
+  -- agree on the looper's banks.
+  bytes | Array.head bytes == Just 0xF0 ->
+    for_ (Read.decodeReply bytes >>= Read.replyBank) \bank -> do
+      pages <- Ref.read p.pages
+      for_ pages \pg -> TwisterPages.heardBank pg bank
   _ -> pure unit
 
--- | One press, answered.
-answer :: Process -> LoopBanks.SwitchGesture -> Effect Unit
-answer p press = do
+-- | Take the daemon's selection, if it changed since we last looked, so this
+-- | process, PWYF and Quadrat agree on the loop in hand.
+adopt :: Process -> Effect Unit
+adopt p = do
   snap <- LooperSocket.latest
   for_ snap \s -> do
     seen <- Ref.read p.selectedSeen
     when (seen /= Just s.selected) do
       Ref.write s.selected p.focus
       Ref.write (Just s.selected) p.selectedSeen
+
+-- | One press, answered.
+answer :: Process -> LoopBanks.SwitchGesture -> Effect Unit
+answer p press = do
+  adopt p
+  snap <- LooperSocket.latest
   focus <- Ref.read p.focus
   let late = Press.deferralOf Press.defaultDeferral press
   say ("switch: " <> LoopBanks.slotName press.slot <> " "

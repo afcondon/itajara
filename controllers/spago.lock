@@ -15,10 +15,13 @@
             "helm",
             "integers",
             "itajara-client",
+            "js-timers",
             "maybe",
             "nullable",
+            "ordered-collections",
             "prelude",
             "refs",
+            "strings",
             "tuples"
           ]
         },
@@ -950,6 +953,7 @@
         "ordered-collections",
         "prelude",
         "refs",
+        "strings",
         "tuples"
       ]
     },

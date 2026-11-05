@@ -17,6 +17,9 @@ package:
     - foldable-traversable
     - helm
     - integers
+    - js-timers
+    - ordered-collections
+    - strings
     - itajara-client
     - maybe
     - nullable
