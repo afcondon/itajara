@@ -99,6 +99,13 @@ start cfg = do
   void $ MIDI.onStateChange cfg.access \_ -> attach p
   void $ MIDI.onClaims cfg.access (claimsChanged p)
   void $ MIDI.onWanted cfg.access (wanted p)
+  -- A screen that does not hold the Twister asks for a page (PWYF's
+  -- minimap); only the holder can turn to it.
+  void $ MIDI.onAsked cfg.access \_ by text -> do
+    s <- Ref.read p.st
+    for_ (Holder.readPageRequest text) \page -> when s.holding do
+      p.say ("twister: " <> by <> " asks for page " <> show (page + 1))
+      showPage p true page
   void $ MIDI.onRefused cfg.access \port by why ->
     cfg.say ("twister: " <> by <> " keeps " <> port <> ": " <> why)
   void $ setInterval 100 (tick p)

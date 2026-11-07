@@ -74,6 +74,7 @@ module Data.Looper.Twister
   , pagerRing
   , pagerIndex
   , pageFor
+  , pageShown
   , pageTone
   , pageStep
   , tones
@@ -97,7 +98,7 @@ import Data.Looper.Layout (nLoops)
 import Data.Looper.Machine (Rig)
 import Data.Maybe (Maybe(..), fromMaybe, isJust, maybe)
 import Data.Tuple (Tuple(..))
-import Helm.Twister (Knob, encodersPerLayer)
+import Helm.Twister (Knob, colour, encodersPerLayer)
 import Foreign.LooperSocket (LayerShape, LoopPhase(..), LoopState, allPhases, phaseName, phaseOf)
 
 -- | A parameter an encoder can hold.
@@ -1409,6 +1410,17 @@ pageTone p = case p `mod` pages' of
   1 -> Violet
   2 -> Yellow
   _ -> Blue
+
+-- | **Which page a message sent to the Twister shows**, read back from the
+-- | pager's colour (`pageTone`): the one indicator that is written on every
+-- | page turn, by hand or not. The pager's *ring* is not: turned by hand it
+-- | is the knob's own, and nobody writes it. For a screen that watches what
+-- | the holder sends (`Helm.WebMIDI.watchPort`) rather than holding the
+-- | device. `Nothing` for every other message.
+pageShown :: Array Int -> Maybe Int
+pageShown bytes = Array.find
+  (\p -> bytes == colour { layer: 0, index: pagerIndex } (hue (pageTone p)))
+  (Array.range 0 (pages' - 1))
 
 -- | How far the encoder turns for one page.
 -- |

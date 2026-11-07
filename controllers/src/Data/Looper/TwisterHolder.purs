@@ -23,12 +23,17 @@ module Data.Looper.TwisterHolder
   ( loopBankBase
   , looperHoldsBank
   , looperProcess
+  , pageRequest
+  , readPageRequest
   ) where
 
 import Prelude
 
 import Data.Array as Array
+import Data.Int as Int
 import Data.Looper.Duty (allSlots)
+import Data.Maybe (Maybe)
+import Data.String as Str
 
 -- | The wire number of the first of the looper's MC6 banks (the device shows
 -- | it as one more: bank 3). The looper's banks follow it, one per
@@ -45,3 +50,13 @@ looperHoldsBank bank = bank >= loopBankBase && bank < loopBankBase + Array.lengt
 -- | Twister to when the looper should hold it.
 looperProcess :: String
 looperProcess = "itajara-controllers"
+
+-- | **Asking the holder for a page** (`Helm.WebMIDI.askHolder`): a screen that
+-- | does not hold the Twister asks whoever does to show the looper's page `n`
+-- | (from 0, as `Data.Looper.Twister` counts them). The hub relays the text
+-- | and does not read it, so both ends read and write it here.
+pageRequest :: Int -> String
+pageRequest n = "page " <> show n
+
+readPageRequest :: String -> Maybe Int
+readPageRequest text = Str.stripPrefix (Str.Pattern "page ") text >>= Int.fromString
