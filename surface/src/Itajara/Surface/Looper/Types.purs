@@ -5,9 +5,13 @@
 module Itajara.Surface.Looper.Types
   ( LooperPanel(..)
   , LogLine
+  , pushLog
   ) where
 
 import Prelude
+
+import Data.Array as Array
+import Data.Maybe (Maybe(..))
 
 -- | Which of the Looper page's reference panels is open, if any.
 -- |
@@ -27,3 +31,17 @@ derive instance Eq LooperPanel
 
 -- | One line of the looper log.
 type LogLine = { text :: String, times :: Int }
+
+-- | Add a line to the log, newest first, collapsing an immediate repeat into
+-- | a count and keeping the newest sixty.
+-- |
+-- | **Here, beside the type, so every app with a Looper page collapses the
+-- | same way.** A repeat is two presses and has to say so, but not twice as
+-- | loudly; and the rule for what counts as "the same press" is one a second
+-- | copy would come to disagree with. (PWYF's `Engine.pushLooperLog` is the
+-- | rule this was copied from, and could call this.)
+pushLog :: String -> Array LogLine -> Array LogLine
+pushLog text lines = case Array.uncons lines of
+  Just { head, tail } | head.text == text ->
+    Array.cons (head { times = head.times + 1 }) tail
+  _ -> Array.take 60 (Array.cons { text, times: 1 } lines)

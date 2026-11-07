@@ -69,3 +69,672 @@
 .loop-wave { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
 .loop-wave path { fill: #3a7d6c; }
 .loop-layer-on { flex: 0 0 auto; width: 12px; height: 12px; margin: 0; align-self: center; accent-color: #3a7d6c; cursor: pointer; }
+
+/* ── The Looper page, whole (Itajara.Surface.Looper.*) ─────────────────────
+   Copied from producing-with-your-feet's static/index.html (its "Looper"
+   section) on 2026-11-07, when Quadrat's Loop page began drawing the same
+   page. Rules already above were left out rather than repeated, as were the
+   MC6 footswitch cards, which only PWYF draws. PWYF keeps its own copy for
+   now; its custom properties carry PWYF's values as fallbacks here, so a page
+   that defines none of them still reads. Everything below is scoped by a
+   looper-, loop(s)-, twister-, board-sim, recipe, face-tab, tone- or mark-
+   class, none of which the Friend draws, so it changes nothing there. */
+
+
+/* Was 720px, from when this page was a single narrow column of readouts. The
+   pedal face needs its own half, but not the whole of a 2000px monitor —
+   knobs stretched across a metre are no easier to read than knobs that fit. */
+.looper-view {
+  padding: 24px 32px;
+  max-width: 1440px;
+}
+
+.looper-view h2 {
+  font-size: 16px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-muted, #666);
+  margin: 0 0 20px;
+}
+
+/* Connection state is the first thing to read: every control below is a lie
+   if the daemon is not there, so it is stated before any of them. */
+.looper-conn {
+  font-size: 13px;
+  margin: 0 0 20px;
+  padding: 8px 12px;
+  border-radius: 4px;
+  border-left: 3px solid transparent;
+}
+
+/* Kept, unused in the ordinary case: `connectionLine` renders nothing at all
+   while the socket is healthy, so this only ever styles the failure. */
+.looper-conn.ok {
+  color: var(--fg-muted, #666);
+  border-left-color: #4a9a5e;
+  background: rgba(74, 154, 94, 0.06);
+}
+
+.looper-conn.down {
+  color: #9a4a4a;
+  border-left-color: #9a4a4a;
+  background: rgba(154, 74, 74, 0.06);
+  font-family: 'SF Mono', 'Menlo', monospace;
+  font-size: 12px;
+}
+
+.looper-transport {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+}
+
+.looper-btn {
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 12px 22px;
+  min-width: 150px;
+  border: 1px solid var(--border, #ddd);
+  border-radius: 4px;
+  background: var(--bg-panel, #fff);
+  color: var(--fg, #1a1a1a);
+  cursor: pointer;
+}
+
+.looper-btn:hover:not(:disabled) { background: var(--bg-hover, #f0f0f0); }
+.looper-btn:disabled { opacity: 0.35; cursor: default; }
+
+.looper-btn.small {
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 400;
+  padding: 12px 16px;
+}
+
+/* Recording is the one state that must be unmistakable across a room, with a
+   guitar on, without reading anything.
+   The :hover selector above outranks a plain .recording — one class plus two
+   pseudo-classes against two classes — so hovering masked the recording state,
+   which is precisely the moment the pointer is resting on the button you just
+   pressed. Naming the hover case explicitly is the fix; raising specificity by
+   accident would not have stayed fixed. */
+.looper-btn.recording,
+.looper-btn.recording:hover:not(:disabled) {
+  background: #c0392b;
+  border-color: #a5301f;
+  color: #fff;
+}
+
+.looper-hint {
+  font-size: 12px;
+  color: var(--fg-muted, #666);
+  margin-left: auto;
+}
+
+/* ── The page head, and the three things you look up ───────────────────────
+   The Itajara donut used to sit in a right-hand column here — the Hylograph
+   pedal face, handsome and describing a machine this page had outgrown: it
+   drew twelve CC knobs while the surface underneath had become eight loops,
+   a tape mode and a Twister. It was removed 2026-08-27 rather than updated,
+   because the loops ARE the display; a second picture of the same engine can
+   only be a slower one that sometimes disagrees.
+
+   What is left is one column, and three buttons that open what used to crowd
+   it. */
+/* ── The status strip ─────────────────────────────────────────────────────
+   What stands where a heading saying LOOPER and a band saying "connected"
+   used to. The nav already names the page and a socket that is open all day
+   is worth nothing; what you actually look up is the rig's state, and it was
+   previously only reachable by opening two panels and reading three encoders.
+
+   Label small and quiet above, value large and dark below — the reading is
+   the thing, the label only says which reading it is. */
+.looper-status {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 24px; flex-wrap: wrap; margin: 0 0 20px;
+  border-bottom: 1px solid #ded9d1; padding-bottom: 14px;
+}
+.looper-status-row {
+  display: flex; align-items: flex-start; gap: 28px; flex-wrap: wrap;
+}
+.looper-reading { display: flex; flex-direction: column; gap: 2px; }
+.looper-reading-label {
+  font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase;
+  color: #a39a8c; font-weight: 500;
+}
+.looper-reading-value {
+  font-size: 19px; line-height: 1.15; font-weight: 600; color: #2e2b27;
+  letter-spacing: -0.01em; white-space: nowrap;
+}
+/* Only the readings that change what every other one means — no clock, no
+   bar, no daemon. A strip where everything shouts is a strip nobody reads. */
+.looper-reading.is-alarm .looper-reading-value { color: #a8442a; }
+.looper-reading.is-alarm .looper-reading-label { color: #c08a72; }
+
+.looper-help-row { display: flex; gap: 6px; padding-top: 12px; }
+
+/* ── Panels ────────────────────────────────────────────────────────────────
+   Two kinds, and the difference is load-bearing. The Twister card and the MC6
+   bank tables are READ: modal is right, because nothing is happening behind
+   them worth watching. The board simulator is DRIVEN — the way to learn what a
+   switch does is to press it and watch a loop go red — so it docks in a corner
+   with no backdrop and the page under it stays live and legible. */
+.looper-panel-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 8px 12px; border-bottom: 1px solid #ded9d1;
+}
+.looper-panel-title {
+  font-size: 11px; letter-spacing: 0.09em; text-transform: uppercase;
+  color: #3a3733; font-weight: 600;
+}
+.looper-panel-close {
+  font: inherit; font-size: 20px; line-height: 1; padding: 0 4px;
+  background: none; border: none; color: #9a948b; cursor: pointer;
+}
+.looper-panel-close:hover { color: #2e2b27; }
+
+
+/* ── Two columns: what you operate, and what tells you about it ────────────
+   The board was a corner dock for an afternoon. Seeing it open answered the
+   question: it is small enough to keep, and a control you have to summon is
+   one you will not summon with a guitar in your hands. So it is a fixture —
+   and the log goes directly beneath it, so a press and the sentence it
+   produced are in one column, cause above effect, without crossing the page. */
+.looper-body {
+  display: grid; grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 28px; align-items: start;
+}
+.looper-side { display: flex; flex-direction: column; gap: 16px; }
+.looper-side-card {
+  background: #fbfaf8; border: 1px solid #ded9d1;
+}
+.looper-side-card .looper-panel-head { padding: 7px 10px; }
+
+/* The Twister's current page: sixteen cells, four across, in a 320px column.
+   Colour rides the left edge rather than filling the cell, so a row reads as a
+   group and the word stays the thing you read. */
+.twister-card { padding: 10px 10px 11px; }
+.twister-card-title {
+  font-size: 10px; letter-spacing: .09em; text-transform: uppercase;
+  color: #857d73; margin-bottom: 8px;
+}
+.twister-card-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }
+/* The page tabs on the live card: the Twister panel's strip, tightened to fit
+   the side column (316px in the panel, ~295px here). */
+.looper-side-card .twister-tabs { margin: 0 10px; padding-top: 8px; }
+.looper-side-card .twister-tab { font-size: 11.5px; padding: 5px 7px 6px; gap: 4px; }
+.looper-side-card .twister-tab.on { background: #fbfaf8; }
+.twister-card-cell {
+  min-height: 32px; background: #fff; padding: 4px 5px;
+  border: 1px solid #e2ddd5; border-left: 3px solid #c9c2b8;
+  font-size: 10px; line-height: 1.2; color: #33302c;
+  overflow: hidden; word-break: break-word;
+}
+.twister-card-cell.is-dark { background: #f4f1ec; border-color: #eae5dd; border-left-color: #eae5dd; }
+
+/* Narrow on purpose: at page width the twelve switches were three columns of
+   near-empty box with a word in the corner, which is the white space that made
+   this worth moving. In a 320px column the same grid is dense. */
+.looper-side-card .board-sim { border: 0; margin: 0; padding: 10px; background: transparent; }
+.looper-side-card .board-sim-head { margin-bottom: 6px; }
+.looper-side-card .board-sim-rows { gap: 4px; }
+.looper-side-card .board-sim-row { gap: 4px; }
+.looper-side-card .board-sim-fs3x { gap: 8px; margin-top: 6px; }
+.looper-side-card .board-sim-fs3x .board-sim-row { gap: 4px; }
+.looper-side-card .board-sim-tap { min-height: 0; padding: 3px 5px; gap: 0; }
+.looper-side-card .board-sim-key.is-blank { min-height: 0; padding: 6px 0; }
+.looper-side-card .board-sim-label { font-size: 11px; line-height: 1.1; }
+.looper-side-card .board-sim-letter { font-size: 9px; }
+.looper-side-card .board-sim-extra { font-size: 9px; padding: 0 4px; }
+
+/* ── The log ───────────────────────────────────────────────────────────────
+   Newest first, because the question is always "what did I just do", and
+   reading down is then reading backwards in time. Capped in `Engine.logLimit`
+   and scrolled here, so a long session cannot make the column taller than the
+   loops it sits beside. */
+.looper-log {
+  list-style: none; margin: 0; padding: 6px 10px 10px;
+  max-height: 320px; overflow-y: auto;
+  font-size: 12px; line-height: 1.45; color: #4a453f;
+}
+.looper-log-line {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  padding: 3px 0; border-bottom: 1px solid #f0ede7;
+}
+.looper-log-line:last-child { border-bottom: 0; }
+/* The newest is the one you are looking for, so it is the one that is dark. */
+.looper-log-line:first-child { color: #2f2b27; font-weight: 500; }
+.looper-log-times {
+  font-size: 10px; color: #a09a92; font-variant-numeric: tabular-nums;
+  flex: none;
+}
+.looper-log-empty {
+  margin: 0; padding: 8px 10px 12px; font-size: 12px; color: #a09a92;
+}
+
+@media (max-width: 1000px) {
+  .looper-body { grid-template-columns: 1fr; }
+  .looper-side { flex-direction: row; flex-wrap: wrap; }
+  .looper-side-card { flex: 1 1 300px; }
+}
+
+/* The MC6 starter bank, and the button that writes it. Sits below the
+   transport because you program it once and then rarely look again. */
+/* ── Six-loop display ──────────────────────────────────────────────────────
+   The grid mirrors the MC6: three across, two down, A-F. Restrained on
+   purpose — this is glanced at from standing height while playing, so it
+   carries state and structure and nothing decorative. */
+
+.looper-face-toggle { display: flex; gap: 0; margin: 0 0 18px 0; }
+.face-tab {
+  font: inherit; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
+  padding: 6px 14px; background: transparent; cursor: pointer;
+  border: 1px solid #d8d4cc; border-right-width: 0; color: #6d6862;
+}
+.face-tab:last-child { border-right-width: 1px; }
+.face-tab.on { background: #3a7d6c; border-color: #3a7d6c; color: #fff; }
+
+/* A once-a-session calibration of the room, sitting with the transport rather
+   than on a performance surface. */
+.looper-arm {
+  display: inline-flex; align-items: center; gap: 8px; margin-left: 14px;
+  font-size: 12px; color: #6b6459;
+}
+.looper-arm input[type=range] { width: 120px; accent-color: #3a7d6c; }
+.looper-arm-value {
+  font-variant-numeric: tabular-nums; min-width: 62px; color: #4a453d;
+}
+
+/* ── The Twister's layout, at the foot of the Looper page ──────────────────
+   A reference rather than a control: read once, learn the page, stop looking.
+   Folded shut by default, and laid out four-by-four because that is how the
+   device is laid out — any other arrangement would be a second mapping to hold
+   in your head while using the first. */
+/* No longer its own disclosure — the panel that holds it is the disclosure,
+   and a card you have to open twice is a card you do not open. */
+.twister-map { margin: 0; }
+/* Only rendered when the app and the device disagree, or there is no device —
+   so it is a warning, and looks like one. */
+.twister-map-status {
+  font-size: 12px; color: #8a5a2b; background: #fdf6ec;
+  border-left: 3px solid #d9a441; padding: 6px 10px; margin: 0 0 14px;
+}
+.twister-map-body { padding-top: 0; }
+.twister-map-caveat {
+  max-width: 78ch; font-size: 11px; line-height: 1.5; color: #a39a8c;
+  font-style: italic; margin: 16px 0 0;
+}
+
+/* ── Recipes ──────────────────────────────────────────────────────────────
+   A sequence you can follow without leaving the page, because leaving the page
+   throttles it and the looper stops answering the Twister. Numbered, because
+   the order is the whole content. */
+.recipes { display: flex; flex-direction: column; gap: 22px; }
+.recipe h4 {
+  margin: 0 0 3px; font-size: 15px; font-weight: 600; letter-spacing: 0.01em;
+}
+.recipe-why {
+  margin: 0 0 8px; font-size: 11.5px; line-height: 1.45; color: #857d70;
+  max-width: 68ch;
+}
+.recipe-steps {
+  margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 5px;
+}
+.recipe-steps li { font-size: 12.5px; line-height: 1.35; }
+/* Which page the control is on, set apart so the eye can run down the column
+   of them without reading the sentences. */
+.recipe-at {
+  display: inline-block; min-width: 52px; font-size: 10px;
+  letter-spacing: 0.06em; text-transform: uppercase; color: #a39a8c;
+}
+.recipe-act { color: #2e2b27; }
+/* Quoted from an ack the daemon really sends — this is what makes the list a
+   test script and not only a manual. */
+.recipe-expect {
+  display: block; margin: 2px 0 0 52px; font-size: 11px; line-height: 1.4;
+  color: #4a9a52; font-style: italic;
+}
+.recipe-note {
+  margin: 8px 0 0; font-size: 11.5px; line-height: 1.5; color: #6b6459;
+  border-left: 2px solid #ded9d1; padding-left: 10px; max-width: 68ch;
+}
+
+/* The pages, as a strip of tabs: which page is showing, and the way to the
+   other one. It is also a readout — turning the pager moves the highlight — so
+   the current tab is a span, not a disabled button. */
+.twister-tabs {
+  display: flex; gap: 2px; margin: 0 0 12px;
+  border-bottom: 1px solid #ded9d1;
+}
+.twister-tab {
+  font: inherit; font-size: 12.5px; line-height: 1.2;
+  padding: 6px 12px 7px; margin-bottom: -1px;
+  display: inline-flex; align-items: baseline; gap: 7px;
+  background: transparent; border: 1px solid transparent; border-bottom: none;
+  color: #6b6459; cursor: pointer;
+}
+.twister-tab:hover { color: #2e2b27; background: #f5f2ed; }
+.twister-tab.on {
+  background: #fff; border-color: #ded9d1; color: #2e2b27;
+  font-weight: 600; cursor: default;
+}
+.twister-tab-num {
+  font-size: 10px; letter-spacing: 0.08em; color: #a39a8c; font-weight: 500;
+}
+.twister-tab.on .twister-tab-num { color: #4a9a52; }
+
+/* Tightened with the preamble. These are the last prose on the card and they
+   earn their place — they say what a page is FOR, which no cell can — but at
+   52ch they wrapped to four lines each and that is four rows of grid gone. */
+.twister-page-note {
+  margin: 0 0 8px; font-size: 11.5px; line-height: 1.45; color: #857d70;
+  max-width: 68ch;
+}
+
+/* Four across, four down. Cells keep a common height here — unlike the loop
+   slots, where a taller cell means more layers, these are all the same kind of
+   thing and a ragged grid would just be harder to scan. */
+.twister-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;
+}
+.twister-cell {
+  border: 1px solid #ded9d1; background: #fbfaf8; padding: 7px 8px 8px;
+  display: flex; flex-direction: column; gap: 3px; min-height: 74px;
+}
+.twister-cell.is-empty { background: transparent; border-style: dashed; opacity: 0.4; }
+.twister-cell-head { display: flex; align-items: center; gap: 6px; }
+.twister-cell-name {
+  font-size: 12px; font-weight: 600; line-height: 1.15; flex: 1;
+}
+.twister-cell-line { font-size: 10.5px; line-height: 1.35; color: #6b6459; }
+.twister-cell-verb {
+  display: inline-block; min-width: 34px; color: #a39a8c;
+  letter-spacing: 0.04em; text-transform: uppercase; font-size: 9px;
+}
+.twister-cell-shows {
+  font-size: 10px; line-height: 1.3; color: #a39a8c; font-style: italic;
+  margin-top: auto; padding-top: 3px;
+}
+
+/* The tones are what the app ASKS the device for. Nobody has compared them
+   with what it does, which is why the card says so in words as well.
+
+   These seven hexes are also in `Data.Looper.Twister.swatch`, which is where
+   the printed sheet gets them — a document opened in its own tab cannot reach
+   this stylesheet. Keep the two in step; the shared `Tone` guarantees that a
+   colour cannot go missing from either, not that they agree on which one. */
+.twister-swatch {
+  width: 10px; height: 10px; border-radius: 50%; display: inline-block;
+  flex: 0 0 auto; border: 1px solid rgba(0,0,0,0.15);
+}
+.tone-red     { background: #c0392b; }
+.tone-orange  { background: #d97b28; }
+.tone-yellow  { background: #d9b526; }
+.tone-green   { background: #4a9a52; }
+.tone-teal    { background: #3a9d92; }
+.tone-blue    { background: #3a72b8; }
+.tone-violet  { background: #8a5fb0; }
+.tone-off     { background: #efece7; }
+
+.twister-phases { margin-top: 14px; }
+.twister-phases h4 {
+  margin: 0 0 8px; font-size: 12px; font-weight: 600;
+  letter-spacing: 0.06em; text-transform: uppercase; color: #6b6459;
+}
+.twister-phase-row { display: flex; flex-wrap: wrap; gap: 6px 18px; }
+.twister-phase {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11.5px; color: #4a453d;
+}
+
+/* Cells align at the TOP, not stretched to a common height. A loop with four
+   layers is a taller object than a loop with one, and saying so is the whole
+   point of drawing layers as rows. */
+/* Four across, two down — the Twister's own top half, and the shape an MC8
+   would fill exactly. It was three across while the MC6 dictated the order. */
+.loops-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr);
+  gap: 12px; margin-bottom: 12px; align-items: start;
+}
+
+/* Loops 4 and 8 — the fourth column, which the MC6 is three switches too narrow
+   to hold. They were drawn dashed while that absence was the whole story.
+   It is not any more: the Grab bank reaches both, and what sets them apart now
+   is what goes IN them — a beat or a pad off the iPad, arriving on its own pair
+   of channels rather than through the pedalboard. So the edge is a colour and
+   not a dash. A dash reads as provisional; these are the two you build on.
+
+   Three sides only. `border-top-color` is the state channel — playing, armed,
+   recording — and a rule that took the whole border would silence it on
+   exactly the two loops you are watching while a grab closes. */
+.loop-slot.is-grab {
+  border-left-color: #6d7f96;
+  border-right-color: #6d7f96;
+  border-bottom-color: #6d7f96;
+}
+
+.loop-slot {
+  border: 1px solid #ded9d1; border-top: 3px solid #ded9d1;
+  padding: 10px 12px 12px; background: #fbfaf8;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.loop-slot.is-empty     { background: #f6f5f2; }
+.loop-slot.is-stopped   { border-top-color: #b9b3a9; }
+/* A stopped loop keeps its structure visible but drained of colour — it is
+   still turning, and its playhead still moves, which is what phase-locked
+   means. Hiding it would promise a restart from the top. */
+.loop-slot.is-stopped .loop-block.sounds { background: #b9b3a9; }
+.loop-slot.is-stopped .loop-playhead { opacity: 0.35; }
+.loop-slot.is-playing   { border-top-color: #3a7d6c; }
+/* Armed and recording are the two states the player must see from across the
+   room, so they take the whole edge, not just the top: an inset ring, which
+   does not move the layout. The colours keep their meanings (amber waits, red
+   writes); green stays "playing". */
+.loop-slot.is-recording { border-color: #c0392b; box-shadow: inset 0 0 0 2px #c0392b; }
+.loop-slot.is-armed     { border-color: #c8922f; box-shadow: inset 0 0 0 2px #c8922f; background: #fdf6e8; }
+/* Selected is not a state of the loop but where the next verb lands, so it is
+   drawn OUTSIDE the card, in ink: a thick ring that sits beside any state
+   colour, and the letter inverted. AC 2026-11-05: the faint green halo was too
+   subtle to find. */
+.loop-slot.is-selected  { outline: 3px solid #2e2b27; outline-offset: 3px; }
+.loop-slot.is-selected .loop-letter {
+  background: #2e2b27; color: #fbfaf8; padding: 2px 6px; border-radius: 2px;
+}
+
+/* The board, on screen, with every switch live (Component.Looper.Board).
+   Laid out as the device is — near row under your toes at the BOTTOM — so it
+   can be read against the thing on the floor without translating. */
+.board-sim {
+  border: 1px solid #ded9d1; background: #fbfaf8;
+  padding: 12px 14px 14px; margin: 14px 0;
+}
+.board-sim-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 12px; margin-bottom: 10px;
+}
+.board-sim-name {
+  font-size: 11px; letter-spacing: 0.09em; text-transform: uppercase;
+  color: #3a3733; font-weight: 600;
+}
+.board-sim-hint { font-size: 11px; color: #9a948b; }
+/* `boardRows` is already far-row-first — D E F above A B C — because the device
+   numbers from the bottom. Rendering in array order is therefore the board's
+   own order, and no CSS may quietly re-sort what the feet have learned. */
+.board-sim-rows { display: flex; flex-direction: column; gap: 6px; }
+.board-sim-row {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;
+}
+/* The two FS3X units sit under the MC6's own six, with a little air between,
+   side by side as they do on the floor: G H I left, J K L right. */
+.board-sim-fs3x { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 8px; }
+.board-sim-key { display: flex; flex-direction: column; gap: 3px; }
+.board-sim-key.is-blank {
+  border: 1px dashed #e6e2db; background: transparent;
+  min-height: 44px; display: flex; align-items: center; justify-content: center;
+}
+.board-sim-key.is-blank .board-sim-letter { color: #cfc9c0; }
+.board-sim-tap {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  width: 100%; min-height: 44px; padding: 6px 8px; cursor: pointer;
+  border: 1px solid #ccc5ba; background: #fff; text-align: left;
+  font: inherit; color: #2e2b27;
+}
+.board-sim-tap:hover { border-color: #3a7d6c; background: #f4faf8; }
+.board-sim-tap:active { background: #e7f2ee; }
+.board-sim-tap:focus-visible { outline: 2px solid #3a7d6c; outline-offset: 1px; }
+.board-sim-letter {
+  font-size: 10px; letter-spacing: 0.08em; color: #9a948b; font-weight: 600;
+}
+.board-sim-label { font-size: 13px; line-height: 1.15; }
+.board-sim-more { display: flex; flex-wrap: wrap; gap: 3px; }
+.board-sim-extra {
+  font: inherit; font-size: 10px; line-height: 1.3; cursor: pointer;
+  padding: 1px 5px; border: 1px solid #e0dbd3; background: #f6f5f2;
+  color: #6d675f;
+}
+.board-sim-extra:hover { border-color: #b48a3c; background: #fbf5e9; color: #3a3733; }
+
+.loop-head { display: flex; align-items: baseline; gap: 8px; }
+.loop-letter {
+  font-size: 20px; font-weight: 600; line-height: 1;
+  color: #2f2b27; min-width: 1.1em;
+}
+.loop-state {
+  font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: #6d6862;
+}
+.loop-slot.is-recording .loop-state { color: #c0392b; }
+.loop-slot.is-armed .loop-state { color: #c8922f; }
+.loop-layers { margin-left: auto; font-size: 11px; color: #8b857d; }
+
+/* One cycle, top to bottom one row per layer.
+   **A layer is a fixed height and the stack grows downwards.** This used to be
+   a fixed 56px with the layers flexing to share it, so overdubbing squeezed
+   every layer thinner — two layers each got half the picture, four got a
+   quarter, and the loop you had worked hardest on was the one drawn smallest.
+   The reasoning was that the grid must not move under your feet, which is worth
+   something on a stage and nothing at a desk with the screen in front of you.
+   What it cost was the ability to read a layer at all. */
+.loop-track {
+  --layer-h: 54px;
+  position: relative; min-height: var(--layer-h); background: #efece7;
+  display: flex; flex-direction: column; gap: 1px; padding: 1px; overflow: hidden;
+}
+.loop-layer { display: flex; flex: 0 0 var(--layer-h); height: var(--layer-h); gap: 1px; }
+.loop-layer.is-off .loop-block { opacity: 0.25; }
+.loop-block { height: 100%; position: relative; overflow: hidden; }
+/* The envelope is the ink and the block is the ground behind it, not the other
+   way round — a loud layer has to be *more* mark, not less, or the picture
+   reads inverted. The block keeps a tint so the structure it carries (which
+   part of the cycle this layer sounds in) survives underneath. */
+.loop-block.sounds.has-wave { background: #d3e2dc; }
+.loop-slot.is-recording .loop-block.sounds.has-wave { background: #f0d6d2; }
+.loop-slot.is-recording .loop-wave path { fill: #c0392b; }
+.loop-slot.is-stopped .loop-block.sounds.has-wave { background: #e4e1dc; }
+.loop-slot.is-stopped .loop-wave path { fill: #b9b3a9; }
+.loop-block.sounds { background: #3a7d6c; }
+.loop-block.rest   { background: repeating-linear-gradient(
+    45deg, #e2ded7, #e2ded7 3px, #eeebe6 3px, #eeebe6 6px); }
+.loop-slot.is-recording .loop-block.sounds { background: #c0392b; }
+
+/* Position comes from the snapshot; the transition only fills the 100 ms
+   between snapshots. Nothing here accumulates time — see Slots.purs for what
+   happened when something did. */
+.loop-playhead {
+  position: absolute; top: 0; bottom: 0; width: 2px;
+  background: #2f2b27; opacity: 0.85; pointer-events: none;
+}
+@media (prefers-reduced-motion: reduce) { .loop-playhead { transition: none !important; } }
+
+/* ── Level and pan, on every slot ─────────────────────────────────────────
+   Drawn rather than written, because the question these two answer is "which
+   of these is loudest" and "where is this one sitting" — comparisons across
+   the row, which a mark that vanishes at unity cannot make. The words survive
+   as the hover. */
+.loop-mix {
+  display: flex; align-items: center; gap: 8px; margin: 5px 0 0;
+}
+.loop-level {
+  flex: 1 1 auto; height: 3px; background: #ebe6df; position: relative;
+}
+.loop-level-fill {
+  position: absolute; left: 0; top: 0; bottom: 0;
+  background: #857d70;
+}
+.loop-pan {
+  flex: 0 0 46px; height: 3px; background: #ebe6df; position: relative;
+}
+/* The one position worth marking, so an off-centre tick reads as off-centre
+   without anything having to be measured. */
+.loop-pan-centre {
+  position: absolute; left: 50%; top: -2px; bottom: -2px;
+  width: 1px; background: #ded9d1;
+}
+.loop-pan-tick {
+  position: absolute; top: -3px; width: 3px; height: 9px;
+  margin-left: -1.5px; background: #857d70;
+}
+/* Selected and playing slots get the accent, so the strip belongs to the slot
+   rather than sitting on top of it. */
+.loop-slot.is-selected .loop-level-fill,
+.loop-slot.is-selected .loop-pan-tick { background: #2e2b27; }
+
+.loop-foot {
+  display: flex; justify-content: space-between;
+  font-size: 11px; color: #8b857d; font-variant-numeric: tabular-nums;
+}
+/* Three weights, not one colour.
+   The marks used to be one run of small green text joined by dots, so "1 SHOT"
+   — which changes what your foot does — read exactly like "L 50", which is a
+   fact about the stereo field. Hierarchy by contrast rather than by hue: solid
+   for the ones that change your next press, outlined for the ones changing on
+   their own, plain for the ones that are merely true. */
+.loop-marks { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+.loop-mark {
+  font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
+  font-weight: 600; line-height: 1.1; white-space: nowrap;
+}
+/* A chip too, just the quietest one. Without a boundary two adjacent plain
+   marks run together — "REV" beside "L" reads as one word "REV L" — which is
+   how the dot separators earned their keep in the first place. */
+.mark-set  { color: #8b857d; background: #f0ede8; padding: 3px 5px; }
+.mark-live { color: #3a7d6c; border: 1px solid #bcd3cb; padding: 2px 5px; }
+.mark-foot { color: #fbfaf8; background: #2f2b27; padding: 3px 5px; }
+/* A stopped loop keeps its marks legible but drained, the same as its blocks:
+   they are still true, they are just not happening. */
+.loop-slot.is-stopped .mark-set  { color: #b0aaa2; background: #f4f2ee; }
+.loop-slot.is-stopped .mark-live { color: #b9b3a9; border-color: #ded9d1; }
+.loop-slot.is-stopped .mark-foot { background: #b9b3a9; }
+
+.loops-legend {
+  display: flex; gap: 18px; font-size: 11px; color: #8b857d;
+  border-top: 1px solid #ece8e2; padding-top: 8px; margin-bottom: 22px;
+}
+.loops-warn { color: #c0392b; }
+
+.looper-muted {
+  font-size: 12px;
+  color: var(--fg-muted, #666);
+  margin: 0 0 4px;
+  line-height: 1.5;
+}
+
+/* Where we are in the cycle. Crude beside the concentric rings the design
+   wants, but it is the one thing a looper must never leave you guessing. */
+.looper-phase {
+  height: 6px;
+  background: var(--border, #ddd);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 18px;
+}
+
+.looper-phase-fill {
+  height: 100%;
+  background: var(--accent, #3a6ea5);
+  transition: width 0.1s linear;
+}
+
