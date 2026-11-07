@@ -13,9 +13,8 @@
 -- | That is the whole property; the module is otherwise the same text it was.
 -- |
 -- | `BankSlot` stays, and deliberately: the "banks" are the information
--- | architecture of the looper's controls — the loops, one loop, its config,
--- | quantise, speed, grab, pan — and the MC6 layout is one projection of that.
--- | A page with no pedal can still be organised the same way.
+-- | architecture of the looper's controls, and the MC6 layout is one
+-- | projection of that. Since 2026-11-07 there is one, the Loops bank.
 module Data.Looper.Duty
   ( BankSlot(..)
   , allSlots
@@ -60,75 +59,43 @@ import Data.Maybe (Maybe(..), fromMaybe, maybe)
 -- | The banks, as roles rather than numbers. Which MC6 bank each lands on is a
 -- | deployment question (`banks` takes a base); which bank a press came from is
 -- | not, and that is what travels in the CC.
-data BankSlot
-  = LoopBank
-  -- | One loop's verbs, whichever loop you came from. See `own LoopPage`.
-  | LoopPage
-  | ConfigBank
-  | QuantiseBank
-  | SpeedBank
-  -- | The two loops the six loop switches cannot reach, and a way to fill them
-  -- | from something that is not a guitar. See `own GrabBank`.
-  | GrabBank
-  | PanBank
+-- |
+-- | **One bank, since 2026-11-07.** There were seven — the loops, one loop's
+-- | page, its config, quantise, speed, grab and pan — and AC cut them to the
+-- | Loops bank alone ("simplify everything by removing all the other looper
+-- | banks too"). What the six others reached is on the Twister and the page.
+-- | The type stays a type, with its CC arithmetic, because the longer-term
+-- | idea is a second bank on the same channel ("our tested loop bank, plus a
+-- | second bank for less-used controls or someone's own mapping"): that is a
+-- | constructor here and a block of CCs at index 1, nothing more.
+data BankSlot = LoopBank
 
 derive instance Eq BankSlot
 derive instance Ord BankSlot
 
 allSlots :: Array BankSlot
-allSlots =
-  [ LoopBank, LoopPage, ConfigBank, QuantiseBank, SpeedBank, GrabBank, PanBank ]
+allSlots = [ LoopBank ]
 
--- | **Seven is the last one that fits.** The CC block is `16 * (index + 1)`, so
--- | Pan sits at 112 and its twelfth switch is 123 — four short of the 127 a
--- | seven-bit value stops at. An eighth bank would put switches above 128,
--- | where they stop being data and start being status bytes, and the frame
--- | carrying them would truncate. The byte-range test in `test/Main` is what
--- | would catch it, and it would catch it as a wall rather than as a warning.
+-- | The block a slot's CCs sit in: `16 * (index + 1)`. **The Loops bank is
+-- | index 0, CCs 16–27, and must stay so**: the MC6 AC has programmed sends
+-- | exactly those, and moving them would need the board rewritten.
 slotIndex :: BankSlot -> Int
 slotIndex = case _ of
   LoopBank -> 0
-  LoopPage -> 1
-  ConfigBank -> 2
-  QuantiseBank -> 3
-  SpeedBank -> 4
-  GrabBank -> 5
-  PanBank -> 6
 
 slotFromIndex :: Int -> Maybe BankSlot
 slotFromIndex = case _ of
   0 -> Just LoopBank
-  1 -> Just LoopPage
-  2 -> Just ConfigBank
-  3 -> Just QuantiseBank
-  4 -> Just SpeedBank
-  5 -> Just GrabBank
-  6 -> Just PanBank
   _ -> Nothing
 
 -- | The bank's name on the device's screen. Eight characters, like a label.
 slotName :: BankSlot -> String
 slotName = case _ of
   LoopBank -> "Loops"
-  -- Not "Loop 3". The device cannot be relabelled fast enough to track which
-  -- loop is in hand — an upload is well over a second — so the pedal names the
-  -- *page* and the computer names the loop. The standing division of labour.
-  LoopPage -> "The Loop"
-  ConfigBank -> "Loop Cfg"
-  QuantiseBank -> "Quantise"
-  SpeedBank -> "Speed"
-  GrabBank -> "Grab"
-  PanBank -> "Pan"
 
 slotId :: BankSlot -> String
 slotId = case _ of
   LoopBank -> "loops"
-  LoopPage -> "loop"
-  ConfigBank -> "config"
-  QuantiseBank -> "quantise"
-  SpeedBank -> "speed"
-  GrabBank -> "grab"
-  PanBank -> "pan"
 
 data Jump = ToSlot BankSlot | ToBoard
 
@@ -191,8 +158,6 @@ data Duty
   -- | something you go to a config bank to arrange. The mode stays visible in
   -- | Modes and on screen; this is the shortcut, not a second source of truth.
   | ArmLoop
-  -- | Deeper into the family. Labelled with the destination's own name.
-  | Enter BankSlot
   -- | Up, or out. Labelled with where it goes, so "< Config" and "< Board"
   -- | cannot drift from the jump the device was programmed with.
   | Back Jump
@@ -560,7 +525,6 @@ dutyLabel = case _ of
   OverdubLoop -> "Overdub"
   Transport -> "Stop/Go"
   ArmLoop -> "Arm"
-  Enter slot -> slotName slot
   Back (ToSlot slot) -> "< " <> shortSlot slot
   Back ToBoard -> "< Board"
   StopAll -> "Stop All"
@@ -648,8 +612,6 @@ dutyName = case _ of
   OverdubLoop -> "One more pass over it"
   Transport -> "Stop it, or set it going"
   ArmLoop -> "Start on the next note"
-  Enter ConfigBank -> "Set up this loop"
-  Enter slot -> "Set " <> slotName slot
   Back (ToSlot slot) -> "Back to " <> slotName slot
   Back ToBoard -> "Leave the looper"
   StopAll -> "Stop every loop"
@@ -857,10 +819,10 @@ stepDecay = nextRung decayLadder
 decayWord :: Number -> String
 decayWord db = fromMaybe (show (Int.round db) <> " dB") (rungWord decayLadder db)
 
+-- | A slot's name where the screen is short ("< Loops"). The same as its name
+-- | while the only bank is the Loops bank; it was "Config" for the config bank.
 shortSlot :: BankSlot -> String
-shortSlot = case _ of
-  ConfigBank -> "Config"
-  slot -> slotName slot
+shortSlot = slotName
 
 rateWord :: Number -> String
 rateWord r

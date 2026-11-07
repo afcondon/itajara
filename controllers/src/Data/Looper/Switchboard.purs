@@ -40,8 +40,8 @@ act rig p = case LB.dutiesAt p.slot p.switch of
 
     -- **All three go the same way now**, which they did not when a loop switch
     -- carried a different verb on each. A double no longer means overdub and a
-    -- hold no longer opens the config bank, because both have a switch of their
-    -- own on `LoopPage` with their name printed on it — so the gesture chooses
+    -- hold no longer opens the config bank (gone since 2026-11-07), because
+    -- the verbs have switches and encoders of their own — so the gesture chooses
     -- which duty the switch is showing, and the duty decides everything else.
     -- The MC6 always speaks about the focused loop: six switches cannot name
     -- eight loops as well as saying what to do to one.

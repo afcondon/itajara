@@ -22,8 +22,8 @@
 -- | table in `Data.Looper.TwisterHolder`: the MC6's bank, read from the same
 -- | frames PWYF reads (`Helm.MC6.Read`), says when they are the looper's.
 -- |
--- | Not yet: `ShowBank` (the config page on close), which needs the MC6
--- | session PWYF holds; it is logged as not available here.
+-- | Not here: `ShowBank`, which needs the MC6 session PWYF holds; it is logged
+-- | as not available. (Nothing produces it since the config bank went.)
 -- |
 -- | Settings, from the environment: `HUB_URL` (ws://127.0.0.1:3039),
 -- | `LOOPER_URL` (Itajara's registered address), `MC6_INPUT` (a part of the

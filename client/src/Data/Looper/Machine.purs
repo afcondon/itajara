@@ -61,8 +61,8 @@ data Action
   = Command String
   -- | Ask the MC6 to show a bank. A courtesy: audio never waits on it.
   | ShowBank BankSlot
-  -- | Remember which loop was last touched, so the config bank knows its
-  -- | subject. App state, not the machine's.
+  -- | Remember which loop was last touched, so the toolbar and the Twister
+  -- | know their subject. App state, not the machine's.
   | Focus Int
   -- | Understood, and impossible for a stated reason.
   | Unavailable String
@@ -93,7 +93,7 @@ type Rig =
   -- | asks for fewer layers than there are, and `perform` spends the
   -- | difference in `Undo`. Guessing low deletes take.
   , maxLayers :: Int
-  -- | The loop the config bank acts on: the last one touched.
+  -- | The loop the focused duties act on: the last one touched.
   , focus :: Int
   -- | The metronome and input monitoring. Global in the engine rather than per
   -- | loop, and addressed without a leading digit.
@@ -229,7 +229,6 @@ perform rig subject = case _ of
 
   -- Navigation the MC6 performs itself, from the jumps it was programmed with.
   -- The app only has to agree that it happened.
-  Duty.Enter to -> [ Handled ("showing " <> slotWord to) ]
   Duty.Back _ -> [ Handled "out" ]
 
   -- Stop all, as six commands rather than one. There is no all-loops form in
@@ -398,9 +397,10 @@ perform rig subject = case _ of
   -- Nothing here is conditional on what the loop holds: `g1` and the source go
   -- out only when the snapshot says they are not already true, `len` on a loop
   -- already that long changes nothing, and `r` on a loop with material is an
-  -- overdub. So there is no branch to get wrong — but see `own GrabBank` on
-  -- why the second machine belongs in the *other* grab loop rather than as a
-  -- layer over the first.
+  -- overdub. So there is no branch to get wrong. A second machine belongs in
+  -- the *other* grab loop rather than as a layer over the first: an overdub
+  -- starts at the play head, not on a bar line (measured 2026-08-30), so a
+  -- pattern longer than a bar comes back rotated.
   Duty.Grab bars ->
     [ Command (Verb.render (Verb.Playing true)) ]
       <> onGrid rig i
@@ -524,25 +524,10 @@ perform rig subject = case _ of
   is field = maybe false field (loopAt rig i)
 
 
--- | Whether closing a loop should send the board to the config bank.
--- |
--- | The plan wants this, and calls it the only genuinely app-driven bank change
--- | — only the app knows a press was the *second* one. It is also the one thing
--- | here that has been actively unpleasant in use, and the reason is worth
--- | keeping rather than fixing quietly:
--- |
--- | **A courtesy that lands somewhere useless is not a courtesy.** With the
--- | config bank unwired, closing a loop moved the board to a page where every
--- | switch answers "not wired yet" — so the next thing the player does with
--- | their foot does nothing, after every single loop they record. The MC6's own
--- | "< Loops" switch is the way back, which is fine once you know and baffling
--- | until you do.
--- |
--- | Off until the config bank does something. Deliberately a flag with an
--- | explanation rather than deleted code: the behaviour is right, its
--- | precondition simply is not met yet.
-jumpToConfigOnClose :: Boolean
-jumpToConfigOnClose = false
+-- | **Closing a loop no longer sends the board anywhere.** It could, behind a
+-- | flag (`jumpToConfigOnClose`, off): the plan wanted closing a loop to show
+-- | the config bank. The config bank went on 2026-11-07 with the other six, so
+-- | the flag went with it.
 
 -- | Record: open a take, close one, or take back a wait.
 -- |
@@ -560,8 +545,7 @@ onRecord i = case _ of
     -- Writing now: close it. Asked first because these are claims about what is
     -- happening at this instant, and they outrank what is stored.
     | Looper.isWriting st ->
-        Array.cons (Command (cmd i Verb.Record))
-          (if jumpToConfigOnClose then [ ShowBank ConfigBank ] else [])
+        [ Command (cmd i Verb.Record) ]
 
     -- Waiting for a sound that may never come. A press has to be able to take
     -- that back, or a listening loop holds the one converter the rig has and
@@ -711,12 +695,6 @@ sourced rig i = case loopAt rig i, Array.findIndex (_ == rig.grabSource) rig.sou
 slotWord :: BankSlot -> String
 slotWord = case _ of
   LoopBank -> "loops"
-  LoopPage -> "the loop"
-  ConfigBank -> "config"
-  QuantiseBank -> "quantise"
-  SpeedBank -> "speed"
-  GrabBank -> "grab"
-  PanBank -> "pan"
 
 -- | One line about what an action did, for the display and the log.
 -- |

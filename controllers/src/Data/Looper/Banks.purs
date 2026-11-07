@@ -1,10 +1,11 @@
 -- | The MC6 banks for the six-loop looper, and the namespace they speak in.
 -- |
 -- | This is the build-time artifact of `itajara-in-atlantis` §"The MC6 is a
--- | keyboard": one bank per `BankSlot`, generated here and uploaded once — seven
--- | of them, which is as many as the CC arithmetic below has room for. Nothing
--- | rewrites
--- | them live, because relabelling a switch costs a preset upload of well over
+-- | keyboard": one bank per `BankSlot`, generated here and uploaded once. There
+-- | were seven, as many as the CC arithmetic below has room for; since
+-- | 2026-11-07 there is one, the Loops bank (AC: "simplify everything by
+-- | removing all the other looper banks too"), with room left for a second on
+-- | the same channel. Nothing rewrites them live, because relabelling a switch costs a preset upload of well over
 -- | a second and the state of a loop changes faster than that. What each loop
 -- | is doing is shown on the computer; the MC6 supplies twelve labelled places
 -- | to put a foot.
@@ -161,7 +162,6 @@ module Data.Looper.Banks
   , loopRows
   , switchLoops
   , grabLoops
-  , grabSwitchForLoop
   , grabSource
   , loopAtSwitch
   , switchForLoop
@@ -484,22 +484,12 @@ loopAtSwitch = Array.index switchLoops
 -- | Reversed for the same reason `switchLoops` reads bottom row first: the MC6
 -- | numbers its switches from the near edge, so A is loop 8 and D is loop 4.
 -- |
--- | These are the two the Grab bank aims at, and that is not a coincidence
--- | dressed as a design. Being out of the feet's reach is what made them the
--- | loops you set up rather than stomp, and material that arrives from the
--- | iPad is set up rather than stomped.
+-- | Being out of the feet's reach is what made them the loops you set up
+-- | rather than stomp, and material that arrives from the iPad is set up
+-- | rather than stomped: a `Grab` lands on the grid in these two. (The Grab
+-- | bank that aimed at them went on 2026-11-07; the loops and the duty stay.)
 grabLoops :: Array Int
 grabLoops = Array.reverse (Array.mapMaybe Array.last loopRows)
-
--- | Which switch on the Grab bank selects a loop, for the two that have one.
--- |
--- | **Derived from the layout's own shape, not from a second copy of it.** The
--- | targets sit in the left column of both rows — A and D — so the switch is
--- | three times the position in `grabLoops`, which is the one arithmetic fact
--- | `own GrabBank` and this have to agree about. A test walks both and checks
--- | they do.
-grabSwitchForLoop :: Int -> Maybe Int
-grabSwitchForLoop l = (\n -> n * (mc6OwnSwitches / 2)) <$> Array.findIndex (_ == l) grabLoops
 
 -- | The input a grab loop records from, **by the name the daemon gives it**.
 -- |
@@ -562,9 +552,9 @@ faceSlot (Face m) = m
 -- | What to print on a loop's slot: the switch that reaches it, or its number
 -- | when the board is somewhere that cannot reach it.
 -- |
--- | The letters are only true on the loop bank. With the board on config, A is
--- | Quantise — so labelling the first loop "A" there points a foot at the wrong
--- | thing, which is the same fault the legend had.
+-- | The letters are only true on the loop bank. Off it (on the board's own
+-- | banks), A is something else — so labelling the first loop "A" there points
+-- | a foot at the wrong thing, which is the same fault the legend had.
 -- | What to print on a loop: the letter of the switch that selects it when the
 -- | board is showing the loop bank, its own number otherwise.
 -- |
@@ -576,17 +566,10 @@ faceSlot (Face m) = m
 -- | that survives testing.
 -- |
 -- | Loops with no switch have no letter; their number is the honest answer.
--- |
--- | **Two banks name loops now**, since the Grab page landed: the loop bank
--- | names six and the Grab bank names the two the loop bank cannot reach.
--- | Reading the letter off the wrong one is the same fault as reading it off
--- | the index — on the Grab bank, A is loop 8 and not loop 5 — so each bank
--- | asks its own table and every other bank still prints numbers.
 faceLoopKey :: Face -> Int -> String
 faceLoopKey (Face m) i = case m of
   Just LoopBank -> fromMaybe (show (i + 1)) (switchForLoop i >>= switchLetter)
-  Just GrabBank -> fromMaybe (show (i + 1)) (grabSwitchForLoop i >>= switchLetter)
-  _ -> show (i + 1)
+  Nothing -> show (i + 1)
 
 -- | What one switch does, across the three gestures it can carry.
 -- |
@@ -623,7 +606,6 @@ alsoHold d s = s { hold = Just d }
 -- | list. A bank jump is a *consequence* of what the switch is for.
 dutyTap :: Duty -> Maybe Jump
 dutyTap = case _ of
-  Enter slot -> Just (ToSlot slot)
   Back j -> Just j
   -- **Choosing a loop no longer opens anything**, changed 2026-08-30. It used
   -- to: choosing was opening its page, one act and one press, back when the
@@ -687,9 +669,9 @@ dutyFor g s = case g of
 -- |
 -- | **Read from the same table the device was programmed from**, which is the
 -- | only way the app can follow a bank change it did not command. Most of the
--- | navigation in this family is the MC6's own: a long press on a loop switch
--- | jumps to the config bank without a word to anyone, because that jump is a
--- | message stored *on the device*. The app sees the loop switch's CC and
+-- | navigation in this family is the MC6's own: J's hold leaves for the board
+-- | without a word to anyone, because that jump is a message stored *on the
+-- | device*. The app sees the loop switch's CC and
 -- | nothing else — so if it waits to be told, it is one press behind for ever,
 -- | and the legend describes a bank nobody is standing on.
 -- |
@@ -760,27 +742,13 @@ toolbar slot =
   -- waits for your note, so unlike Record its own timing does not matter. The
   -- best switch goes to the gesture that is late if you are.
   --
-  -- **G's hold is the only way onto the Grab bank**, and it is here because
-  -- there was nowhere else. The loop switches carry two gestures by decision
-  -- and no third; `J` has all three already; and bank 0's gateway — which is
-  -- where a jump like this properly belongs, per DESIGN-BANKS — is not built
-  -- yet. So the family carries its own navigation for now, as it does for the
-  -- way out.
-  --
-  -- `G` rather than any other switch for a stated reason: it is the one duty
-  -- up here whose own timing does not matter, which the paragraph above says
-  -- in order to justify putting Arm on the worst switch. A second gesture
-  -- costs a switch its press-down report — the device has to wait out the
-  -- double-tap window before it knows what you meant — and Arm is precisely
-  -- the duty that can afford to pay it. Record could not.
-  --
-  -- It leads both ways, like `J`: from the Grab bank it goes back to the
-  -- loops, so one switch shuttles between the two pages you actually use.
-  [ alsoHold
-      (Back (ToSlot (case slot of
-                       GrabBank -> LoopBank
-                       _ -> GrabBank)))
-      (only ArmLoop)
+  -- **G is Arm alone.** Its hold was the only way onto the Grab bank, and went
+  -- with it on 2026-11-07, so G is a sole-gesture switch again and reports at
+  -- press-down. An MC6 programmed before then still sends the hold (value 1,
+  -- with a jump to where the Grab bank was); it decodes as a hold on G, which
+  -- nothing is bound to, and is said rather than acted on until the bank is
+  -- written again.
+  [ only ArmLoop
   , only Reverse
   , only RecordLoop
   -- **The set, and the way out.** Tap stops everything, double starts it again
@@ -793,14 +761,11 @@ toolbar slot =
   -- switch on the board is a better home than a tap on a switch you have to
   -- reach up for.
   --
-  -- One gesture out from wherever you are standing, but not one gesture *all
-  -- the way* out: from a deeper page it goes home to the loops, and it takes a
-  -- second hold from there to leave the looper. The old toolbar could do both
-  -- because it had a tap and a hold to spend on the question; this has a hold.
+  -- From the Loops bank it leaves the looper for the board. (While there were
+  -- deeper pages it went home to the loops from them, a second hold leaving.)
   , alsoHold
       (case slot of
-         LoopBank -> Back ToBoard
-         _ -> Back (ToSlot LoopBank))
+         LoopBank -> Back ToBoard)
       (alsoDouble StartAll (only StopAll))
   , only HalfSpeed
   , only OverdubLoop
@@ -822,8 +787,9 @@ own = case _ of
   -- milliseconds is a take.
   --
   -- Carrying one meaning, they sit on `ActionPress` and report the instant a
-  -- foot lands. The verbs they used to carry are on `LoopPage`, one switch and
-  -- one printed name each.
+  -- foot lands. The verbs they used to carry went to a page of their own
+  -- (`LoopPage`, removed 2026-11-07) and are on the toolbar, the Twister and
+  -- the screen.
   -- **Not switch order — grid order.** Switch A selects loop 5, because A is
   -- the bottom-left switch and loop 5 is the bottom-left loop. See
   -- `switchLoops`.
@@ -832,8 +798,8 @@ own = case _ of
   -- press-down report above — a switch with two meanings waits out the
   -- device's double-tap window before it can say which you meant — and the
   -- paragraph above is wrong about how much that matters: it is *Record* that
-  -- has to answer when your foot lands, and Record is on `LoopPage` with one
-  -- gesture of its own. Choosing a loop can afford to wait.
+  -- has to answer when your foot lands, and Record is on `I` with one gesture
+  -- of its own. Choosing a loop can afford to wait.
   --
   -- Undo rather than Clear, which was the first idea. Clear zeroes `redo_to`
   -- as well as the loop, so it is the one destructive act in the engine that
@@ -844,165 +810,6 @@ own = case _ of
   -- on it. There is nowhere for a hold to go: what the tap used to open is
   -- gone, its verbs having turned out to be the toolbar's six over again.
   LoopBank -> map (\n -> alsoDouble Undo (only (SelectLoop n))) switchLoops
-
-  -- **The verbs, for whichever loop is in hand.**
-  --
-  -- One bank, not six. The page is the same six switches whatever brought you
-  -- here, because the app already knows which loop that was — the same
-  -- arrangement the config bank has always had, and the reason the family fits
-  -- on the device at all. The pedal names the verb; the computer names the loop.
-  --
-  -- Every switch here carries exactly one gesture, so every one of them is on
-  -- `ActionPress`. That is the whole return on the redesign: Record answers
-  -- when your foot lands, not when the device has finished deciding you were
-  -- not about to press it again.
-  --
-  -- No `< Loops` on F: the way out is the toolbar's, in the same place it is on
-  -- every other bank, which leaves all six of the printed switches for verbs.
-  LoopPage ->
-    [ only RecordLoop
-    , only OverdubLoop
-    , only Transport
-    , only ArmLoop
-    -- **E is a shortcut, and it is the only one.** Reverse also lives on the
-    -- config bank, where it belongs by category — but flipping a loop backwards
-    -- is something you do mid-phrase, and two presses away is the wrong distance
-    -- for a thing you reach for while playing. Nothing else on the config family
-    -- earns that: speed, pan and the modes are all decisions you make once.
-    --
-    -- Duplication across banks is cheap here in a way it would not be on G to L.
-    -- These six are printed on the screen, so a player reads what is under their
-    -- foot rather than remembering it, and the positional-grammar rule that
-    -- governs the unmarked switches does not apply.
-    , only Reverse
-    , only (Enter ConfigBank)
-    ]
-
-  -- The four that lead somewhere sit first, because they are the ones with a
-  -- value to choose; the two that act sit last.
-  -- **Three that lead and three that act, since the modes bank became Grab.**
-  -- The fourth door used to be Modes; of the five duties that lost their bank,
-  -- one-shot is the only one that is a decision you make *while* something is
-  -- playing rather than while setting it up, so it is the one that takes the
-  -- freed switch. The other four are set-up values and are on the Twister,
-  -- which is where set-up belongs.
-  ConfigBank ->
-    [ only (Enter QuantiseBank)
-    , only (Enter SpeedBank)
-    , only (Enter PanBank)
-    , only (Reverse)
-    , only (Pendulum)
-    , only OneShot
-    ]
-
-  -- Free is the default and sits first, because ambient wants it and because a
-  -- loop that quantises when you did not ask is a loop that starts late for a
-  -- reason you cannot see.
-  QuantiseBank -> [ only (Free)
-    , only (Grid 1)
-    , only (Grid 2)
-    , only (Grid 4)
-    , only (Grid 8)
-    , only (Back (ToSlot ConfigBank))
-    ]
-
-  -- No reverse row: direction is the sign of speed, so backwards at half speed
-  -- is Reverse on the config bank and then a half here. Two presses for a thing
-  -- that was ten switches, and one fewer place for the two to disagree.
-  SpeedBank -> [ only (Rate 0.25)
-    , only (Rate 0.5)
-    , only (Rate 1.0)
-    , only (Rate 1.5)
-    , only (Rate 2.0)
-    , only (Back (ToSlot ConfigBank))
-    ]
-
-  -- **Grab, where Modes was, and where there was no room for anything.**
-  --
-  -- The CC block runs out at seven banks (see `slotIndex`), so an eighth page
-  -- could only come from one of the seven — and six of them have been
-  -- unreachable since choosing a loop stopped opening anything. Modes was the
-  -- one whose loss costs nothing at all: one-shot, listen, chance, fade and
-  -- decay each have an encoder of their own on the Twister's pages three and
-  -- four, so the bank was a second, slower way to reach five things already in
-  -- reach. Their duties are still in the tables below, unplaced.
-  --
-  -- ## What this bank is for
-  --
-  -- **Loops 4 and 8 are the fourth column** — the one the six loop switches
-  -- cannot reach, because the MC6 is three across and the grid is four. That
-  -- made them the two you *set up* rather than stomp, which turns out to be
-  -- exactly the right shape for material that does not come from the guitar:
-  -- a beat out of Patterning, a pad out of Xynthesizr, arriving on the iPad's
-  -- pair of channels rather than through the pedalboard.
-  --
-  -- So this page aims at those two and nothing else, and the whole of the
-  -- workflow is on it: pick which of the two, and grab a whole number of bars
-  -- into it. Then leave, and make guitar loops against what you grabbed.
-  --
-  -- ## Why a grab is not just a recording
-  --
-  -- The iPad has to be playing, and it will not be until Link's transport
-  -- starts — that is the only cue any of those apps takes. So `Grab` is two
-  -- things at once: it starts the session and it starts a grid-quantised
-  -- recording of the declared length. Both are waiting for the same downbeat,
-  -- so the take begins on the drum machine's bar one rather than a bar and a
-  -- bit into it.
-  --
-  -- **Two machines go in the two loops, and that is what the pair is for.**
-  -- Both open on the grid always — see `Machine.gridded` — so their bar lines
-  -- are the same bar lines and two beats grabbed one after the other agree
-  -- about where one is.
-  --
-  -- A second grab into the *same* loop is an overdub, and it works, but not
-  -- for this: an overdub starts at the play head rather than on a boundary
-  -- (measured 2026-08-30, and the daemon says why — it writes from `origin`,
-  -- so where the audio lands is already right), while the transport restarts
-  -- the iPad at the next **bar**. A pattern longer than a bar therefore comes
-  -- back rotated by however far into the loop you happened to be. Layering a
-  -- second machine over the first, in phase, would need the transport
-  -- scheduled for the loop's next *cycle* rather than its next bar, and that
-  -- is a frame-deadline-to-Link-time join nothing here has yet.
-  --
-  -- ```
-  --   far    Loop 4    4 bars    Halt
-  --   near   Loop 8    8 bars    < Loops
-  -- ```
-  --
-  -- `Halt` is the other half of the transport and has to be here: once the
-  -- grab has closed, the iPad is still playing, and nothing else on this board
-  -- can stop it. It stops the Link session rather than the looper, which is
-  -- said in its long name because the difference matters — Ableton stops too.
-  GrabBank ->
-    let
-      -- Through `grabLoops`, so the two this page aims at and the two the loop
-      -- bank cannot reach are the same fact read twice, not two lists that
-      -- agree today.
-      target n =
-        maybe (only Nothing_) (\l -> alsoDouble Undo (only (SelectLoop l)))
-          (Array.index grabLoops n)
-    in
-      [ target 0
-      , only (Grab 8)
-      -- The way out they asked for, in the place the way out has always been on
-      -- a bank with a spare switch. The toolbar's hold on J does the same thing
-      -- from here; this is the one you can find without remembering it.
-      , only (Back (ToSlot LoopBank))
-      , target 1
-      , only (Grab 4)
-      , only (LinkPlay false)
-      ]
-
-  -- Five places across the field rather than the eight this had, which is
-  -- plenty for placing six loops against each other and is what fits where the
-  -- device can print the names.
-  PanBank -> [ only (Place 0)
-    , only (Place 32)
-    , only (Place 64)
-    , only (Place 96)
-    , only (Place 127)
-    , only (Back (ToSlot ConfigBank))
-    ]
 
 -- | The family, written from `base` on, its way home to `boardBank`, every
 -- | switch speaking on `channel`.
@@ -1020,7 +827,6 @@ banks cfg = map toBank allSlots
     -- look at it.
     , returnSwitchIndex: case slot of
         LoopBank -> 11
-        _ -> 5
     , switches: Array.mapWithIndex (compile slot) (padTo (layout slot))
     }
 

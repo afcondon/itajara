@@ -152,7 +152,7 @@ slot onLayer top focus fc idx st =
         <> (if focus == idx then " is-selected" else "")
         -- **The fourth column, marked rather than hidden.** These were the two
         -- loops no foot could reach and were drawn with a dashed edge to say
-        -- so; since the Grab bank they have switches of their own, and what
+        -- so; the Grab bank (2026-08-30 to 2026-11-07) gave them switches, and what
         -- makes them different is no longer absence but *kind* — they hold
         -- what the iPad plays rather than what the guitar does. So the mark is
         -- a colour now and not a dash, which is a statement rather than an
@@ -171,7 +171,7 @@ slot onLayer top focus fc idx st =
         [ HH.span_ [ HH.text (lengthWord top st) ]
         -- The resolutions, shown only when they are not the default. A row of
         -- "forward · centre · free" on six slots is noise; a lone "REV" is
-        -- information, and the config bank is otherwise invisible from here.
+        -- information, and these resolutions are otherwise invisible from here.
         , HH.span [ HP.class_ (HH.ClassName "loop-marks") ]
             (map mark (marks st))
         ]

@@ -2,9 +2,11 @@
 -- | ask the other.
 -- |
 -- | The rule (AC, 2026-11-05): an MC6 bank can name who holds the Twister, and
--- | when it does, that holder has it. On the looper's banks the looper's own
+-- | when it does, that holder has it. On the looper's bank the looper's own
 -- | process holds it (its pages); on a bank with a scene, PWYF does (the
--- | scene). On every other bank, focus decides, and focus is PWYF's.
+-- | scene). On every other bank PWYF does (the focused pedal's page). Since
+-- | 2026-11-07 the looper is not a pedal in PWYF, so the bank is the only way
+-- | the Twister reaches the looper.
 -- |
 -- | Each program reads the same bank from the same MC6 frame and looks it up
 -- | here, so the process and PWYF agree on the looper's banks without a word
@@ -37,7 +39,8 @@ import Data.String as Str
 
 -- | The wire number of the first of the looper's MC6 banks (the device shows
 -- | it as one more: bank 3). The looper's banks follow it, one per
--- | `BankSlot`, as `Data.Looper.Banks.banks` lays them out.
+-- | `BankSlot`, as `Data.Looper.Banks.banks` lays them out — one bank, the
+-- | Loops bank, since 2026-11-07, so `looperHoldsBank` is true of 2 alone.
 loopBankBase :: Int
 loopBankBase = 2
 

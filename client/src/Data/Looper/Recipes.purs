@@ -69,43 +69,9 @@ says at act expect = { at, act, expect: Just expect }
 
 recipes :: Array Recipe
 recipes =
-  [ { name: "A beat off the iPad, four bars of it"
-    , why: "The way in when the piece starts with a drum machine rather than \
-           \with you. Get to the Grab bank with a hold on G — the same switch \
-           \Arm is on — and have Patterning (or anything with Start/Stop Sync \
-           \ticked) loaded and stopped. Choosing the loop sets it up: on the \
-           \grid, listening to the iPad. There is no input to go and find."
-    , steps:
-        [ says "Grab bank" "press Loop 4, or Loop 8 for the other one"
-               "loop 3 records from ipad (in 5+6)."
-        , says "Grab bank" "press 4 bars"
-               "loop 3 starts on the grid in 1.94 s."
-        , says "" "the iPad comes in on the downbeat and four bars go by"
-               "loop 3 committed: 8.000 s, 1 layer playing."
-        , says "Grab bank" "press Halt — the iPad is still playing otherwise"
-               "asked Link to stop — peers with start/stop sync follow."
-        , step "Grab bank" "press < Loops, and make guitar loops against it"
-        ]
-    , note: Just "**One press does four things**, and it has to: the iPad will \
-                 \not play until Link's transport starts, and the take has to \
-                 \open on the same bar line the transport does. So `4 bars` \
-                 \starts the session, sets the grid, declares the length and \
-                 \records — and the recording waits for the downbeat rather \
-                 \than for your foot, which is why nothing here needs counting \
-                 \in. **Two machines go in the two loops, not in one loop \
-                 \twice.** Both grab loops open on the grid always, so their \
-                 \bar lines are the same bar lines and the two beats agree \
-                 \about where one is. Layering a second grab into the *same* \
-                 \loop is an overdub, and an overdub starts at the play head \
-                 \rather than on a bar line — measured — so the iPad's own \
-                 \downbeat lands wherever the loop happens to be, and a \
-                 \pattern longer than a bar can come back rotated. Layer by \
-                 \hand, into two loops by foot. A double on the loop switch \
-                 \undoes the last one. And Halt stops the Link *session*, so \
-                 \it stops Ableton too — that is what a session transport is, \
-                 \not a leak."
-    }
-  , { name: "A four-bar first loop, in time"
+  -- "A beat off the iPad, four bars of it" was first here, and went with the
+  -- Grab bank on 2026-11-07: every step of it was a switch on that bank.
+  [ { name: "A four-bar first loop, in time"
     , why: "The ordinary way in when Link is running and you want to sit on \
            \Ableton's grid. Check the legend reads a tempo before you start."
     , steps:
