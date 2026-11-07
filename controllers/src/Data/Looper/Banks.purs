@@ -36,34 +36,16 @@
 -- | CC 0-15 are left alone because CC 0 and 32 are bank select and the low
 -- | numbers are where every other device's defaults live.
 -- |
--- | ## Channel 9 is the app's own
+-- | ## A whole channel, nine by default
 -- |
--- | Taking a whole channel for "the MC6 talking to the app about its own
--- | switches" keeps this namespace from ever colliding with a message meant for
--- | a pedal. It is a control plane, not a pedal.
+-- | The family speaks on one MIDI channel of its own, a setting
+-- | (`SwitchChannel`) that defaults to nine. Why a whole channel, and why nine,
+-- | is told at `defaultSwitchChannel`.
 -- |
--- | **Nine, because it is the only one left, and that was checked against the
--- | device rather than against a comment.** This first shipped on channel 16 on
--- | the strength of a note in `Data.Looper` saying 9, 13 and 16 were free.
--- | Thirteen had since been taken by Itajara, and sixteen is **LoopyPro** — the
--- | device's own channel table says so, and its `sendToPort` is 2034 where every
--- | other channel is 2047, three ports masked off exactly as a channel routed to
--- | the iPad and nowhere else would be.
--- |
--- | The device's table, read from the August connect dump, is the authority:
--- | 1 MC6, 2 (Brothers), 3 MOOD, 4 Clean, 5 Hedra, 7 Flint, 8 Lex, 10 Iridium,
--- | 11 Riverside, 12 Mercury7, 14 Brig, 15 Habit, 16 LoopyPro — plus 6
--- | Lost + Found and 13 Itajara, which the app knows about and the device does
--- | not name. That leaves nine, alone.
--- |
--- | Note that the March backup has Habit and LoopyPro the other way round. They
--- | were swapped at some point between, which is precisely why a channel is not
--- | something to take on the word of a comment.
--- |
--- | Note the split from `Data.Looper.looperBank`, which is a different thing
--- | wearing a similar name: that bank drives the *single-loop* transport
--- | through Itajara's pedal CCs on channel 13, and stays as long as the old
--- | Looper page does. This is the six-loop machine, and it addresses the app.
+-- | Until 2026-11-07 PWYF also wrote a single-loop "transport" bank
+-- | (`Data.Looper.looperBank` there, channel 13, through Itajara's pedal CCs).
+-- | It was removed (AC: "we can absolutely remove that extra transport bank");
+-- | this family is the looper's only MC6 bank.
 -- |
 -- | ## The device says which gesture, and the value says which
 -- |
@@ -143,7 +125,12 @@
 -- | A switch carrying **only** a tap needs none of this, because it is on
 -- | `ActionPress` and two presses are simply two presses.
 module Data.Looper.Banks
-  ( switchChannel
+  ( SwitchChannel
+  , defaultSwitchChannel
+  , switchChannelFrom
+  , switchChannelNumber
+  , allSwitchChannels
+  , switchStatus
   , switchesClaim
   , loopSwitches
   , switchCC
@@ -200,9 +187,64 @@ import Helm.MC6.Message as MC6Msg
 import Helm.MC6.Types (MC6Action(..), MC6Message)
 import Data.Maybe (Maybe(..), fromMaybe, maybe)
 
--- | The channel the MC6 uses to address the app about its own switches.
-switchChannel :: Int
-switchChannel = 9
+-- | The MIDI channel the MC6 uses to address the looper about its own
+-- | switches: one setting, read by whoever writes the banks (PWYF) and by
+-- | whoever answers them (the looper's process, PWYF's fallback), passed to
+-- | both as a value. A newtype, and no bare constant, so nothing can address
+-- | the family on a hard-coded nine while the setting says otherwise: the
+-- | writer and the reader disagreeing is a board whose presses go nowhere.
+newtype SwitchChannel = SwitchChannel Int
+
+derive instance Eq SwitchChannel
+derive instance Ord SwitchChannel
+
+instance Show SwitchChannel where
+  show (SwitchChannel n) = "(SwitchChannel " <> show n <> ")"
+
+-- | **Nine, by default.** Taking a whole channel for "the MC6 talking to the
+-- | looper about its own switches" keeps this namespace from ever colliding
+-- | with a message meant for a pedal. It is a control plane, not a pedal.
+-- |
+-- | **Nine, because it was the only one left, and that was checked against the
+-- | device rather than against a comment.** This first shipped on channel 16 on
+-- | the strength of a note in PWYF's `Data.Looper` saying 9, 13 and 16 were
+-- | free. Thirteen had since been taken by Itajara, and sixteen is
+-- | **LoopyPro** — the device's own channel table says so, and its
+-- | `sendToPort` is 2034 where every other channel is 2047, three ports masked
+-- | off exactly as a channel routed to the iPad and nowhere else would be.
+-- |
+-- | The device's table, read from the August connect dump, is the authority:
+-- | 1 MC6, 2 (Brothers), 3 MOOD, 4 Clean, 5 Hedra, 7 Flint, 8 Lex, 10 Iridium,
+-- | 11 Riverside, 12 Mercury7, 14 Brig, 15 Habit, 16 LoopyPro — plus 6
+-- | Lost + Found and 13 Itajara, which the app knows about and the device does
+-- | not name. That leaves nine, alone.
+-- |
+-- | Note that the March backup has Habit and LoopyPro the other way round. They
+-- | were swapped at some point between, which is precisely why a channel is not
+-- | something to take on the word of a comment — and why, since 2026-11-07, it
+-- | is a setting rather than a constant: a board laid out differently can move
+-- | it without a rebuild. Changing it means writing the banks again and
+-- | restarting the looper's process (`LOOPER_MC6_CHANNEL`).
+defaultSwitchChannel :: SwitchChannel
+defaultSwitchChannel = SwitchChannel 9
+
+-- | A channel, if the number is one (1–16, as the MC6's editor and every MIDI
+-- | monitor number them).
+switchChannelFrom :: Int -> Maybe SwitchChannel
+switchChannelFrom n
+  | n >= 1 && n <= 16 = Just (SwitchChannel n)
+  | otherwise = Nothing
+
+switchChannelNumber :: SwitchChannel -> Int
+switchChannelNumber (SwitchChannel n) = n
+
+-- | All sixteen, in order, for a picker.
+allSwitchChannels :: Array SwitchChannel
+allSwitchChannels = map SwitchChannel (Array.range 1 16)
+
+-- | The status byte of a Control Change on this channel, for matching raw MIDI.
+switchStatus :: SwitchChannel -> Int
+switchStatus (SwitchChannel n) = 0xB0 + n - 1
 
 -- | The name on Helm's hub held by whoever is answering these switches.
 -- |
@@ -306,14 +348,16 @@ type SwitchGesture =
 switchGesture :: BankSlot -> Int -> Gesture -> SwitchGesture
 switchGesture slot switch gesture = { slot, switch, gesture }
 
--- | Read a CC as a gesture on a switch, or refuse it.
+-- | Read a CC as a gesture on a switch, or refuse it: the family's channel
+-- | (the setting), then the channel the CC arrived on (1–16), its number and
+-- | its value.
 -- |
 -- | Total and cheap, so the router can offer it every incoming CC and let the
 -- | `Nothing` mean "not ours" — which is what keeps this namespace from having
 -- | to be checked for at the call site as well as here.
-decodeSwitch :: Int -> Int -> Int -> Maybe SwitchGesture
-decodeSwitch channel ccNum value =
-  if channel /= switchChannel || ccNum < stride then Nothing
+decodeSwitch :: SwitchChannel -> Int -> Int -> Int -> Maybe SwitchGesture
+decodeSwitch (SwitchChannel channel) arrivedOn ccNum value =
+  if arrivedOn /= channel || ccNum < stride then Nothing
   else do
     slot <- slotFromIndex (ccNum `div` stride - 1)
     let sw = ccNum `mod` stride
@@ -960,7 +1004,9 @@ own = case _ of
     , only (Back (ToSlot ConfigBank))
     ]
 
-banks :: { base :: Int, boardBank :: Int } -> Array ControlBank
+-- | The family, written from `base` on, its way home to `boardBank`, every
+-- | switch speaking on `channel`.
+banks :: { base :: Int, boardBank :: Int, channel :: SwitchChannel } -> Array ControlBank
 banks cfg = map toBank allSlots
   where
   toBank :: BankSlot -> ControlBank
@@ -982,7 +1028,7 @@ banks cfg = map toBank allSlots
   describe slot =
     "Itajara " <> slotName slot <> " — switch CCs "
       <> show (switchCC slot 0) <> "-" <> show (switchCC slot (switchCount - 1))
-      <> " on channel " <> show switchChannel
+      <> " on channel " <> show (switchChannelNumber cfg.channel)
 
   padTo :: Array Duties -> Array Duties
   padTo ds = Array.take switchCount (ds <> Array.replicate switchCount (only Nothing_))
@@ -1028,7 +1074,7 @@ banks cfg = map toBank allSlots
   bindings slot i sw =
     let
       emit action value duty =
-        { cc: MC6Msg.ccMessage switchChannel (switchCC slot i) value action
+        { cc: MC6Msg.ccMessage (switchChannelNumber cfg.channel) (switchCC slot i) value action
         , jump: (\j -> MC6Msg.bankJumpMessage (target j) action) <$> dutyTap duty
         }
 
@@ -1066,7 +1112,7 @@ banks cfg = map toBank allSlots
       -- board would otherwise stay put after two quick presses.
       pressSide duty =
         Array.cons
-          (MC6Msg.ccMessage switchChannel (switchCC slot i) (gestureValue Tap) ActionPress)
+          (MC6Msg.ccMessage (switchChannelNumber cfg.channel) (switchCC slot i) (gestureValue Tap) ActionPress)
           (case dutyTap duty of
              Nothing -> []
              Just j ->

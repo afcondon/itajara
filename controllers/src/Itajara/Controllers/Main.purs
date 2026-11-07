@@ -27,7 +27,9 @@
 -- |
 -- | Settings, from the environment: `HUB_URL` (ws://127.0.0.1:3039),
 -- | `LOOPER_URL` (Itajara's registered address), `MC6_INPUT` (a part of the
--- | MC6's input name, "Morningstar").
+-- | MC6's input name, "Morningstar"), `LOOPER_MC6_CHANNEL` (the channel the
+-- | looper's banks speak on, 1–16, default 9: it must match the channel PWYF
+-- | wrote the banks with, so changing one means changing the other).
 module Itajara.Controllers.Main (main) where
 
 import Prelude
@@ -67,6 +69,8 @@ type Process =
   -- Unsubscribes the MC6 input we are listening to, if any.
   , detach :: Ref (Effect Unit)
   , mc6Match :: String
+  -- The channel the looper's banks were written on (`LOOPER_MC6_CHANNEL`).
+  , channel :: LoopBanks.SwitchChannel
   , pages :: Ref (Maybe TwisterPages.Pages)
   }
 
@@ -80,6 +84,16 @@ main = launchAff_ do
   hubUrl <- liftEffect $ envOr "HUB_URL" "ws://127.0.0.1:3039"
   looperUrl <- liftEffect $ envOr "LOOPER_URL" LooperSocket.defaultUrl
   mc6Match <- liftEffect $ envOr "MC6_INPUT" "Morningstar"
+  channelSetting <- liftEffect $ envOr "LOOPER_MC6_CHANNEL"
+    (show (LoopBanks.switchChannelNumber LoopBanks.defaultSwitchChannel))
+  -- A setting that is not a channel is said out loud and the default used,
+  -- rather than exiting: Bosun would only restart the process into the same
+  -- refusal, and the default is today's board.
+  let channelRead = Int.fromString channelSetting >>= LoopBanks.switchChannelFrom
+      channel = fromMaybe LoopBanks.defaultSwitchChannel channelRead
+  when (channelRead == Nothing) $ liftEffect $
+    say ("LOOPER_MC6_CHANNEL=" <> channelSetting <> " is not a channel 1-16; using "
+      <> show (LoopBanks.switchChannelNumber channel))
   got <- attempt $ MIDI.requestHubAccessAff { url: hubUrl, client: clientName, waitMs: 15000.0 }
   liftEffect case got of
     Left err -> do
@@ -87,10 +101,12 @@ main = launchAff_ do
       exit1
     Right access -> do
       LooperSocket.connect looperUrl
-      p <- { access, focus: _, selectedSeen: _, detach: _, mc6Match, pages: _ }
+      p <- { access, focus: _, selectedSeen: _, detach: _, mc6Match, channel, pages: _ }
         <$> Ref.new 0 <*> Ref.new Nothing <*> Ref.new (pure unit) <*> Ref.new Nothing
       MIDI.claimName access LoopBanks.switchesClaim
-      say ("up: hub " <> hubUrl <> ", looper " <> looperUrl <> "; claimed " <> LoopBanks.switchesClaim)
+      say ("up: hub " <> hubUrl <> ", looper " <> looperUrl
+        <> ", MC6 channel " <> show (LoopBanks.switchChannelNumber channel)
+        <> "; claimed " <> LoopBanks.switchesClaim)
       attach p
       pages <- TwisterPages.start
         { access, focus: p.focus, adopt: adopt p, perform: run p 0.0, say }
@@ -120,8 +136,9 @@ attach p = do
 
 onMidi :: Process -> Array Int -> Effect Unit
 onMidi p = case _ of
-  [ status, ccNum, val ] | status == 0xB0 + LoopBanks.switchChannel - 1 ->
-    for_ (LoopBanks.decodeSwitch LoopBanks.switchChannel ccNum val) (answer p)
+  [ status, ccNum, val ] | status == LoopBanks.switchStatus p.channel ->
+    for_ (LoopBanks.decodeSwitch p.channel (LoopBanks.switchChannelNumber p.channel) ccNum val)
+      (answer p)
   -- Which bank the MC6 is on, from the frames it volunteers while PWYF holds
   -- its session: the same frames and the same reading as PWYF's, so the two
   -- agree on the looper's banks.
