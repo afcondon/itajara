@@ -37,8 +37,15 @@ pub(crate) fn save_take(sh: &Shared, li: usize, sr: u32, name: &str) -> Ack {
         return Ack::Now("nothing to save yet.".into());
     }
 
-    let name = safe_name(name);
+    // A blank name says which loop it came from; a typed one is the person's.
+    let name = safe_name_or(name, &format!("loop{}", li + 1));
     let dir = sh.takes_dir.join(&name);
+    // **Never into a take that is already there.** Writing into it replaced
+    // its layers and left any extra ones behind, so a reused name destroyed
+    // a take and then misdescribed it. Quadrat learned the same about `cw`.
+    if dir.exists() {
+        return Ack::Now(format!("there is already a take called {}; save it under another name.", name));
+    }
     Ack::Later(Box::new(move |sh: &Shared| {
         let (written, loop_len, said) = match write_take(sh, li, sr, &dir) {
             Ok(w) => w,
@@ -510,22 +517,76 @@ fn len_of(lp: &Loop) -> usize {
     lp.loop_len.load(Ordering::Acquire)
 }
 
+/// A name a person typed, made safe to be a folder: letters, digits, `-` and
+/// `_` stay, anything else becomes `-`, and the ends are trimmed of `-`. So
+/// "onward, seagull!" is `onward--seagull`. Deliberately the folder *is* the
+/// name, with no display title kept beside it: AC, 2026-11-07, on scripts and
+/// file tools that break on anything else. Blank (or nothing left after
+/// cleaning) is `take-<MMDD>-<HHMMSS>`.
 pub(crate) fn safe_name(raw: &str) -> String {
+    safe_name_or(raw, "take")
+}
+
+/// As `safe_name`, with the prefix a blank name is stamped under.
+pub(crate) fn safe_name_or(raw: &str, prefix: &str) -> String {
+    let cleaned = clean_name(raw);
+    if cleaned.is_empty() { stamped(prefix) } else { cleaned }
+}
+
+fn clean_name(raw: &str) -> String {
     let cleaned: String = raw
         .trim()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
         .collect();
-    let cleaned = cleaned.trim_matches('-').to_string();
-    if cleaned.is_empty() {
-        format!(
-            "take-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-        )
-    } else {
-        cleaned
+    cleaned.trim_matches('-').to_string()
+}
+
+/// `<prefix>-<MMDD>-<HHMMSS>` in local time: the shape Quadrat names its own
+/// takes in (`Quadrat.Slug`), so a looper save and a Quadrat capture read
+/// alike in one folder. It used to be `take-<unix seconds>`, which nobody
+/// could read.
+pub(crate) fn stamped(prefix: &str) -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as libc::time_t)
+        .unwrap_or(0);
+    // SAFETY: localtime_r writes only into the `tm` it is given.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let ok = !unsafe { libc::localtime_r(&secs, &mut tm) }.is_null();
+    if !ok {
+        return format!("{}-{}", prefix, secs);
+    }
+    format!(
+        "{}-{:02}{:02}-{:02}{:02}{:02}",
+        prefix,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    #[test]
+    fn a_typed_name_is_cleaned_to_a_folder() {
+        assert_eq!(safe_name("onward, seagull!"), "onward--seagull");
+        assert_eq!(safe_name("  bass_2 "), "bass_2");
+        assert_eq!(safe_name("../etc"), "etc");
+    }
+
+    #[test]
+    fn a_blank_name_is_stamped_under_its_prefix() {
+        let n = safe_name_or("  !! ", "loop3");
+        let rest = n.strip_prefix("loop3-").expect("prefix");
+        let parts: Vec<&str> = rest.split('-').collect();
+        assert_eq!(parts.len(), 2, "{}", n);
+        assert_eq!(parts[0].len(), 4, "{}", n);
+        assert_eq!(parts[1].len(), 6, "{}", n);
+        assert!(rest.chars().all(|c| c.is_ascii_digit() || c == '-'), "{}", n);
     }
 }

@@ -253,11 +253,21 @@ fn a_saved_loop_declares_its_bars_from_link_and_keeps_its_mix() {
     let tape = std::fs::read_to_string(sh.takes_dir.join("onlink/tape.json")).unwrap();
     assert!(tape.contains("\"bpmFrom\": \"link\"") && tape.contains("\"bars\": 2") && tape.contains("\"beats\": 4"), "{}", tape);
 
+    // A save never goes into a take that is already there: it is refused,
+    // and the take it would have overwritten keeps its tape.
+    let ack = dispatch(&sh, 48_000, "0wonlink");
+    assert!(ack.contains("already a take called onlink"), "ack was: {}", ack);
+    assert!(sh.takes_dir.join("onlink/tape.json").exists(), "the first take is untouched");
+
     // Link at another tempo: the loop is not on it, so nothing is declared.
     sh.link_tempo.store((tempo * 0.5).to_bits(), Ordering::Relaxed);
-    let ack = dispatch(&sh, 48_000, "0wonlink");
+    let ack = dispatch(&sh, 48_000, "0woffbeat");
     assert!(!ack.contains("from Link"), "ack was: {}", ack);
-    assert!(!sh.takes_dir.join("onlink/tape.json").exists(), "and a stale tape.json is removed");
+    assert!(!sh.takes_dir.join("offbeat/tape.json").exists(), "no tape.json for an assumed tempo");
+
+    // Unnamed, it is named for its loop and the time.
+    let ack = dispatch(&sh, 48_000, "0w");
+    assert!(ack.contains("/loop1-"), "ack was: {}", ack);
 
     // One layer: no mix.
     one_layer_loop(&sh, 2, 80, 0.75);

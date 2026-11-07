@@ -134,12 +134,7 @@ impl Jam {
     pub fn take_next_name(&self) -> String {
         let given = self.next_name.lock().map(|mut n| std::mem::take(&mut *n)).unwrap_or_default();
         if given.is_empty() {
-            "jam-".to_string()
-                + &std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0)
-                    .to_string()
+            crate::engine::export::stamped("jam")
         } else {
             given
         }

@@ -47,7 +47,7 @@ mod copy;
 mod cycle;
 mod dispatch;
 mod edit;
-mod export;
+pub(crate) mod export;
 mod guards;
 mod lane;
 mod layer;
