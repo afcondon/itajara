@@ -34,7 +34,7 @@ import Data.Looper.Twister as LoopTwister
 import Data.Looper.TwisterHolder as Holder
 import Data.Map (Map)
 import Data.Map as Map
-import Data.Maybe (Maybe(..), fromMaybe, isJust, maybe)
+import Data.Maybe (Maybe(..), fromMaybe, isJust, isNothing, maybe)
 import Data.Ord (abs)
 import Data.String as Str
 import Data.Tuple (Tuple(..))
@@ -111,10 +111,16 @@ attach :: Pages -> Effect Unit
 attach p = do
   join (Ref.read p.detach)
   Ref.write (pure unit) p.detach
+  before <- Ref.read p.st
   ports <- MIDI.outputs p.access
   let found = Array.find (\o -> matches o.name) ports
   out <- maybe (pure Nothing) (\o -> MIDI.findOutput p.access (MIDI.Exactly o.id)) found
   Ref.modify_ (_ { port = map _.id found, out = out }) p.st
+  -- The Twister came back (unplugged, or the Mac slept) while this process
+  -- held it: what it shows is whatever it woke with, not what `lit` says.
+  when (before.holding && isNothing before.port && isJust found) do
+    p.say "twister: back, repainting the looper's pages"
+    paintFresh p
   mIn <- MIDI.findInput p.access HelmTwister.port
   for_ mIn \input -> do
     hear <- Guard.guarded Guard.timing (onMessage p)
