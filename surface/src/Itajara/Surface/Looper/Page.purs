@@ -90,6 +90,8 @@ type State r =
   , looperLog :: Array LogLine
   , twisterPage :: Int
   , twisterHeardBank :: Maybe Int
+  -- | What is typed in the Save field; empty lets the looper name it.
+  , looperSaveName :: String
   | r
   )
 
@@ -157,6 +159,14 @@ type Handlers i =
   -- | Dragging the window along the picture; the fixed panel's hand, which
   -- | this page never shows, so it offers none.
   , waveDrag :: Maybe (Edit.WaveDrag i)
+  -- | The Save field: typing in it, and saving the loop in hand under what
+  -- | it says (empty: the looper names it `loop<N>-<MMDD>-<HHMMSS>`).
+  -- |
+  -- | **The one button that does not go through `gesture`**, because a CC
+  -- | carries no name. The app turns it into the looper's save for the loop in
+  -- | hand and runs it the way it runs everything else.
+  , setSaveName :: String -> i
+  , save :: String -> i
   }
 
 render
@@ -179,6 +189,7 @@ render h ports extras state =
     , HH.div [ HP.class_ (HH.ClassName "looper-body") ]
         [ HH.div [ HP.class_ (HH.ClassName "looper-main") ]
             [ faceToggle
+            , saveRow
             , case state.looper of
                 Just lp | state.looperShowsSlots -> Slots.render h.setLayer lp state.looperFocus (LoopBanks.face state.looperBankShown)
                 _ -> HH.text ""
@@ -349,6 +360,35 @@ render h ports extras state =
   faceToggle =
     HH.div [ HP.class_ (HH.ClassName "looper-face-toggle") ]
       [ tab true "Loops", tab false "Transport" ]
+
+  -- | Save the loop in hand, on both faces: it is what you do after a take,
+  -- | whichever face the take was played on. The folder is the name, cleaned
+  -- | by the looper (letters, digits, `-`, `_`); a name that is already a take
+  -- | is refused rather than written over, and the log says which happened.
+  saveRow = case state.looper >>= \l -> Array.index l.loops state.looperFocus of
+    Nothing -> HH.text ""
+    Just fl ->
+      let
+        empty = fl.layers == 0 || fl.loopFrames == 0
+        label = "loop " <> show (state.looperFocus + 1)
+      in
+        HH.div [ HP.class_ (HH.ClassName "looper-save") ]
+          [ HH.label_ [ HH.text ("Save " <> label <> " as") ]
+          , HH.input
+              [ HP.type_ HP.InputText
+              , HP.value state.looperSaveName
+              , HP.placeholder ("loop" <> show (state.looperFocus + 1) <> "-date-time")
+              , HP.disabled (not st.connected)
+              , HE.onValueInput h.setSaveName
+              ]
+          , HH.button
+              [ HP.class_ (HH.ClassName "looper-btn small")
+              , HP.disabled (not st.connected || empty)
+              , HP.title (if empty then label <> " has nothing to save yet" else "write its layers to a take")
+              , HE.onClick \_ -> h.save state.looperSaveName
+              ]
+              [ HH.text "Save" ]
+          ]
 
   tab wants label =
     HH.button

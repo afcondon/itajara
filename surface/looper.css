@@ -349,6 +349,17 @@
   font-variant-numeric: tabular-nums; min-width: 62px; color: #4a453d;
 }
 
+/* Save the loop in hand: one line under the face toggle, on both faces. */
+.looper-save {
+  display: flex; align-items: center; gap: 8px; margin: -6px 0 16px 0;
+  font-size: 12px; color: #6b6459;
+}
+.looper-save input[type=text] {
+  font: inherit; font-size: 13px; padding: 5px 8px; width: 220px;
+  border: 1px solid #d8d4cc; background: #fff; color: #2b2823;
+}
+.looper-save input[type=text]:focus { outline: none; border-color: #3a7d6c; }
+
 /* ── The Twister's layout, at the foot of the Looper page ──────────────────
    A reference rather than a control: read once, learn the page, stop looking.
    Folded shut by default, and laid out four-by-four because that is how the
