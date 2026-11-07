@@ -73,6 +73,7 @@ module Data.Looper.Twister
   , pager
   , pagerRing
   , pagerIndex
+  , pinnedLayer
   , pageFor
   , pageShown
   , pageTone
@@ -1388,6 +1389,10 @@ rigKnob p rig = case p of
 -- | pages there are, and the travel above the last band is simply unused.
 pagerRing :: Int -> Int
 pagerRing p = clamp 0 127 (p * pageStep)
+
+-- | The layer the device is kept on; the app owns paging.
+pinnedLayer :: Int
+pinnedLayer = 0
 
 -- | Which encoder the pager is, found rather than restated.
 -- |

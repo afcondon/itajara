@@ -12,6 +12,7 @@ package:
     - halogen
     - integers
     - itajara-client
+    - itajara-controllers
     - maybe
     - numbers
     - ordered-collections
@@ -27,3 +28,9 @@ workspace:
   extraPackages:
     itajara-client:
       path: ../client
+    # The looper's MC6 and Twister layouts, which the Looper page's board,
+    # slots and Twister map draw; it reaches Helm by path, so this does too.
+    itajara-controllers:
+      path: ../controllers
+    helm:
+      path: ../../helm

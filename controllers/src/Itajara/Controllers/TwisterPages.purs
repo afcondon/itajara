@@ -208,7 +208,7 @@ drift p bytes = for_ (HelmTwister.layerOf bytes) \layer ->
 -- | The layer the device is kept on. Paging is this process's, not the
 -- | device's (`Data.Twister.deviceBank` in PWYF says why).
 pinned :: Int
-pinned = 0
+pinned = LoopTwister.pinnedLayer
 
 send :: Pages -> Array Int -> Effect Unit
 send p bytes = do
