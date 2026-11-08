@@ -105,6 +105,9 @@ import Itajara.Surface.Wave (viewOf, wave)
 import Halogen.HTML as HH
 import Halogen.HTML.Events as HE
 import Halogen.HTML.Properties as HP
+import Web.DOM.Element as Element
+import Web.Event.Event (Event, EventType(..))
+import Web.Event.Event as Event
 
 -- | The six slots, in board order.
 -- |
@@ -125,11 +128,14 @@ import Halogen.HTML.Properties as HP
 -- |
 -- | The app's `looperFocus` is what `Data.Looper.Machine` actually acts on, so
 -- | it is the only honest answer to "which loop does this bank talk about".
--- | `onLayer loop layer on` is the one thing a slot can *do*: the layer
--- | checkboxes. Loop is the daemon's index; layer is the number the slot
--- | shows, from one.
-render :: forall w i. (Int -> Int -> Boolean -> i) -> LooperState -> Int -> LB.Face -> HH.HTML w i
-render onLayer lp focus fc =
+-- | What a slot can *do*. `onLayer loop layer on` is the layer checkboxes
+-- | (loop is the daemon's index; layer is the number the slot shows, from
+-- | one); `onEdit loop` is a click anywhere else in the box, which opens the
+-- | loop's Edit panel.
+type Intents i = { onLayer :: Int -> Int -> Boolean -> i, onEdit :: Int -> i }
+
+render :: forall w i. Intents i -> LooperState -> Int -> LB.Face -> HH.HTML w i
+render intents lp focus fc =
   HH.div [ HP.class_ (HH.ClassName "loops") ]
     [ HH.div [ HP.class_ (HH.ClassName "loops-grid") ]
         (Array.mapMaybe cell (join LB.loopRows))
@@ -142,11 +148,13 @@ render onLayer lp focus fc =
     , legend lp focus
     ]
   where
-  cell i = slot onLayer lp focus fc i <$> Array.index lp.loops i
+  cell i = slot intents lp focus fc i <$> Array.index lp.loops i
 
--- | One loop.
-slot :: forall w i. (Int -> Int -> Boolean -> i) -> LooperState -> Int -> LB.Face -> Int -> LoopState -> HH.HTML w i
-slot onLayer top focus fc idx st =
+-- | One loop. **The whole box opens its Edit panel**, except the layer
+-- | checkboxes, which are controls of their own: a click whose target is an
+-- | `INPUT` is the checkbox's, and the box lets it pass.
+slot :: forall w i. Intents i -> LooperState -> Int -> LB.Face -> Int -> LoopState -> HH.HTML w i
+slot intents top focus fc idx st =
   HH.div
     [ HP.class_ (HH.ClassName ("loop-slot " <> stateClass st
         <> (if focus == idx then " is-selected" else "")
@@ -157,7 +165,11 @@ slot onLayer top focus fc idx st =
         -- what the iPad plays rather than what the guitar does. So the mark is
         -- a colour now and not a dash, which is a statement rather than an
         -- apology.
-        <> (if Array.elem idx LB.grabLoops then " is-grab" else ""))) ]
+        <> (if Array.elem idx LB.grabLoops then " is-grab" else "")))
+    , HP.title "open this loop's Edit panel"
+    , HE.handler' (EventType "click") \ev ->
+        if targetIsInput ev then Nothing else Just (intents.onEdit idx)
+    ]
     [ HH.div [ HP.class_ (HH.ClassName "loop-head") ]
         [ HH.span [ HP.class_ (HH.ClassName "loop-letter") ]
             [ HH.text (LB.faceLoopKey fc idx) ]
@@ -165,7 +177,7 @@ slot onLayer top focus fc idx st =
         , HH.span [ HP.class_ (HH.ClassName "loop-layers") ]
             [ HH.text (if st.layers == 0 then "" else show st.layers <> plural st.layers " layer") ]
         ]
-    , track (onLayer idx) top st
+    , track (intents.onLayer idx) top st
     , mix top st
     , HH.div [ HP.class_ (HH.ClassName "loop-foot") ]
         [ HH.span_ [ HH.text (lengthWord top st) ]
@@ -196,6 +208,12 @@ slot onLayer top focus fc idx st =
 -- | the encoder ring is drawn from — so the bar on the screen and the ring under
 -- | the hand cannot disagree about the same loop. A second conversion here
 -- | would be a second chance to bend the fader law differently.
+targetIsInput :: Event -> Boolean
+targetIsInput ev =
+  case Event.target ev >>= Element.fromEventTarget of
+    Just el -> Element.tagName el == "INPUT"
+    Nothing -> false
+
 mix :: forall w i. LooperState -> LoopState -> HH.HTML w i
 mix lp st =
   HH.div [ HP.class_ (HH.ClassName "loop-mix") ]

@@ -67,6 +67,7 @@ import Data.Int as Int
 import Data.Looper.Banks as LoopBanks
 import Data.Map (Map)
 import Data.Maybe (Maybe(..), maybe)
+import Data.Tuple (Tuple(..))
 import Itajara.Surface.Looper.Statement (inputWords, launchWords, secs)
 import Itajara.Surface.Looper.Types (LogLine, LooperPanel(..))
 import Foreign.LooperSocket (LooperState, SocketStatus)
@@ -85,7 +86,6 @@ type State r =
   , looperStatus :: SocketStatus
   , looperSnapshotAge :: Number
   , looperFocus :: Int
-  , looperShowsSlots :: Boolean
   , looperPanel :: Maybe LooperPanel
   , looperPeaks :: Maybe LooperSocket.Peaks
   , looperEditLocal :: Map String Int
@@ -131,7 +131,9 @@ type Extras w i =
 -- | means this module cannot take that shortcut even by accident: it has no
 -- | word for the socket.
 type Handlers i =
-  { setFace :: Boolean -> i
+  { -- | A loop box was clicked: take that loop in hand and open its Edit
+    -- | panel (the daemon's loop index).
+    editLoop :: Int -> i
   , simulate :: LoopBanks.BankSlot -> Int -> LoopBanks.Gesture -> i
   , showTwisterPage :: Int -> i
   , openPanel :: Maybe LooperPanel -> i
@@ -189,7 +191,7 @@ render h ports extras state =
       -- is open is a band that is right all day and tells you nothing on the one
       -- day it matters. Both are gone; what stands there instead is the rig's
       -- state, which is the thing you look up.
-      ( [ HH.div [ HP.class_ (HH.ClassName "looper-status") ] [ p.readings, p.buttons ] ]
+      ( [ HH.div [ HP.class_ (HH.ClassName "looper-status") ] [ p.readings ] ]
           <> p.notices
           <>
             -- **The board and the log, in that order, and the order is the
@@ -210,14 +212,13 @@ render h ports extras state =
 -- | same pieces in the looper's own arrangement.
 -- |
 -- | * `readings` — the rig's state as a row of labelled readings.
--- | * `buttons` — the row that opens the panels.
 -- | * `notices` — the connection and audio lines, empty when all is well.
--- | * `main` — the loops: the face toggle, Save, and the slots or transport.
--- | * `side` — the Twister card and the log.
+-- | * `main` — Save, and the loops; a loop box opens its Edit panel.
+-- | * `side` — the Twister card, the MC6 minimap, and the log. The Twister
+-- |   and the MC6 each have a loupe onto their full reference.
 -- | * `overlay` — the open panel, if any.
 type Parts w i =
   { readings :: HH.HTML w i
-  , buttons :: HH.HTML w i
   , notices :: Array (HH.HTML w i)
   , main :: Array (HH.HTML w i)
   , side :: Array (HH.HTML w i)
@@ -233,36 +234,18 @@ parts
   -> Parts w i
 parts h ports extras state =
   { readings: HH.div [ HP.class_ (HH.ClassName "looper-status-row") ] readings
-  , buttons: helpRow
   , notices: [ connectionLine, audioLine ]
   , main:
-      [ faceToggle
-      , saveRow
+      [ saveRow
       , case state.looper of
-          Just lp | state.looperShowsSlots -> Slots.render h.setLayer lp state.looperFocus (LoopBanks.face state.looperBankShown)
-          _ -> HH.text ""
-      , case state.looper of
-          Just lp | not state.looperShowsSlots ->
-            -- The focused loop, read from `loops`: the top level is the
-            -- rig and says nothing about any one loop.
-            case Array.index lp.loops state.looperFocus of
-              Just fl -> HH.div_ [ transport lp fl, readout lp fl ]
-              Nothing -> HH.text ""
-          _ -> HH.text ""
+          Just lp -> Slots.render { onLayer: h.setLayer, onEdit: h.editLoop } lp state.looperFocus (LoopBanks.face state.looperBankShown)
+          Nothing -> HH.text ""
       ]
-  , side: [ twisterCard, logCard ]
+  , side: [ twisterCard, boardCard, logCard ]
   , overlay: panel
   }
   where
   st = state.looperStatus
-
-  panelBtn which label =
-    HH.button
-      [ HP.class_ (HH.ClassName
-          ("looper-help-btn" <> if state.looperPanel == Just which then " on" else ""))
-      , HE.onClick \_ -> h.openPanel (if state.looperPanel == Just which then Nothing else Just which)
-      ]
-      [ HH.text label ]
 
   panel = case state.looperPanel of
     Nothing -> HH.text ""
@@ -331,7 +314,19 @@ parts h ports extras state =
   -- | said the same six things less usefully, because you could not press it.
   twisterCard =
     HH.div [ HP.class_ (HH.ClassName "looper-side-card") ]
-      ([ cardHead "The Twister, live" ] <> extras.twisterCard)
+      ([ cardHead "The Twister, live" (Just (Tuple PanelTwister "what each encoder does")) ]
+         <> extras.twisterCard)
+
+  -- | **The MC6, small enough for the side column, and pressable.** The board
+  -- | was a button that opened a modal; as a minimap it is also the screen's
+  -- | transport, since its switches are the looper's verbs (record, overdub,
+  -- | arm, undo on a double press) and pressing one here is pressing it there.
+  -- | The loupe opens the full-size board.
+  boardCard =
+    HH.div [ HP.class_ (HH.ClassName "looper-side-card is-board") ]
+      [ cardHead "The MC6" (Just (Tuple PanelBoard "the board, full size"))
+      , BoardSim.render h.simulate (LoopBanks.face state.looperBankShown)
+      ]
 
   -- | What the presses did, newest first.
   -- |
@@ -341,7 +336,7 @@ parts h ports extras state =
   -- | those away by the time you look up.
   logCard =
     HH.div [ HP.class_ (HH.ClassName "looper-side-card") ]
-      [ cardHead "What happened"
+      [ cardHead "What happened" Nothing
       , if Array.null state.looperLog
           then HH.p [ HP.class_ (HH.ClassName "looper-log-empty") ]
                  [ HH.text "Nothing pressed yet." ]
@@ -362,10 +357,23 @@ parts h ports extras state =
       )
 
   -- The side cards' head. They are the page, not something laid over it, so
-  -- there is nothing to close and no button here.
-  cardHead title =
+  -- there is nothing to close. A loupe opens the card's full reference, where
+  -- it has one: the button row that used to open those is gone.
+  cardHead title loupe =
     HH.div [ HP.class_ (HH.ClassName "looper-panel-head") ]
-      [ HH.span [ HP.class_ (HH.ClassName "looper-panel-title") ] [ HH.text title ] ]
+      ( [ HH.span [ HP.class_ (HH.ClassName "looper-panel-title") ] [ HH.text title ] ]
+          <> case loupe of
+            Nothing -> []
+            Just (Tuple which what) ->
+              [ HH.button
+                  [ HP.class_ (HH.ClassName "looper-loupe")
+                  , HP.title what
+                  , HP.attr (HH.AttrName "aria-label") what
+                  , HE.onClick \_ -> h.openPanel (Just which)
+                  ]
+                  [ HH.text "\x2315" ]
+              ]
+      )
 
   -- The panel itself is `Itajara.Surface.Edit`, shared with the Friend so
   -- the two draw one picture; this page supplies the three things it reads.
@@ -395,16 +403,7 @@ parts h ports extras state =
           ]
       ]
 
-  -- Two faces, not two pages. The old transport is the only thing that can
-  -- drive the engine by hand, which is exactly what the six-slot display needs
-  -- in order to have anything to show while the state machine does not exist
-  -- yet — so it stays one click away rather than behind a nav item.
-  faceToggle =
-    HH.div [ HP.class_ (HH.ClassName "looper-face-toggle") ]
-      [ tab true "Loops", tab false "Transport" ]
-
-  -- | Save the loop in hand, on both faces: it is what you do after a take,
-  -- | whichever face the take was played on. The folder is the name, cleaned
+  -- | Save the loop in hand: it is what you do after a take. The folder is the name, cleaned
   -- | by the looper (letters, digits, `-`, `_`); a name that is already a take
   -- | is refused rather than written over, and the log says which happened.
   saveRow = case state.looper >>= \l -> Array.index l.loops state.looperFocus of
@@ -431,13 +430,6 @@ parts h ports extras state =
               ]
               [ HH.text "Save" ]
           ]
-
-  tab wants label =
-    HH.button
-      [ HP.class_ (HH.ClassName (if state.looperShowsSlots == wants then "face-tab on" else "face-tab"))
-      , HE.onClick \_ -> h.setFace wants
-      ]
-      [ HH.text label ]
 
   -- A connected socket says nothing about whether audio is running: the push
   -- thread reads shared atomics and will serve a confident snapshot from an
@@ -476,36 +468,6 @@ parts h ports extras state =
   -- | Some of it repeats what a slot says. That is the point: a value you have
   -- | to go and find is a value you check once and then assume, and every one
   -- | of these is a thing that being wrong about costs a take.
-  helpRow =
-      HH.div [ HP.class_ (HH.ClassName "looper-help-row") ]
-          [ panelBtn PanelEdit "Edit"
-          , panelBtn PanelRecipes "Recipes"
-          , panelBtn PanelTwister "Twister"
-          , maybe (HH.text "") (\_ -> panelBtn PanelBanks "MC6 banks") extras.banks
-          -- **Behind a button rather than on the page**, since the Twister
-          -- card took its slot. The device labels A-F on its own screen and
-          -- G-L mean the same six things on every bank, so there is nothing
-          -- here to look up any more. What is left is that its switches can be
-          -- pressed from the app, which is how the board gets exercised
-          -- without feet.
-          , panelBtn PanelBoard "MC6 board"
-          -- **Not a panel, so not a `panelBtn`.** The other three lay a
-          -- reference over this page; this one opens a document in another tab
-          -- so the reference can be on paper beside the rig while this tab
-          -- keeps focus — which it has to, because a background tab stops
-          -- handling Twister messages.
-          , case extras.printSheet of
-              Nothing -> HH.text ""
-              Just open ->
-                HH.button
-                  [ HP.class_ (HH.ClassName "looper-help-btn is-print")
-                  , HP.title "The four pages and the recipes, in a new tab, laid \
-                             \out for A4. Print it or save it as a PDF from there."
-                  , HE.onClick \_ -> open
-                  ]
-                  [ HH.text "Print sheet" ]
-          ]
-
   readings = case state.looper of
     Nothing -> [ reading "rig" "no daemon" true ]
     Just lp ->
@@ -594,167 +556,3 @@ parts h ports extras state =
           else "No daemon. Start it with:  itajara loop --device AUDIO4c --ws"
       ]
 
-  -- Every button here goes through the Itajara pedal's CC — the same path a
-  -- footswitch or a Twister encoder takes. There is deliberately no shortcut to
-  -- the socket from the UI: one route in means one place to debug.
-  -- `lp` is the rig, `fl` the focused loop.
-  transport lp fl =
-    HH.div [ HP.class_ (HH.ClassName "looper-transport") ]
-      [ gestureBtn ("looper-btn" <> if fl.recording then " recording" else "")
-          (not st.connected) 1 (nextPress fl)
-      , gestureBtn "looper-btn small"
-          (not st.connected || fl.loopFrames == 0) 2
-          (if LooperSocket.phaseOf fl == LooperSocket.Multiplying then "End multiply" else "Multiply")
-      , gestureBtn "looper-btn small" (not st.connected) 5 "Take"
-      , gestureBtn "looper-btn small" (not st.connected || fl.layers == 0) 3 "Undo"
-      -- Only offered when there is a length and nothing sitting in it, which is
-      -- the only moment it is meaningful and also the only moment it is wanted.
-      , gestureBtn "looper-btn small"
-          (not st.connected || fl.layers /= 0 || fl.loopFrames == 0) 13 "Forget length"
-      , HH.button
-          [ HP.class_ (HH.ClassName "looper-btn small")
-          , HP.disabled (not st.connected)
-          , HE.onClick \_ -> h.setClick (not lp.click)
-          ]
-          [ HH.text (if lp.click then "Click off" else "Click on") ]
-      , armThreshold lp
-      , revoxFeedback
-      ]
-
-  -- | How loud a sound has to be to start a level-armed loop.
-  -- |
-  -- | **On the page rather than on a knob, and deliberately.** It very nearly
-  -- | went on the Twister — turn to set the level, which arms the loop, press to
-  -- | record regardless. Two things sent it here instead. It is *rig-wide*, so
-  -- | on a page of eight loop encoders it would have been eight knobs quietly
-  -- | writing one value; and it is a once-a-session calibration of the room and
-  -- | the instrument, which is the same kind of thing as the residual latency
-  -- | and belongs where that kind of thing lives.
-  -- |
-  -- | A performance surface is for what you reach for while playing. Everything
-  -- | else on it is in the way.
-  armThreshold lp =
-    HH.span [ HP.class_ (HH.ClassName "looper-arm") ]
-      [ HH.label_ [ HH.text "Listen from" ]
-      , HH.input
-          [ HP.type_ HP.InputRange
-          , HP.min (-80.0)
-          , HP.max 0.0
-          , HP.step (HP.Step 1.0)
-          , HP.value (show (Int.round lp.armDb))
-          , HP.disabled (not st.connected)
-          , HE.onValueInput \v -> h.setArm v
-          ]
-      , HH.span [ HP.class_ (HH.ClassName "looper-arm-value") ]
-          [ HH.text (show (Int.round lp.armDb) <> " dBFS") ]
-      ]
-
-  -- | What a Revox pass leaves of what was under it.
-  -- |
-  -- | **Here rather than on the Twister, and only because both pages are
-  -- | full.** It is a performance control — riding the feedback is how the mode
-  -- | is played — so it wants a knob, and it will get one on the trim-and-shift
-  -- | page when that exists. Until then a slider you can reach is better than a
-  -- | cell nothing else could spare.
-  -- The focused loop's, because Revox is a per-loop mode — unlike the arm
-  -- threshold above it, which is the rig's.
-  revoxFeedback = case state.looper >>= \l -> Array.index l.loops state.looperFocus of
-    Nothing -> HH.text ""
-    Just fl -> revoxSlider fl
-
-  revoxSlider fl =
-    HH.span [ HP.class_ (HH.ClassName "looper-arm") ]
-      [ HH.label_ [ HH.text "Tape leaves" ]
-      , HH.input
-          [ HP.type_ HP.InputRange
-          , HP.min (-24.0)
-          , HP.max 0.0
-          , HP.step (HP.Step 0.5)
-          , HP.value (show fl.fbDb)
-          , HP.disabled (not st.connected)
-          , HE.onValueInput \v -> h.setFeedback v
-          ]
-      , HH.span [ HP.class_ (HH.ClassName "looper-arm-value") ]
-          [ HH.text (LoopBanks.levelWord fl.fbDb <> " a pass") ]
-      , HH.label_ [ HH.text "keeping" ]
-      , HH.input
-          [ HP.type_ HP.InputRange
-          , HP.min 1000.0
-          , HP.max 20000.0
-          , HP.step (HP.Step 250.0)
-          , HP.value (show (Int.round fl.toneHz))
-          , HP.disabled (not st.connected)
-          , HE.onValueInput \v -> h.setTone v
-          ]
-      , HH.span [ HP.class_ (HH.ClassName "looper-arm-value") ]
-          [ HH.text (if fl.toneHz >= 20000.0 then "all of it"
-                     else show (Int.round (fl.toneHz / 100.0) * 100) <> " Hz") ]
-      ]
-
-  gestureBtn cls disabled ccNum label =
-    HH.button
-      [ HP.class_ (HH.ClassName cls)
-      , HP.disabled disabled
-      , HE.onClick \_ -> h.gesture ccNum
-      ]
-      [ HH.text label ]
-
-  -- | What the next press does, which is the thing every looper hides.
-  nextPress fl = case LooperSocket.phaseOf fl of
-    LooperSocket.RecordingFirst -> "Close the loop"
-    LooperSocket.Overdubbing -> "Finish overdub"
-    LooperSocket.Multiplying -> "End multiply"
-    LooperSocket.Armed -> "Starting…"
-    -- An empty loop with a length is not an overdub, whatever the engine calls
-    -- the phase. Saying "Overdub" with nothing to overdub onto is what made a
-    -- kept grid read as a stuck one. `Playing` and `Idle` differ only in
-    -- whether the playhead is moving, and the next press is the same either
-    -- way, so they share the answer rather than repeating it.
-    LooperSocket.Playing -> byContents
-    LooperSocket.Idle -> byContents
-    where
-    byContents
-      | fl.sized = "Record on the grid"
-      | fl.layers == 0 = "Record"
-      | otherwise = "Overdub"
-
-  readout lp fl =
-    HH.div [ HP.class_ (HH.ClassName "looper-readout") ]
-      [ phaseBar fl
-      , HH.table [ HP.class_ (HH.ClassName "docs-table") ]
-          [ HH.tbody_
-              [ row "State" fl.state
-              , row "Layers" (show fl.layers <> " of " <> show lp.maxLayers)
-              , row "Loop"
-                  ( if fl.loopFrames == 0 then "not set"
-                    else fmt2 fl.loopSecs <> " s  (" <> show fl.loopFrames <> " frames)"
-                           <> (if fl.sized
-                                 then "  \x2014 empty, grid kept for the next take"
-                                 else "")
-                  )
-              , row "Input" (fmt1 lp.inDb <> " dBFS")
-              , row "Output" (fmt1 lp.outDb <> " dBFS")
-              , row "Alignment"
-                  ( if lp.calibrated then "locked, K " <> show lp.k
-                    else "waiting for the first input buffer"
-                  )
-              ]
-          ]
-      ]
-
-  -- Where we are in the cycle. Crude next to the concentric rings §12 wants,
-  -- but it is the one thing a looper must never leave you guessing about.
-  phaseBar fl =
-    HH.div [ HP.class_ (HH.ClassName "looper-phase") ]
-      [ HH.div
-          [ HP.class_ (HH.ClassName "looper-phase-fill")
-          , HP.style ("width:" <> show (max 0.0 (min 100.0 (fl.phase * 100.0))) <> "%")
-          ]
-          []
-      ]
-
-  row label value =
-    HH.tr_ [ HH.td [ HP.class_ (HH.ClassName "docs-cc") ] [ HH.text label ], HH.td_ [ HH.text value ] ]
-
-  fmt1 n = show (Int.toNumber (Int.round (n * 10.0)) / 10.0)
-  fmt2 n = show (Int.toNumber (Int.round (n * 100.0)) / 100.0)

@@ -18,6 +18,8 @@ package:
     - ordered-collections
     - prelude
     - strings
+    - web-dom
+    - web-events
     - web-uievents
   build:
     strict: true

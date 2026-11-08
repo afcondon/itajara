@@ -253,6 +253,13 @@
   background: #fbfaf8; border: 1px solid #ded9d1;
 }
 .looper-side-card .looper-panel-head { padding: 7px 10px; }
+/* A loupe onto the card's full reference (the Twister's encoder map, the
+   board at full size). Quiet until pointed at. */
+.looper-loupe {
+  border: 0; background: none; padding: 0 2px; cursor: pointer;
+  font-size: 15px; line-height: 1; color: #8a857c;
+}
+.looper-loupe:hover, .looper-loupe:focus { color: #1e1c19; outline: 0; }
 
 /* The Twister's current page: sixteen cells, four across, in a 320px column.
    Colour rides the left edge rather than filling the cell, so a row reads as a
@@ -532,7 +539,12 @@
   border: 1px solid #ded9d1; border-top: 3px solid #ded9d1;
   padding: 10px 12px 12px; background: #fbfaf8;
   display: flex; flex-direction: column; gap: 8px;
+  cursor: pointer;
 }
+/* The whole box opens the loop's Edit panel; the layer checkboxes keep
+   their own cursor. */
+.loop-slot:hover { border-color: #b9b2a6; }
+.loop-slot input { cursor: default; }
 .loop-slot.is-empty     { background: #f6f5f2; }
 .loop-slot.is-stopped   { border-top-color: #b9b3a9; }
 /* A stopped loop keeps its structure visible but drained of colour — it is
