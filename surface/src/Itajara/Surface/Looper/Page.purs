@@ -214,7 +214,8 @@ render h ports extras state =
 -- |
 -- | * `readings` — the rig's state as a row of labelled readings.
 -- | * `notices` — the connection and audio lines, empty when all is well.
--- | * `main` — Save, and the loops; a loop box is pressed with `pressLoop`.
+-- | * `main` — the loops; a loop box is pressed with `pressLoop`. Save is in
+-- |   the Edit panel, with the loop it saves.
 -- | * `side` — the Twister card, the MC6 minimap, and the log. The Twister
 -- |   and the MC6 each have a loupe onto their full reference.
 -- | * `overlay` — the open panel, if any.
@@ -237,8 +238,7 @@ parts h ports extras state =
   { readings: HH.div [ HP.class_ (HH.ClassName "looper-status-row") ] readings
   , notices: [ connectionLine, audioLine ]
   , main:
-      [ saveRow
-      , case state.looper of
+      [ case state.looper of
           Just lp -> Slots.render { onLayer: h.setLayer, onPress: h.pressLoop } lp state.looperFocus (LoopBanks.face state.looperBankShown)
           Nothing -> HH.text ""
       ]
@@ -263,7 +263,11 @@ parts h ports extras state =
       Just body -> modal "" "MC6 banks" body
       Nothing -> HH.text ""
     Just PanelEdit ->
-      modal "is-edit" ("Edit — loop " <> show (state.looperFocus + 1)) [ editPanel ]
+      -- **Save lives here, under the edit**, because both act on one loop,
+      -- the loop in hand, and saving is what follows trimming a take. Below
+      -- the shared panel rather than in it: `Itajara.Surface.Edit` is the
+      -- Friend's too, and the Friend saves its own way.
+      modal "is-edit" ("Edit — loop " <> show (state.looperFocus + 1)) [ editPanel, saveRow ]
     -- **In the app rather than on paper, and that is the whole reason it
     -- exists.** Following a written sequence means looking away from the
     -- browser, and Chrome throttles a background tab — the looper stops
