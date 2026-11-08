@@ -49,7 +49,9 @@ module Itajara.Surface.Looper.Page
   , Handlers
   , Ports
   , Extras
+  , Parts
   , render
+  , parts
   ) where
 
 import Prelude
@@ -114,14 +116,10 @@ type Ports = { twister :: Boolean }
 -- |   button is not drawn.
 -- | * `printSheet` — open the printable sheet. `Nothing` and the button is not
 -- |   drawn.
--- | * `statement` — the app's own drawing of what the looper is set to (from
--- |   `Itajara.Surface.Looper.Statement.sentences`). Given, it takes the place
--- |   of the strip's row of readings; `Nothing` keeps the readings.
 type Extras w i =
   { twisterCard :: Array (HH.HTML w i)
   , banks :: Maybe (Array (HH.HTML w i))
   , printSheet :: Maybe i
-  , statement :: Maybe (HH.HTML w i)
   }
 
 -- | Every action this page can cause.
@@ -182,40 +180,79 @@ render
   -> Record (State r)
   -> HH.HTML w i
 render h ports extras state =
-  HH.div [ HP.class_ (HH.ClassName "looper-view") ]
-    -- **No heading, and no "connected" line in the ordinary case.** The nav
-    -- above already says LOOPER, and a band across the page saying the socket
-    -- is open is a band that is right all day and tells you nothing on the one
-    -- day it matters. Both are gone; what stands there instead is the rig's
-    -- state, which is the thing you look up.
-    [ statusStrip
-    , connectionLine
-    , audioLine
-    , HH.div [ HP.class_ (HH.ClassName "looper-body") ]
-        [ HH.div [ HP.class_ (HH.ClassName "looper-main") ]
-            [ faceToggle
-            , saveRow
-            , case state.looper of
-                Just lp | state.looperShowsSlots -> Slots.render h.setLayer lp state.looperFocus (LoopBanks.face state.looperBankShown)
-                _ -> HH.text ""
-            , case state.looper of
-                Just lp | not state.looperShowsSlots ->
-                  -- The focused loop, read from `loops`: the top level is the
-                  -- rig and says nothing about any one loop.
-                  case Array.index lp.loops state.looperFocus of
-                    Just fl -> HH.div_ [ transport lp fl, readout lp fl ]
-                    Nothing -> HH.text ""
-                _ -> HH.text ""
+  let
+    p = parts h ports extras state
+  in
+    HH.div [ HP.class_ (HH.ClassName "looper-view") ]
+      -- **No heading, and no "connected" line in the ordinary case.** The nav
+      -- above already says LOOPER, and a band across the page saying the socket
+      -- is open is a band that is right all day and tells you nothing on the one
+      -- day it matters. Both are gone; what stands there instead is the rig's
+      -- state, which is the thing you look up.
+      ( [ HH.div [ HP.class_ (HH.ClassName "looper-status") ] [ p.readings, p.buttons ] ]
+          <> p.notices
+          <>
+            -- **The board and the log, in that order, and the order is the
+            -- argument.** Press a switch here and the sentence it produced
+            -- appears directly underneath it — cause above effect, in one
+            -- column, without crossing the page.
+            [ HH.div [ HP.class_ (HH.ClassName "looper-body") ]
+                [ HH.div [ HP.class_ (HH.ClassName "looper-main") ] p.main
+                , HH.div [ HP.class_ (HH.ClassName "looper-side") ] p.side
+                ]
+            , p.overlay
             ]
-        -- **The board and the log, in that order, and the order is the
-        -- argument.** Press a switch here and the sentence it produced appears
-        -- directly underneath it — cause above effect, in one column, without
-        -- crossing the page. That is what the corner dock could not do.
-        , HH.div [ HP.class_ (HH.ClassName "looper-side") ]
-            [ twisterCard, logCard ]
-        ]
-    , panel
-    ]
+      )
+
+-- | **The page in pieces, for an app that lays them out itself.** Quadrat puts
+-- | its own statement and meter at the head of a main column and the side
+-- | cards in a column of their own, as it does on every page; `render` is the
+-- | same pieces in the looper's own arrangement.
+-- |
+-- | * `readings` — the rig's state as a row of labelled readings.
+-- | * `buttons` — the row that opens the panels.
+-- | * `notices` — the connection and audio lines, empty when all is well.
+-- | * `main` — the loops: the face toggle, Save, and the slots or transport.
+-- | * `side` — the Twister card and the log.
+-- | * `overlay` — the open panel, if any.
+type Parts w i =
+  { readings :: HH.HTML w i
+  , buttons :: HH.HTML w i
+  , notices :: Array (HH.HTML w i)
+  , main :: Array (HH.HTML w i)
+  , side :: Array (HH.HTML w i)
+  , overlay :: HH.HTML w i
+  }
+
+parts
+  :: forall w i r
+   . Handlers i
+  -> Ports
+  -> Extras w i
+  -> Record (State r)
+  -> Parts w i
+parts h ports extras state =
+  { readings: HH.div [ HP.class_ (HH.ClassName "looper-status-row") ] readings
+  , buttons: helpRow
+  , notices: [ connectionLine, audioLine ]
+  , main:
+      [ faceToggle
+      , saveRow
+      , case state.looper of
+          Just lp | state.looperShowsSlots -> Slots.render h.setLayer lp state.looperFocus (LoopBanks.face state.looperBankShown)
+          _ -> HH.text ""
+      , case state.looper of
+          Just lp | not state.looperShowsSlots ->
+            -- The focused loop, read from `loops`: the top level is the
+            -- rig and says nothing about any one loop.
+            case Array.index lp.loops state.looperFocus of
+              Just fl -> HH.div_ [ transport lp fl, readout lp fl ]
+              Nothing -> HH.text ""
+          _ -> HH.text ""
+      ]
+  , side: [ twisterCard, logCard ]
+  , overlay: panel
+  }
   where
   st = state.looperStatus
 
@@ -439,12 +476,8 @@ render h ports extras state =
   -- | Some of it repeats what a slot says. That is the point: a value you have
   -- | to go and find is a value you check once and then assume, and every one
   -- | of these is a thing that being wrong about costs a take.
-  statusStrip =
-    HH.div [ HP.class_ (HH.ClassName "looper-status") ]
-      [ case extras.statement of
-          Just said -> said
-          Nothing -> HH.div [ HP.class_ (HH.ClassName "looper-status-row") ] readings
-      , HH.div [ HP.class_ (HH.ClassName "looper-help-row") ]
+  helpRow =
+      HH.div [ HP.class_ (HH.ClassName "looper-help-row") ]
           [ panelBtn PanelEdit "Edit"
           , panelBtn PanelRecipes "Recipes"
           , panelBtn PanelTwister "Twister"
@@ -472,7 +505,6 @@ render h ports extras state =
                   ]
                   [ HH.text "Print sheet" ]
           ]
-      ]
 
   readings = case state.looper of
     Nothing -> [ reading "rig" "no daemon" true ]
