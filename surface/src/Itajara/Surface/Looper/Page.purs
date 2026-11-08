@@ -131,9 +131,10 @@ type Extras w i =
 -- | means this module cannot take that shortcut even by accident: it has no
 -- | word for the socket.
 type Handlers i =
-  { -- | A loop box was clicked: take that loop in hand and open its Edit
-    -- | panel (the daemon's loop index).
-    editLoop :: Int -> i
+  { -- | A loop box was clicked (the daemon's loop index). The app decides
+    -- | what that means: Quadrat takes the loop in hand on the first click and
+    -- | opens its Edit panel on a click on the loop already in hand.
+    pressLoop :: Int -> i
   , simulate :: LoopBanks.BankSlot -> Int -> LoopBanks.Gesture -> i
   , showTwisterPage :: Int -> i
   , openPanel :: Maybe LooperPanel -> i
@@ -213,7 +214,7 @@ render h ports extras state =
 -- |
 -- | * `readings` — the rig's state as a row of labelled readings.
 -- | * `notices` — the connection and audio lines, empty when all is well.
--- | * `main` — Save, and the loops; a loop box opens its Edit panel.
+-- | * `main` — Save, and the loops; a loop box is pressed with `pressLoop`.
 -- | * `side` — the Twister card, the MC6 minimap, and the log. The Twister
 -- |   and the MC6 each have a loupe onto their full reference.
 -- | * `overlay` — the open panel, if any.
@@ -238,7 +239,7 @@ parts h ports extras state =
   , main:
       [ saveRow
       , case state.looper of
-          Just lp -> Slots.render { onLayer: h.setLayer, onEdit: h.editLoop } lp state.looperFocus (LoopBanks.face state.looperBankShown)
+          Just lp -> Slots.render { onLayer: h.setLayer, onPress: h.pressLoop } lp state.looperFocus (LoopBanks.face state.looperBankShown)
           Nothing -> HH.text ""
       ]
   , side: [ twisterCard, boardCard, logCard ]

@@ -16,6 +16,7 @@
 module Itajara.Surface.Looper.Statement
   ( Reading
   , Part(..)
+  , Option
   , Settings
   , sentences
   , warnings
@@ -54,13 +55,29 @@ data Part i
       , step :: Number
       , intent :: String -> i
       }
+  | Choice
+      { label :: String
+      , value :: String
+      , options :: Array Option
+      , intent :: String -> i
+      }
 
--- | What the settings in the sentence ask for: the page's own handlers.
+-- | One of a `Choice`'s options: what is sent (`value`), what is read
+-- | (`text`), and whether it can be chosen (`off`: a source not connected,
+-- | or "not set", which describes a loop but is not something you can ask for).
+type Option = { value :: String, text :: String, off :: Boolean }
+
+-- | What the settings in the sentence ask for: the page's own handlers. The
+-- | strings are the option values and field text, parsed by the page.
 type Settings i =
   { setClick :: Boolean -> i
   , setArm :: String -> i
   , setFeedback :: String -> i
   , setTone :: String -> i
+  , setLaunch :: String -> i
+  , setSource :: String -> i
+  , setGrid :: Boolean -> i
+  , setBars :: String -> i
   }
 
 read :: forall i. String -> String -> Part i
@@ -80,7 +97,7 @@ sentences set looper focus = case looper of
     [ rig lp, inHand lp (Array.index lp.loops focus) ]
   where
   rig lp =
-    clock lp <> [ Said ", and loops launch " ] <> launch lp.launchQ <> [ Said ". " ]
+    clock lp <> [ Said ", and loops launch ", launch lp.launchQ, Said ". " ]
       <> clickAndArm lp
 
   -- | **Rig-wide, set once a session**: the click, and how loud a sound has to
@@ -115,7 +132,9 @@ sentences set looper focus = case looper of
         [ Said "At "
         , read "tempo" (show (Int.round lp.linkTempo) <> " bpm")
         , Said " in "
-        , read "metre" (show (Int.round lp.linkQuantum) <> "/4")
+        -- The metre is Link's, set where the tempo is (Ableton, or any Link
+        -- peer): the looper has no verb for it, so it is read, not chosen.
+        , read "metre, from Link" (show (Int.round lp.linkQuantum) <> "/4")
         , Said ", "
         ]
           <> bar lp
@@ -130,22 +149,56 @@ sentences set looper focus = case looper of
 
   -- In beats, because that is what the setting is; a bar is spelled as a bar,
   -- since in 3/4 it is three.
-  launch q = case q of
-    -1 -> [ Said "on ", read "launch" "the bar" ]
-    0 -> [ read "launch" "freely" ]
-    1 -> [ Said "on ", read "launch" "the beat" ]
-    n -> [ Said "every ", read "launch" (show n <> " beats") ]
+  -- In beats, because that is what the setting is: a bar is spelled as a
+  -- bar, since in 3/4 it is three. A quantum the menu does not offer is shown
+  -- as itself rather than snapped to one it does.
+  launch q =
+    Choice
+      { label: "what a launch waits for (rig-wide)"
+      , value: show q
+      , options:
+          map (\n -> { value: show n, text: launchPhrase n, off: false })
+            (if Array.elem q launches then launches else Array.snoc launches q)
+      , intent: set.setLaunch
+      }
+
+  launches = [ -1, 0, 1, 2, 3, 4 ]
+
+  launchPhrase = case _ of
+    -1 -> "on the bar"
+    0 -> "freely"
+    1 -> "on the beat"
+    n -> "every " <> show n <> " beats"
 
   inHand lp = case _ of
     Nothing -> [ read "selected" ("Loop " <> show (focus + 1)), Said " is selected." ]
     Just fl ->
       [ read "selected" ("Loop " <> show (focus + 1))
       , Said " is selected, listening to "
-      , read "input" (inputWords lp (Just fl))
-      , Said "; "
+      , Choice
+          { label: "the input this loop records from"
+          , value: show fl.src
+          , options:
+              Array.mapWithIndex
+                (\i src ->
+                  { value: show (i + 1)
+                  , text: src.name <> (if src.mono then " (mono)" else " (stereo)")
+                      <> (if src.available then "" else " \x2014 off")
+                  , off: not src.available
+                  })
+                lp.sources
+          , intent: set.setSource
+          }
+      , Said "; it is "
+      , length fl.cycles
+      , Said ", and its grid is "
+      , Toggle
+          { label: "whether this loop keeps to the grid: press to turn it " <> if fl.quant then "off" else "on"
+          , value: if fl.quant then "on" else "off"
+          , intent: set.setGrid (not fl.quant)
+          }
+      , Said "."
       ]
-        <> length fl.cycles
-        <> [ Said ", and its grid is ", read "grid" (if fl.quant then "on" else "off"), Said "." ]
         <> tape fl
 
   -- | **Only on tape.** What a Revox pass leaves of what was under it, and how
@@ -177,10 +230,25 @@ sentences set looper focus = case looper of
         , Said "."
         ]
 
-  length = case _ of
-    0 -> [ Said "its length is ", read "length" "not set" ]
-    1 -> [ Said "it is ", read "length" "1 bar", Said " long" ]
-    n -> [ Said "it is ", read "length" (show n <> " bars"), Said " long" ]
+  -- | How many bars. "Not set" describes an empty loop and cannot be asked
+  -- | for, so it is offered only as the reading and never as a choice; a length
+  -- | the menu does not list is shown as itself.
+  length n =
+    Choice
+      { label: "how many bars this loop is (on an empty loop: the length the next take will have)"
+      , value: show n
+      , options:
+          (if n == 0 then [ { value: "0", text: "of no set length", off: true } ] else [])
+            <> map (\b -> { value: show b, text: barsPhrase b, off: false })
+                 (if n == 0 || Array.elem n lengths then lengths else Array.sort (Array.snoc lengths n))
+      , intent: set.setBars
+      }
+
+  lengths = [ 1, 2, 3, 4, 6, 8, 12, 16, 24, 32 ]
+
+  barsPhrase = case _ of
+    1 -> "1 bar long"
+    b -> show b <> " bars long"
 
 -- | **Only the exception**: the one readout of the old Transport face that is
 -- | worth saying, and only while it is wrong. Alignment locks on the first

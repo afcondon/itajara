@@ -130,9 +130,9 @@ import Web.Event.Event as Event
 -- | it is the only honest answer to "which loop does this bank talk about".
 -- | What a slot can *do*. `onLayer loop layer on` is the layer checkboxes
 -- | (loop is the daemon's index; layer is the number the slot shows, from
--- | one); `onEdit loop` is a click anywhere else in the box, which opens the
--- | loop's Edit panel.
-type Intents i = { onLayer :: Int -> Int -> Boolean -> i, onEdit :: Int -> i }
+-- | one); `onPress loop` is a click anywhere else in the box (Quadrat: the
+-- | first takes the loop in hand, a second opens its Edit panel).
+type Intents i = { onLayer :: Int -> Int -> Boolean -> i, onPress :: Int -> i }
 
 render :: forall w i. Intents i -> LooperState -> Int -> LB.Face -> HH.HTML w i
 render intents lp focus fc =
@@ -150,9 +150,9 @@ render intents lp focus fc =
   where
   cell i = slot intents lp focus fc i <$> Array.index lp.loops i
 
--- | One loop. **The whole box opens its Edit panel**, except the layer
--- | checkboxes, which are controls of their own: a click whose target is an
--- | `INPUT` is the checkbox's, and the box lets it pass.
+-- | One loop. **The whole box is pressable**, except the layer checkboxes,
+-- | which are controls of their own: a click whose target is an `INPUT` is
+-- | the checkbox's, and the box lets it pass.
 slot :: forall w i. Intents i -> LooperState -> Int -> LB.Face -> Int -> LoopState -> HH.HTML w i
 slot intents top focus fc idx st =
   HH.div
@@ -166,9 +166,9 @@ slot intents top focus fc idx st =
         -- a colour now and not a dash, which is a statement rather than an
         -- apology.
         <> (if Array.elem idx LB.grabLoops then " is-grab" else "")))
-    , HP.title "open this loop's Edit panel"
+    , HP.title (if focus == idx then "edit this loop" else "take this loop in hand")
     , HE.handler' (EventType "click") \ev ->
-        if targetIsInput ev then Nothing else Just (intents.onEdit idx)
+        if targetIsInput ev then Nothing else Just (intents.onPress idx)
     ]
     [ HH.div [ HP.class_ (HH.ClassName "loop-head") ]
         [ HH.span [ HP.class_ (HH.ClassName "loop-letter") ]
