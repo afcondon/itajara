@@ -65,6 +65,7 @@ import Data.Int as Int
 import Data.Looper.Banks as LoopBanks
 import Data.Map (Map)
 import Data.Maybe (Maybe(..), maybe)
+import Itajara.Surface.Looper.Statement (inputWords, launchWords, secs)
 import Itajara.Surface.Looper.Types (LogLine, LooperPanel(..))
 import Foreign.LooperSocket (LooperState, SocketStatus)
 import Foreign.LooperSocket as LooperSocket
@@ -113,10 +114,14 @@ type Ports = { twister :: Boolean }
 -- |   button is not drawn.
 -- | * `printSheet` — open the printable sheet. `Nothing` and the button is not
 -- |   drawn.
+-- | * `statement` — the app's own drawing of what the looper is set to (from
+-- |   `Itajara.Surface.Looper.Statement.sentences`). Given, it takes the place
+-- |   of the strip's row of readings; `Nothing` keeps the readings.
 type Extras w i =
   { twisterCard :: Array (HH.HTML w i)
   , banks :: Maybe (Array (HH.HTML w i))
   , printSheet :: Maybe i
+  , statement :: Maybe (HH.HTML w i)
   }
 
 -- | Every action this page can cause.
@@ -436,7 +441,9 @@ render h ports extras state =
   -- | of these is a thing that being wrong about costs a take.
   statusStrip =
     HH.div [ HP.class_ (HH.ClassName "looper-status") ]
-      [ HH.div [ HP.class_ (HH.ClassName "looper-status-row") ] readings
+      [ case extras.statement of
+          Just said -> said
+          Nothing -> HH.div [ HP.class_ (HH.ClassName "looper-status-row") ] readings
       , HH.div [ HP.class_ (HH.ClassName "looper-help-row") ]
           [ panelBtn PanelEdit "Edit"
           , panelBtn PanelRecipes "Recipes"
@@ -511,18 +518,6 @@ render h ports extras state =
         , twisterReading
         ]
 
-  -- | The selected loop's source, named as the daemon names it.
-  -- |
-  -- | `src` is **one-based** and indexes `sources`, so the subtraction is the
-  -- | seam and is done in one place. A number with no entry is reported as the
-  -- | number rather than silently blanked: it would mean the daemon and this
-  -- | page disagree about how many inputs exist, which is worth seeing.
-  inputWords lp focused = case focused of
-    Nothing -> "\x2014"
-    Just f -> case Array.index lp.sources (f.src - 1) of
-      Nothing -> "source " <> show f.src
-      Just src -> src.name <> (if src.mono then " (mono)" else " (stereo)")
-
   -- | **Which page the Twister is on, on the screen as well as under the hand.**
   -- |
   -- | The controller says it twice — the pager's ring position and its colour —
@@ -549,16 +544,6 @@ render h ports extras state =
       [ HH.span [ HP.class_ (HH.ClassName "looper-reading-label") ] [ HH.text label ]
       , HH.span [ HP.class_ (HH.ClassName "looper-reading-value") ] [ HH.text value ]
       ]
-
-  -- In beats, because that is what the setting is; a bar is spelled as a bar
-  -- rather than as four, since in 3/4 it is three.
-  launchWords q = case q of
-    -1 -> "the bar"
-    0 -> "free"
-    1 -> "1 beat"
-    n -> show n <> " beats"
-
-  secs n = show (Int.toNumber (Int.round (n * 100.0)) / 100.0) <> " s"
 
   -- **Silent when it is right**, which is the same rule the Twister card's
   -- status line follows. A green band saying the socket is open is correct all
