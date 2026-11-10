@@ -21,11 +21,12 @@ libc = "0.2"
 # For the two messages sent TO link-spike (`/link/set-tempo`, `/link/play`),
 # and in the tests to build an anchor the way link-spike used to.
 rosc = "0.10"
-# /link/anchor itself: the value, its validity rule and its 56 bytes, shared
-# with link-spike and es9-daemon and held to Binnacle's conformance vectors.
-# A path while the three are developed side by side; binnacle's
-# rust/link-anchor/README.md has the git form for a build that clones alone.
-link-anchor = { path = "../../live-coding/binnacle/rust/link-anchor" }
+# /link/anchor: the value, its validity rule and its 56 bytes, shared with
+# link-spike and es9-daemon and held to Binnacle's conformance vectors
+# (binnacle/conformance/LINK-ANCHOR.md). Taken from git at a pinned commit so
+# that this repository builds from a lone clone; Cargo finds the crate inside
+# the Binnacle repository by its package name.
+link-anchor = { git = "https://github.com/afcondon/binnacle", rev = "2eeec3cfac3d05e186aa265f36188afb97012f57" }
 # `SmallRng` for chance, which rolls once per loop per cycle in the audio
 # callback. Already in the tree — tungstenite pulls it for WebSocket masking
 # keys — so this is a feature flag rather than a dependency, and a studied
