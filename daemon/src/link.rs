@@ -26,6 +26,7 @@ use std::net::UdpSocket;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use link_anchor::Arrival;
 use rosc::{OscPacket, OscType};
 
 use crate::engine::Shared;
@@ -131,30 +132,24 @@ pub fn spawn_listener(sh: Arc<Shared>, sr: u32, port: u16) {
         let mut announced: Option<(f64, f64)> = None;
         loop {
             let Ok((n, _from)) = socket.recv_from(&mut buf) else { continue };
-            let Ok((_, packet)) = rosc::decoder::decode_udp(&buf[..n]) else { continue };
-            let OscPacket::Message(msg) = packet else { continue };
-            if msg.addr != "/link/anchor" {
-                continue;
-            }
-            let (Some(micros), Some(beat), Some(tempo), Some(quantum)) = (
-                as_i64(msg.args.first()),
-                as_f64(msg.args.get(1)),
-                as_f64(msg.args.get(2)),
-                as_f64(msg.args.get(3)),
-            ) else {
-                sh.link_rejected.fetch_add(1, Ordering::Relaxed);
-                continue;
-            };
 
-            // A tempo of zero would make a bar infinitely long and a quantum of
-            // zero would divide by it. Neither has ever been sent, which is the
-            // reason to check: an anchor that changed shape would otherwise be
-            // adopted silently and show up as a looper that quantises to
-            // nonsense. Counting the refusals makes that visible instead.
-            if !(tempo > 0.0 && tempo < 1000.0) || !(quantum >= 1.0 && quantum <= 64.0) {
-                sh.link_rejected.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
+            // The shape and the validity rule are `link-anchor`'s, shared with
+            // link-spike and es9-daemon and held to Binnacle's conformance
+            // vectors (binnacle/conformance/LINK-ANCHOR.md). A refusal is an
+            // anchor that changed shape or went out of range, which would
+            // otherwise be adopted silently and show up as a looper that
+            // quantises to nonsense; counting it makes that visible. Anything
+            // else on the port was never an anchor and is not counted.
+            let anchor = match link_anchor::decode(&buf[..n]) {
+                Arrival::Accept(anchor) => anchor,
+                Arrival::Refuse(_) => {
+                    sh.link_rejected.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                Arrival::Other => continue,
+            };
+            let (micros, beat, tempo, quantum) =
+                (anchor.unix_micros(), anchor.beat(), anchor.tempo(), anchor.quantum());
 
             sh.link_micros.store(micros, Ordering::Relaxed);
             sh.link_beat.store(beat.to_bits(), Ordering::Relaxed);
@@ -229,24 +224,9 @@ pub fn spawn_listener(sh: Arc<Shared>, sr: u32, port: u16) {
     });
 }
 
-fn as_f64(a: Option<&OscType>) -> Option<f64> {
-    match a {
-        Some(OscType::Double(d)) => Some(*d),
-        Some(OscType::Float(f)) => Some(*f as f64),
-        _ => None,
-    }
-}
-
-fn as_i64(a: Option<&OscType>) -> Option<i64> {
-    match a {
-        Some(OscType::Long(l)) => Some(*l),
-        Some(OscType::Int(i)) => Some(*i as i64),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use link_anchor::Arrival;
     use rosc::{encoder, OscMessage, OscPacket, OscType};
 
     /// The shape link-spike actually sends, copied from its `send_anchor`:
@@ -270,13 +250,26 @@ mod tests {
     #[test]
     fn tempo_comes_from_the_third_argument_not_the_second() {
         let bytes = anchor(1_700_000_000_000_000, 8.25, 120.0, 4.0);
-        let (_, packet) = rosc::decoder::decode_udp(&bytes).expect("decode");
-        let OscPacket::Message(msg) = packet else { panic!("not a message") };
-        assert_eq!(msg.addr, "/link/anchor");
-        assert_eq!(super::as_f64(msg.args.get(1)), Some(8.25));
-        assert_eq!(super::as_f64(msg.args.get(2)), Some(120.0));
-        assert_eq!(super::as_f64(msg.args.get(3)), Some(4.0));
-        assert_eq!(super::as_i64(msg.args.first()), Some(1_700_000_000_000_000));
+        let Arrival::Accept(got) = link_anchor::decode(&bytes) else { panic!("not accepted") };
+        assert_eq!(got.beat(), 8.25);
+        assert_eq!(got.tempo(), 120.0);
+        assert_eq!(got.quantum(), 4.0);
+        assert_eq!(got.unix_micros(), 1_700_000_000_000_000);
+    }
+
+    /// The listener counts a refusal and ignores a stranger, and the two must
+    /// not be confused: `link_rejected` is what the app reads to tell a bad
+    /// clock from an absent one.
+    #[test]
+    fn a_bad_anchor_is_refused_and_another_message_is_not_an_anchor() {
+        let too_slow = anchor(1_700_000_000_000_000, 8.25, 5.0, 4.0);
+        assert!(matches!(link_anchor::decode(&too_slow), Arrival::Refuse(_)));
+        let stranger = encoder::encode(&OscPacket::Message(OscMessage {
+            addr: "/link/set-tempo".into(),
+            args: vec![OscType::Double(120.0)],
+        }))
+        .expect("encode");
+        assert_eq!(link_anchor::decode(&stranger), Arrival::Other);
     }
 
     #[test]

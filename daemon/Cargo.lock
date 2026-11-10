@@ -360,6 +360,7 @@ dependencies = [
  "coreaudio-sys",
  "cpal",
  "libc",
+ "link-anchor",
  "rand",
  "rosc",
  "serde_json",
@@ -461,6 +462,10 @@ dependencies = [
  "cfg-if",
  "windows-link",
 ]
+
+[[package]]
+name = "link-anchor"
+version = "0.1.0"
 
 [[package]]
 name = "log"

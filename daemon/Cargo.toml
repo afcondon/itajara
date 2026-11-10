@@ -18,12 +18,14 @@ tungstenite = "0.24"
 # with, read in the Link listener to date an anchor on the audio's own clock.
 # Already in the tree under cpal.
 libc = "0.2"
-# For /link/anchor only. Hand-decoding was the obvious move given the WAV header
-# next door, but OSC has padding rules and — unlike a WAV — there is no
-# independent decoder to check a hand-rolled parse against. link-spike encodes
-# these bytes with this crate and es9-daemon decodes them with it, so matching
-# it means a parse bug cannot be a divergence from the thing generating them.
+# For the two messages sent TO link-spike (`/link/set-tempo`, `/link/play`),
+# and in the tests to build an anchor the way link-spike used to.
 rosc = "0.10"
+# /link/anchor itself: the value, its validity rule and its 56 bytes, shared
+# with link-spike and es9-daemon and held to Binnacle's conformance vectors.
+# A path while the three are developed side by side; binnacle's
+# rust/link-anchor/README.md has the git form for a build that clones alone.
+link-anchor = { path = "../../live-coding/binnacle/rust/link-anchor" }
 # `SmallRng` for chance, which rolls once per loop per cycle in the audio
 # callback. Already in the tree — tungstenite pulls it for WebSocket masking
 # keys — so this is a feature flag rather than a dependency, and a studied
