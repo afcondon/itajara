@@ -312,3 +312,59 @@ mod tests {
         assert_eq!(crate::engine::bar_origin(4.0, 3.0, 120.0, 100_000, 48_000), 76_000);
     }
 }
+
+#[cfg(test)]
+mod writer_tests {
+    //! Holds this daemon, as a WRITER, to what Diaphus reads
+    //! (binnacle/conformance/DIAPHUS-INBOUND.md). For every declared packet
+    //! at an address sent from here, the same values go through `set_tempo`
+    //! or `set_playing` to a socket opened by the test, and what arrives
+    //! must be the declared bytes.
+    //!
+    //! The other addresses of that declaration are not sent from here and
+    //! are skipped: `/midi/note/at`, `/midi/on/at`, `/midi/off/at`,
+    //! `/midi/cc/at`, `/clock/restart`.
+
+    use super::{set_playing, set_tempo};
+    use serde_json::Value;
+    use std::net::UdpSocket;
+    use std::time::Duration;
+
+    fn bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len()).step_by(2).map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("hex")).collect()
+    }
+
+    #[test]
+    fn tempo_and_transport_are_written_as_declared() {
+        let json: Value = serde_json::from_str(link_anchor::vectors::DIAPHUS_INBOUND).expect("the vector file is JSON");
+        assert_eq!(json["diaphus-inbound-vectors"], 1, "a vector format this replayer understands");
+        let listener = UdpSocket::bind(("127.0.0.1", 0)).expect("a socket to listen on");
+        listener.set_read_timeout(Some(Duration::from_secs(1))).expect("a timeout");
+        let port = listener.local_addr().expect("its address").port();
+
+        let (mut tempos, mut transports, mut failures) = (0, 0, Vec::new());
+        for case in json["packets"].as_array().expect("packets") {
+            let name = case["name"].as_str().expect("name");
+            let values = case["values"].as_array().expect("values");
+            match case["address"].as_str().expect("address") {
+                "/link/set-tempo" => {
+                    set_tempo(values[0].as_f64().expect("a number"), port).expect("sent");
+                    tempos += 1;
+                }
+                "/link/play" => {
+                    set_playing(values[0].as_i64().expect("a whole number") != 0, port).expect("sent");
+                    transports += 1;
+                }
+                _ => continue,
+            }
+            let mut buffer = [0u8; 256];
+            let (size, _) = listener.recv_from(&mut buffer).expect("the packet arrives");
+            let want = bytes(case["hex"].as_str().expect("hex"));
+            if buffer[..size] != want[..] {
+                failures.push(format!("{name}: sent {:02x?}, declared {:02x?}", &buffer[..size], want));
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+        assert!(tempos > 0 && transports > 0, "a declared address sent from here was not exercised");
+    }
+}
