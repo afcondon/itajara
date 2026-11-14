@@ -694,7 +694,7 @@ fn a_one_channel_source_reads_the_same_input_twice() {
     assert!(s.is_mono());
     assert_eq!(s.describe(), "di (in 3)");
 
-    let board = Source { name: "board".into(), ch: [0, 1], on: None, available: true };
+    let board = Source { name: "board".into(), ch: [0, 1], on: None, from: "inputs 1 and 2".into(), available: true };
     assert!(!board.is_mono());
     assert_eq!(board.describe(), "board (in 1+2)");
 }
@@ -1270,6 +1270,8 @@ fn the_fixture_renders_to_a_known_hash() {
 /// of its own beside `capture` for the same reason `capture` is one. And on
 /// 2026-11-14 for `pitch`: the pitch of one input, live, for tuning an
 /// oscillator before a calibration sweep.
+/// And the same day for `from` on each source: where it comes from, said for
+/// a person, so a menu of source names can say what each one is.
 #[test]
 fn the_fixture_snapshots_to_a_known_hash() {
     let sh = fixture();
@@ -1284,7 +1286,7 @@ fn the_fixture_snapshots_to_a_known_hash() {
         "{}",
         text
     );
-    assert_eq!(fnv(FNV_SEED, text.as_bytes()), 2053246262669293027, "snapshot hash");
+    assert_eq!(fnv(FNV_SEED, text.as_bytes()), 12915103842464543542, "snapshot hash");
 }
 
 /// **A plan does not outlive the loop it was made for.** The stale-plan

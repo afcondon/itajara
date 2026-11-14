@@ -483,8 +483,9 @@ fn rig_json(sh: &Shared, sr: u32, alive: bool) -> String {
             .iter()
             .enumerate()
             .map(|(i, s)| format!(
-                r#"{{"name":"{}","mono":{},"available":{},"db":{:.1}}}"#,
+                r#"{{"name":"{}","from":"{}","mono":{},"available":{},"db":{:.1}}}"#,
                 escape(&s.name),
+                escape(&s.from),
                 s.is_mono(),
                 s.available,
                 db(in_each.get(i).copied().unwrap_or(0.0))

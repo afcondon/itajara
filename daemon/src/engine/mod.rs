@@ -236,6 +236,11 @@ pub struct Source {
     /// it landed. An aggregate's channel order is not stable across a power
     /// cycle, so the number is a fact about today and the name is not.
     pub on: Option<String>,
+    /// **Where it comes from, said for a person**: "ES-9 input 1",
+    /// "AUDIO4c inputs 1 and 2". As the source was written when the daemon
+    /// was started, which is the only place that was ever recorded; a surface
+    /// showing a menu of names had nothing to say what each one was.
+    pub from: String,
     /// **False when the interface it names is not currently there.**
     ///
     /// The source keeps its place in the list — `src<n>` counts positions, so
@@ -249,7 +254,7 @@ pub struct Source {
 
 impl Source {
     pub fn mono(name: &str, ch: usize) -> Self {
-        Source { name: name.to_string(), ch: [ch, ch], on: None, available: true }
+        Source { name: name.to_string(), ch: [ch, ch], on: None, from: format!("input {}", ch + 1), available: true }
     }
     pub fn is_mono(&self) -> bool { self.ch[0] == self.ch[1] }
     pub fn describe(&self) -> String {

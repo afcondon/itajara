@@ -421,7 +421,18 @@ fn parse_source(v: &str) -> Result<engine::Source, String> {
     if parts.len() == 1 {
         ch[1] = ch[0];
     }
-    Ok(engine::Source { name: name.to_string(), ch, on, available: true })
+    // Said for a person, from what was written: the interface if one was
+    // named, and the channels as they are counted on it.
+    let inputs = if parts.len() == 1 {
+        format!("input {}", ch[0] + 1)
+    } else {
+        format!("inputs {} and {}", ch[0] + 1, ch[1] + 1)
+    };
+    let from = match &on {
+        Some(device) => format!("{} {}", device, inputs),
+        None => inputs,
+    };
+    Ok(engine::Source { name: name.to_string(), ch, on, from, available: true })
 }
 
 /// Turn every `DEVICE:channel` source into a channel of the device being

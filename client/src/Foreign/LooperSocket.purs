@@ -264,7 +264,8 @@ type LooperState =
   -- | **The pitch of one input, live**, when a surface has asked for one
   -- | (`Tune`). See `Pitch`.
   , pitch :: Pitch
-  , sources :: Array { name :: String, mono :: Boolean, available :: Boolean, db :: Number }
+  -- | `from` says where a source comes from, for a person: "ES-9 input 1".
+  , sources :: Array { name :: String, from :: String, mono :: Boolean, available :: Boolean, db :: Number }
   -- | The loop a console verb with no loop digit addresses. Once also the
   -- | loop whose fields were repeated at this level; now only that, and no
   -- | surface reads it — a page keeps its own focus.
