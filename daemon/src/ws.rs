@@ -419,6 +419,11 @@ fn rig_json(sh: &Shared, sr: u32, alive: bool) -> String {
             // loudly — frames lost, and a file that reached what a WAV can
             // hold. See `crate::jam`.
             r#""jam":{{"on":{},"src":{},"name":"{}","secs":{:.3},"behindSecs":{:.3},"droppedSecs":{:.3},"full":{}}},"#,
+            // **The pitch of one input**, when a surface has asked for one
+            // (`tune<n>`): which source, the pitch found, and how periodic it
+            // was. Zeros when nothing is listened to or no pitch was found.
+            // See `crate::pitch`.
+            r#""pitch":{{"src":{},"hz":{:.3},"clarity":{:.3}}},"#,
             r#""loops":[{}]}}"#
         ),
         sh.max_layers,
@@ -505,6 +510,10 @@ fn rig_json(sh: &Shared, sr: u32, alive: bool) -> String {
         sh.jam.behind() as f64 / sr as f64,
         sh.jam.dropped() as f64 / sr as f64,
         sh.jam.full(),
+        // The pitch of the source being listened to, if one is.
+        sh.pitch.source(),
+        sh.pitch.reading().0,
+        sh.pitch.reading().1,
         each.join(","),
     )
 }
@@ -705,7 +714,7 @@ mod tests {
             "calibrated", "k", "audioAlive", "deviceLost", "reopens", "ack", "ackSeq",
             "linkTempo", "linkQuantum", "linkBarFrames", "linkAnchors", "linkRejected",
             "barFrames", "barOrigin", "launchQ", "maxSecs", "fixedSecs", "ringSecs",
-            "selected", "nLoops", "sources", "capture", "jam", "loops",
+            "selected", "nLoops", "sources", "capture", "jam", "pitch", "loops",
         ];
         expected.sort_unstable();
         assert_eq!(keys, expected);

@@ -24,6 +24,7 @@ module Foreign.LooperSocket
   , send
   , Capture
   , Jam
+  , Pitch
   , latest
   , latestPeaks
   , status
@@ -158,6 +159,16 @@ type Jam =
   , full :: Boolean
   }
 
+-- | The pitch of the input a surface asked the daemon to listen to: which
+-- | source (1-based, zero for none), the pitch found (zero for none) and how
+-- | periodic the input was, 0 to 1. Read about twenty times a second from
+-- | the input the daemon already keeps, for tuning an oscillator by hand.
+type Pitch =
+  { src :: Int
+  , hz :: Number
+  , clarity :: Number
+  }
+
 type Capture =
   { on :: Boolean
   -- | Which source, 1-based, or zero for none yet.
@@ -250,6 +261,9 @@ type LooperState =
   -- | **Recording that is not looping.** See `Capture`.
   , capture :: Capture
   , jam :: Jam
+  -- | **The pitch of one input, live**, when a surface has asked for one
+  -- | (`Tune`). See `Pitch`.
+  , pitch :: Pitch
   , sources :: Array { name :: String, mono :: Boolean, available :: Boolean, db :: Number }
   -- | The loop a console verb with no loop digit addresses. Once also the
   -- | loop whose fields were repeated at this level; now only that, and no

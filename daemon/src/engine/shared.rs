@@ -55,6 +55,10 @@ pub struct Shared {
     /// `aggregate.rs`'s idea of a source, and nothing else: no loop, no phase,
     /// no layer, no length. The module is beside `engine/` for that reason.
     pub capture: crate::capture::Capture,
+    /// **Which input is being listened to for its pitch, and what was last
+    /// heard.** See `crate::pitch`: read by a thread of its own, never by the
+    /// audio callback.
+    pub pitch: crate::pitch::Tap,
     /// A long recording, streamed to disk. See `crate::jam`.
     pub jam: crate::jam::Jam,
     pub loops: Vec<Loop>,

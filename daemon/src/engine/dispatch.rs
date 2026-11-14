@@ -1011,6 +1011,22 @@ fn perform(sh: &Shared, sr: u32, line: &str, from: Caller, later: &mut Option<Jo
             // accepted and ignored here as it is for `exl`, because a capture
             // has no loop to be in. See `crate::capture` for why this exists
             // beside the engine rather than inside it.
+            // **Listen to a source for its pitch**, for tuning an oscillator
+            // before a calibration sweep. Every snapshot carries the reading
+            // until `tune0`. See `crate::pitch`.
+            "tune" => {
+                return match arg.parse::<usize>() {
+                    Ok(0) => {
+                        sh.pitch.listen(0);
+                        "listening to no source for pitch.".into()
+                    }
+                    Ok(n) if n <= sh.sources.len() => {
+                        sh.pitch.listen(n);
+                        format!("listening to {} for its pitch.", sh.sources[n - 1].name)
+                    }
+                    _ => format!("`tune<n>` wants a source from 1 to {}, or 0 for none.", sh.sources.len()),
+                };
+            }
             "cap" => {
                 if sh.capture.is_on() {
                     return "a capture is already running; `cend` it first.".into();

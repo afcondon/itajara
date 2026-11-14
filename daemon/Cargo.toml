@@ -14,6 +14,9 @@ cpal = "0.15"
 coreaudio-sys = "0.2"
 core-foundation-sys = "0.8"
 tungstenite = "0.24"
+# The McLeod pitch method, for `tune<n>`: the pitch of one input, live, in
+# the snapshot. See `src/pitch.rs`. The same detector msm reads a sweep with.
+pitch-detection = "0.3"
 # `clock_gettime(CLOCK_UPTIME_RAW)`, the host clock CoreAudio stamps buffers
 # with, read in the Link listener to date an anchor on the audio's own clock.
 # Already in the tree under cpal.

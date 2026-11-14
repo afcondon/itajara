@@ -231,6 +231,9 @@ data Verb
   | CaptureBars Int
   | CapturePeaks Int
   | WriteCapture String
+  -- | **Listen to a source for its pitch**, 1-based, or 0 for none. Every
+  -- | snapshot then carries the reading (`pitch`).
+  | Tune Int
   -- | **Jam: a long recording that goes to disk as it is made.** Rig-wide,
   -- | like the capture, and independent of it. `NameJam` names the next one
   -- | (it becomes the take's directory); `Jam src` starts one from source
@@ -436,6 +439,7 @@ render = case _ of
   CaptureBars n -> "cbars" <> show n
   CapturePeaks n -> "cpk" <> show n
   WriteCapture name -> "cw" <> name
+  Tune src -> "tune" <> show src
   NameJam name -> "jname" <> name
   Jam src -> "jam" <> show src
   EndJam -> "jend"

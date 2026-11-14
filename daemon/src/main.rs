@@ -16,6 +16,7 @@ mod levels;
 mod link;
 mod measure;
 mod memwatch;
+mod pitch;
 mod wav;
 
 use std::process::ExitCode;

@@ -143,6 +143,9 @@ pub(crate) const VERBS: &[Verb] = &[
     Verb { word: "cbars", arg: Arg::Int },
     Verb { word: "cpk", arg: Arg::Int },
     Verb { word: "cw", arg: Arg::Name },
+    // **Tune: listen to one source for its pitch**, 1-based, or 0 for none.
+    // Rig-wide. See `crate::pitch`.
+    Verb { word: "tune", arg: Arg::Int },
     // **Jam: a long recording that goes to disk as it is made.** Rig-wide,
     // like the capture. See `crate::jam`.
     Verb { word: "jam", arg: Arg::Int },

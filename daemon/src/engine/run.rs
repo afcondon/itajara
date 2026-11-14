@@ -300,6 +300,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
         in_dc: (0..sources.len() * CHANNELS).map(|_| AtomicU32::new(0)).collect(),
         sources,
         capture: crate::capture::Capture::new((opts.capture_secs * sr_f).round() as usize),
+        pitch: crate::pitch::Tap::new(),
         jam: crate::jam::Jam::new(sr_f),
         loops: (0..opts.loops).map(|i| Loop::new(i, opts.layers)).collect(),
         selected: AtomicUsize::new(0),
@@ -423,6 +424,10 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     if let Some(port) = opts.ws_port {
         crate::ws::serve(sh.clone(), sr, port, lane.clone());
     }
+
+    // The pitch of one input, when a surface asks for it. A thread of its own,
+    // reading the ring the callback already keeps. See `crate::pitch`.
+    crate::pitch::spawn(sh.clone(), sr);
 
     if let Some(secs) = opts.selftest {
         let r = selftest(&sh, sr, secs);
