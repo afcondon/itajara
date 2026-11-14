@@ -99,7 +99,7 @@ USAGE
 
       --residual <n>    from `sweep`, for this configuration. Without it the
                         engine reads ~/.itajara/calibration.conf, which
-                        `deepstar latency --write` curates from Amphora; with
+                        `scripts/latency.mjs measure --write` writes; with
                         neither it falls back to 252 and says so, because
                         the default is an assertion and not an abstention
       --max-secs <s>    longest loop, and so the arena size   (default 300)
@@ -189,8 +189,8 @@ USAGE
       Same options as `measure`, minus --buffer, which it varies itself.
 
       --json            emit one object on stdout and no prose, so a
-                        conductor can store the result. `deepstar latency`
-                        is that conductor; see its docs for where the
+                        conductor can store the result. `scripts/latency.mjs`
+                        is that conductor; its header says where the
                         number ends up and who reads it.
 
   itajara measure --device <name> [options]

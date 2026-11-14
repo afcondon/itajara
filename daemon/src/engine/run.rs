@@ -46,7 +46,7 @@ pub(crate) struct Residual {
     pub source: String,
     /// What had the device open when the number was measured, if it is stored.
     /// Kept so the operator can compare it with what is running now; the
-    /// comparison is `deepstar latency check`'s job, not the audio daemon's.
+    /// comparison is `scripts/latency.mjs check`'s job, not the audio daemon's.
     pub clients: Option<String>,
 }
 
@@ -141,7 +141,7 @@ pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
     if let Some(clients) = &residual.clients {
         println!(
             "  measured with these also on the device: {}. \
-             `deepstar latency check` compares that with what is running now.",
+             `scripts/latency.mjs check` compares that with what is running now.",
             clients
         );
     }
