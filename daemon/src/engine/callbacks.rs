@@ -146,7 +146,10 @@ pub(super) fn output(
             lp.is_armed() || lp.is_recording()
         })
         .map(|li| sh.src_of(li))
-        .unwrap_or(0);
+        // Nothing armed: the source being listened to for its pitch, if one
+        // is (`tune<n>`), because a hand tuning an oscillator wants to hear
+        // it. Otherwise the first source, as before.
+        .unwrap_or_else(|| sh.pitch.source().saturating_sub(1));
 
     let mut peak = 0.0f32;
     // Once per buffer, not once per frame: six loops times two
