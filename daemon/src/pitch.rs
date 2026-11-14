@@ -165,6 +165,24 @@ mod tests {
         assert!(cents(found, 196.0).abs() < 10.0, "saw 196 Hz read as {found}");
     }
 
+    /// How steadily a perfectly steady tone reads, as the window slides
+    /// along it the way the listening thread's does. This is the detector's
+    /// own wander: anything beyond it on the needle is the oscillator (or
+    /// the voltage driving it) moving, not the reading.
+    #[test]
+    fn a_steady_tone_reads_steadily() {
+        let sr = 48000usize;
+        for &hz in &[65.178f64, 261.63, 1046.5] {
+            let long: Vec<f64> = (0..WINDOW + 60 * 2400).map(|i| 2.0 * (hz * (i as f64) / (sr as f64)).fract() - 1.0).collect();
+            let readings: Vec<f64> = (0..60).map(|step| detect(&long[step * 2400..step * 2400 + WINDOW], sr).expect("a pitch").0).collect();
+            let low = readings.iter().cloned().fold(f64::INFINITY, f64::min);
+            let high = readings.iter().cloned().fold(0.0, f64::max);
+            let range = cents(high, low);
+            println!("saw {hz} Hz: {low:.4} to {high:.4} Hz, {range:.3} cents over 60 windows");
+            assert!(range < 0.5, "a steady {hz} Hz saw wandered {range:.3} cents");
+        }
+    }
+
     #[test]
     fn silence_is_not_a_pitch() {
         assert!(detect(&vec![0.0; WINDOW], 48000).is_none());
