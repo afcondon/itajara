@@ -74,6 +74,45 @@ pub fn find(needle: &str) -> Result<Candidate, Box<dyn Error>> {
     }
 }
 
+/// `itajara devices --json`: the same, as one array for a program to read.
+///
+/// Each device with its channel counts, and for an aggregate its members and
+/// where each one's channels landed (one-based, as `--source` counts them).
+/// Hand-rolled, as the sweep's object is: this crate's binary has no JSON
+/// dependency.
+pub fn json() -> String {
+    let quote = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+    let host = cpal::default_host();
+    let default_in = host.default_input_device().and_then(|d| d.name().ok());
+    let default_out = host.default_output_device().and_then(|d| d.name().ok());
+    let each: Vec<String> = all()
+        .iter()
+        .map(|c| {
+            let members: Vec<String> = crate::aggregate::layout_of(&c.name)
+                .map(|l| l.members)
+                .unwrap_or_default()
+                .iter()
+                .map(|m| {
+                    format!(
+                        r#"{{"name":{},"in":{},"firstIn":{},"out":{},"firstOut":{},"absent":{}}}"#,
+                        quote(&m.name), m.in_ch, m.first_in, m.out_ch, m.first_out, m.absent
+                    )
+                })
+                .collect();
+            format!(
+                r#"{{"name":{},"in":{},"out":{},"defaultIn":{},"defaultOut":{},"members":[{}]}}"#,
+                quote(&c.name),
+                c.max_in,
+                c.max_out,
+                Some(&c.name) == default_in.as_ref(),
+                Some(&c.name) == default_out.as_ref(),
+                members.join(",")
+            )
+        })
+        .collect();
+    format!("[{}]", each.join(","))
+}
+
 /// `itajara devices` — what CoreAudio is offering, with the detail that
 /// decides whether a rig is wired the way you think it is.
 pub fn list() {

@@ -4,9 +4,18 @@
 //
 //   node scripts/latency.mjs check                 no cable; the pre-flight
 //   node scripts/latency.mjs show
+//   node scripts/latency.mjs devices               what could be measured
 //   node scripts/latency.mjs measure [--write]     needs a loopback cable
 //
-//   options: --device AUDIO4c   --out-ch 0   --itajara <binary>
+//   options: --device <name>   --out-ch 0   --itajara <binary>
+//
+// With no `--device`, the device is the one the running engine has open: the
+// engine says which in its snapshot, with the residual it is using and where
+// it took it from. `check` compares the record with THAT, because a record
+// nobody is using is not a calibration: until 2026-11-15 the record was for
+// "AUDIO4c" while the engine, opened on the aggregate "ES9 then A4C", ignored
+// it and ran on its compiled 252 samples, and `check` read the store and said
+// 275 was in force.
 //
 // **What the residual is.** The samples a sound takes from the engine's
 // output to its input beyond what the buffers account for. The engine
@@ -31,7 +40,7 @@
 // 2026-11-14, when DeepStar was retired; the record's shape is unchanged, so
 // what DeepStar stored still reads.
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -148,9 +157,41 @@ export const records = async () => {
 export const recordFor = async (device) =>
   (await records()).filter((l) => String(l.device).toLowerCase() === device.toLowerCase()).pop() ?? null;
 
+// What the running engine says of itself: the device it opened and the
+// residual it is using. Null when no engine answers.
+export const engineNow = (url = process.env.ITAJARA_WS ?? "ws://127.0.0.1:23028") =>
+  new Promise((done) => {
+    let socket;
+    const finish = (answer) => { try { socket?.close(); } catch {} done(answer); };
+    try { socket = new WebSocket(url); } catch { return done(null); }
+    const giveUp = setTimeout(() => finish(null), 1500);
+    socket.onerror = () => { clearTimeout(giveUp); finish(null); };
+    socket.onmessage = (message) => {
+      clearTimeout(giveUp);
+      try {
+        const rig = JSON.parse(message.data);
+        finish(rig.device ? { device: rig.device, samples: rig.residual?.samples, from: rig.residual?.from ?? "" } : null);
+      } catch { finish(null); }
+    };
+  });
+
+// Every audio device the system offers, with an aggregate's members and where
+// their channels landed. From the engine's own binary, so the names are the
+// ones `--device` takes.
+export const devices = (itajara = resolve(here, "../target/release/itajara")) =>
+  JSON.parse(execFileSync(itajara, ["devices", "--json"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10000 }));
+
 // Whether the number in force can be believed. Never throws: this is asked
 // from a web page, which wants a sentence either way.
-export const check = async (device = "AUDIO4c") => {
+//
+// `engine` is what `engineNow` returned. Given one, the check is of the
+// device the engine has open and the residual it is using. Without one (no
+// engine running, or a device named on the command line) it can only say what
+// the store holds.
+export const check = async (named, engine = null) => {
+  const device = named ?? engine?.device;
+  if (!device) return { ok: false, says: "no engine is running and no device was named, so there is nothing to check" };
+  const inForce = engine && engine.device.toLowerCase() === device.toLowerCase() ? engine : null;
   let now;
   try {
     now = clientsNow();
@@ -164,18 +205,28 @@ export const check = async (device = "AUDIO4c") => {
     return { ok: false, device, clientsNow: now, says: `the store did not answer, so the record could not be read: ${error.message}` };
   }
   if (!record) {
-    return { ok: false, device, measured: false, clientsNow: now,
-      says: `${device} has never been measured, so the engine is using its built-in guess of 252 samples` };
+    return { ok: false, device, measured: false, clientsNow: now, inForce,
+      says: inForce
+        ? `${device} has never been measured: the engine is using ${Math.round(inForce.samples)} samples, from ${inForce.from}`
+        : `${device} has never been measured` };
+  }
+  // The record and the engine disagree: the engine started before the record
+  // was kept, or read a copy that is for another device.
+  if (inForce && Math.round(inForce.samples) !== Math.round(record.residual_samples)) {
+    return { ok: false, device, measured: true, clientsNow: now, inForce,
+      residualSamples: record.residual_samples, residualMs: record.residual_ms,
+      measuredAt: record.measured_at, clientsMeasured: record.clients ?? [],
+      says: `the record says ${Math.round(record.residual_samples)} samples, and the engine is using ${Math.round(inForce.samples)} (from ${inForce.from}): restart the looper to take the record` };
   }
   const { same, arrived, left } = compare(record.clients ?? [], now);
   const changes = [arrived.length ? `${arrived.join(", ")} now running` : "", left.length ? `${left.join(", ")} no longer running` : ""]
     .filter(Boolean).join("; ");
   return {
-    ok: same, device, measured: true, same, arrived, left,
+    ok: same, device, measured: true, same, arrived, left, inForce,
     residualSamples: record.residual_samples, residualMs: record.residual_ms,
     measuredAt: record.measured_at, clientsMeasured: record.clients ?? [], clientsNow: now,
     says: same
-      ? `${Math.round(record.residual_samples)} samples, measured ${record.measured_at} with the same programs running as now`
+      ? `${Math.round(record.residual_samples)} samples${inForce ? " in force" : " on record"}, measured ${record.measured_at} with the same programs running as now`
       : `${Math.round(record.residual_samples)} samples was measured with other programs running (${changes}): measure again`,
   };
 };
@@ -190,6 +241,43 @@ const measure = (itajara, device, outChannel) => {
   if (!line) throw new Error("the sweep printed no result; is the loopback cable in?");
   return { ...JSON.parse(line), kind: KIND, label: JSON.parse(line).device, clients,
     measured_at: new Date().toISOString().replace(/\.\d+Z$/, "Z"), measured_by: "itajara latency" };
+};
+
+// The same measurement for a program that shows it as it goes: `onStep` is
+// called with each buffer size's reading as it lands. Returns a promise of
+// the record, and `stop` to abandon it.
+export const measureLive = (itajara, device, outChannel, onStep) => {
+  const clients = clientsNow();
+  const child = spawn(itajara, ["sweep", "--device", device, "--out-ch", String(outChannel), "--json"], { stdio: ["ignore", "pipe", "pipe"] });
+  let pending = "", result = null, complaint = "";
+  const record = new Promise((done, fail) => {
+    child.stdout.on("data", (chunk) => {
+      pending += chunk;
+      const lines = pending.split("\n");
+      pending = lines.pop();
+      for (const line of lines.map((l) => l.trim()).filter((l) => l.startsWith("{"))) {
+        let said;
+        try { said = JSON.parse(line); } catch { continue; }
+        if (said.step) onStep(said.step);
+        else result = said;
+      }
+    });
+    child.stderr.on("data", (chunk) => { complaint += chunk; });
+    child.on("error", fail);
+    child.on("close", (code, signal) => {
+      if (signal) return fail(new Error("stopped"));
+      if (!result) return fail(new Error(complaint.trim().split("\n").pop() || `the sweep ended (${code}) without a result`));
+      done({ ...result, kind: KIND, label: result.device, clients,
+        measured_at: new Date().toISOString().replace(/\.\d+Z$/, "Z"), measured_by: "itajara latency" });
+    });
+  });
+  return { record, stop: () => child.kill("SIGTERM") };
+};
+
+// Give a kept record to the engine: the copy it reads when it starts.
+export const give = (l, hash) => {
+  mkdirSync(dirname(confPath()), { recursive: true });
+  writeFileSync(confPath(), confText(l, hash));
 };
 
 // Content, a name for it, and its place in the collection. The payload's keys
@@ -225,10 +313,20 @@ const main = async (args) => {
     const at = args.indexOf(name);
     return at < 0 ? otherwise : args[at + 1];
   };
-  const verb = args.find((a) => ["measure", "check", "show"].includes(a)) ?? "check";
-  const device = option("--device", "AUDIO4c");
+  const verb = args.find((a) => ["measure", "check", "show", "devices"].includes(a)) ?? "check";
+  const itajara = option("--itajara", resolve(here, "../target/release/itajara"));
+  const engine = await engineNow();
+  if (verb === "devices") {
+    for (const found of devices(itajara)) {
+      console.log(`${found.name}   in ${found.in}, out ${found.out}${engine?.device === found.name ? "   <- the engine has this open" : ""}`);
+      for (const member of found.members) console.log(`    ${member.name}${member.absent ? " (absent)" : `: inputs from ${member.firstIn}, outputs from ${member.firstOut}`}`);
+    }
+    return 0;
+  }
+  const device = option("--device", engine?.device);
+  if (!device) return console.log("no engine is running: name a device with --device (see `devices`)."), 1;
   if (verb === "check") {
-    const result = await check(device);
+    const result = await check(device, engine);
     console.log(args.includes("--json") ? JSON.stringify(result, null, 2) : `${device}: ${result.says}`);
     if (!args.includes("--json") && result.measured) {
       console.log(`  measured with: ${result.clientsMeasured.join(", ")}\n  running now:   ${result.clientsNow.join(", ")}`);
@@ -241,7 +339,6 @@ const main = async (args) => {
     show(record);
     return 0;
   }
-  const itajara = option("--itajara", resolve(here, "../target/release/itajara"));
   console.log(`Measuring ${device}, output ${option("--out-ch", "0")}, through the loopback cable.`);
   const l = measure(itajara, device, option("--out-ch", "0"));
   show(l);
@@ -249,8 +346,13 @@ const main = async (args) => {
   if (found.length) return console.log(`\n  Not fit to keep: ${found[0]}`), 1;
   if (!args.includes("--write")) return console.log("\n  Not kept. Run again with --write to keep it and give it to the engine."), 0;
   const hash = await keep(l);
-  mkdirSync(dirname(confPath()), { recursive: true });
-  writeFileSync(confPath(), confText(l, hash));
+  // The engine reads one copy, so only a record for the device it has open
+  // is given to it: another device's record is kept and changes nothing.
+  if (engine && engine.device.toLowerCase() !== String(l.device).toLowerCase()) {
+    console.log(`\n  Kept as ${hash.slice(0, 12)}. Not given to the engine, which has ${engine.device} open, not ${l.device}.`);
+    return 0;
+  }
+  give(l, hash);
   console.log(`\n  Kept as ${hash.slice(0, 12)}, and written to ${confPath()}.\n  Restart Itajara to use it; it prints the residual and where it came from when it starts.`);
   return 0;
 };

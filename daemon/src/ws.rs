@@ -405,7 +405,11 @@ fn rig_json(sh: &Shared, sr: u32, alive: bool) -> String {
             r#""ack":"{}","ackSeq":{},"linkTempo":{:.4},"linkQuantum":{:.4},"#,
             r#""linkBarFrames":{},"linkAnchors":{},"linkRejected":{},"#,
             r#""barFrames":{},"barOrigin":{},"launchQ":{},"#,
-            r#""maxSecs":{:.3},"fixedSecs":{:.3},"ringSecs":{:.3},"selected":{},"nLoops":{},"sources":[{}],"#,
+            r#""maxSecs":{:.3},"fixedSecs":{:.3},"ringSecs":{:.3},"selected":{},"nLoops":{},"#,
+            // **The device opened and the residual in force**, with where the
+            // residual came from: a stored calibration, `--residual`, or the
+            // compiled default. See `Shared::residual`.
+            r#""device":"{}","residual":{{"samples":{:.0},"from":"{}"}},"sources":[{}],"#,
             // **The capture, which is not a loop and so is not in `loops`.**
             //
             // A handful of numbers and that is the whole of its state: on or
@@ -476,6 +480,9 @@ fn rig_json(sh: &Shared, sr: u32, alive: bool) -> String {
         // whose fields were repeated above; now only that.
         sh.sel(),
         sh.n_loops,
+        escape(&sh.device),
+        sh.residual,
+        escape(&sh.residual_from),
         // **The sources, named, in the order a `src<n>` counts them.** Without
         // this the app would have a number and no way to say what it meant, and
         // "input 2" on an encoder is the numbering problem all over again.
@@ -715,7 +722,7 @@ mod tests {
             "calibrated", "k", "audioAlive", "deviceLost", "reopens", "ack", "ackSeq",
             "linkTempo", "linkQuantum", "linkBarFrames", "linkAnchors", "linkRejected",
             "barFrames", "barOrigin", "launchQ", "maxSecs", "fixedSecs", "ringSecs",
-            "selected", "nLoops", "sources", "capture", "jam", "pitch", "loops",
+            "selected", "nLoops", "device", "residual", "sources", "capture", "jam", "pitch", "loops",
         ];
         expected.sort_unstable();
         assert_eq!(keys, expected);

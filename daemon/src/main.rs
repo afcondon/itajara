@@ -222,7 +222,11 @@ fn main() -> ExitCode {
 
     match cmd {
         "devices" => {
-            devices::list();
+            if args.iter().any(|a| a == "--json") {
+                println!("{}", devices::json());
+            } else {
+                devices::list();
+            }
             ExitCode::SUCCESS
         }
         // **Does this command line still mean what it meant?**

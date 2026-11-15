@@ -264,6 +264,12 @@ type LooperState =
   -- | **The pitch of one input, live**, when a surface has asked for one
   -- | (`Tune`). See `Pitch`.
   , pitch :: Pitch
+  -- | **The audio device the engine opened**, by the system's name for it.
+  , device :: String
+  -- | **The round-trip residual the engine is using**, and where it took it
+  -- | from: a stored calibration, `--residual`, or its compiled default. What
+  -- | is in force, as against what a store says was measured.
+  , residual :: { samples :: Number, from :: String }
   -- | `from` says where a source comes from, for a person: "ES-9 input 1".
   , sources :: Array { name :: String, from :: String, mono :: Boolean, available :: Boolean, db :: Number }
   -- | The loop a console verb with no loop digit addresses. Once also the

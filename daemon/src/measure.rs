@@ -554,6 +554,15 @@ pub fn sweep(opts: Opts) -> Result<(), Box<dyn Error>> {
             println!("{}", s)
         }
     };
+    // In `--json`, one line for each buffer size as it is measured, before
+    // the object: a conductor showing progress reads the `step` lines, and
+    // one that only wants the result takes the last line, as before.
+    let step = |s: String| {
+        if opts.json {
+            println!("{}", s);
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+    };
     let candidate = crate::devices::find(&opts.device)?;
     say(format!("Device: {}\n", candidate.name));
     say(format!(
@@ -575,6 +584,7 @@ pub fn sweep(opts: Opts) -> Result<(), Box<dyn Error>> {
             Ok(p) => p,
             Err(e) => {
                 say(format!("  {:>6}     —    failed: {}", b, e));
+                step(format!(r#"{{"step":{{"buffer":{},"heard":false,"why":"{}"}}}}"#, b, escape(&e.to_string())));
                 continue;
             }
         };
@@ -589,6 +599,7 @@ pub fn sweep(opts: Opts) -> Result<(), Box<dyn Error>> {
 
         let Some((ch, res)) = best else {
             say(format!("  {:>6}     —    silence on every input", b));
+            step(format!(r#"{{"step":{{"buffer":{},"heard":false,"why":"silence on every input"}}}}"#, b));
             continue;
         };
 
@@ -605,6 +616,10 @@ pub fn sweep(opts: Opts) -> Result<(), Box<dyn Error>> {
             samples,
             spread,
             if spread > 0.5 { "   <- unstable" } else { "" }
+        ));
+        step(format!(
+            r#"{{"step":{{"buffer":{},"heard":true,"channel":{},"samples":{:.1},"spreadMs":{:.3}}}}}"#,
+            p.buffer, ch, samples, spread
         ));
         points.push((p.buffer as f64, samples, ch, spread));
     }

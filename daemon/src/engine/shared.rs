@@ -47,6 +47,15 @@ pub struct Shared {
     pub ring_len: usize,
     /// What each source is called and which input channels it reads.
     pub sources: Vec<Source>,
+    /// **The device opened, and the residual in force with where it came
+    /// from.** Reported in the snapshot, because a stored calibration says
+    /// what was measured and only this says what is being used: on
+    /// 2026-11-15 the store held 275 samples for "AUDIO4c" while the engine,
+    /// opened on an aggregate of another name, had been running on its
+    /// compiled 252 for weeks, and every check read the store.
+    pub device: String,
+    pub residual: f64,
+    pub residual_from: String,
     /// **Recording that is not looping.** See `crate::capture`.
     ///
     /// Here because this struct is "everything both callbacks and the control

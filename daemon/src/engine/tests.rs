@@ -24,6 +24,9 @@ pub(super) fn rig(max_frames: usize) -> Shared {
             .map(|_| AtomicU32::new(0))
             .collect(),
         max_frames,
+        device: "test".into(),
+        residual: 252.0,
+        residual_from: "a test".into(),
         n_loops: DEFAULT_LOOPS,
         max_layers: DEFAULT_LAYERS,
         fixed_frames: 0,
@@ -1286,7 +1289,7 @@ fn the_fixture_snapshots_to_a_known_hash() {
         "{}",
         text
     );
-    assert_eq!(fnv(FNV_SEED, text.as_bytes()), 12915103842464543542, "snapshot hash");
+    assert_eq!(fnv(FNV_SEED, text.as_bytes()), 11075373397942015342, "snapshot hash");
 }
 
 /// **A plan does not outlive the loop it was made for.** The stale-plan
