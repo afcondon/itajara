@@ -8,11 +8,44 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { check, clientsIn, compare, confText, keep, problems, recordFor } from "./latency.mjs";
+import { check, clientsIn, compare, confText, keep, pathOf, problems, recordFor, socket } from "./latency.mjs";
 
 const good = { device: "AUDIO4c", residual_samples: 275, residual_ms: 5.7291, slope_buffers: 2.0,
   sample_rate: 48000, usable: true, clients: ["continuo", "sclang"], measured_at: "2026-08-19T15:34:30Z",
   points: [{ buffer: 64, measured: 147, implied: 275, channel: 0 }, { buffer: 128, measured: 19, implied: 275, channel: 0 }] };
+
+// An aggregate as `itajara devices --json` gives it: two interfaces end to
+// end, the second resampled to the first one's clock.
+const aggregate = {
+  name: "Both", in: 24, out: 24,
+  inNames: [...Array(16).fill(""), ...Array.from({ length: 8 }, (_, i) => `USB In ${i + 1}`)],
+  outNames: [...Array(16).fill(""), ...Array.from({ length: 8 }, (_, i) => `USB Out ${i + 1}`)],
+  members: [
+    { name: "First", in: 16, firstIn: 1, out: 16, firstOut: 1, absent: false, clock: true, resampled: false },
+    { name: "Second ", in: 8, firstIn: 17, out: 8, firstOut: 17, absent: false, clock: false, resampled: true },
+  ],
+};
+
+test("a channel of an aggregate is a socket on one of its interfaces", () => {
+  const found = socket(aggregate, false, 16);
+  assert.equal(found.label, "Second out 1");
+  assert.equal(found.own, "USB Out 1");
+  assert.equal(found.resampled, true);
+  assert.equal(socket(aggregate, true, 3).label, "First in 4");
+  assert.equal(socket(aggregate, true, 3).clock, true);
+});
+
+test("a channel of a plain device is a socket on the device", () => {
+  assert.equal(socket({ name: "Plain", in: 2, out: 2, members: [] }, true, 1).label, "Plain in 2");
+});
+
+test("a record's path names interfaces, not channel numbers", () => {
+  const path = pathOf({ out_ch: 16, points: [{ buffer: 64, channel: 17 }] }, aggregate);
+  assert.deepEqual(path.out, { interface: "Second", number: 1, own: "USB Out 1", clock: false, resampled: true });
+  assert.equal(path.in.number, 2);
+  assert.equal(path.through, "Both");
+  assert.equal(pathOf({ out_ch: 0, points: [{}] }, aggregate), null, "no reading, no path");
+});
 
 test("the order of the programs does not matter", () => {
   assert.deepEqual(compare(["continuo", "es9-daemon", "sclang"], ["sclang", "es9-daemon", "continuo"]),

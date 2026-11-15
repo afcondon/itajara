@@ -35,6 +35,10 @@ use coreaudio_sys::{
     kAudioDevicePropertyStreamConfiguration, kAudioHardwarePropertyDevices,
     kAudioObjectPropertyElementMain, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
     kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
+    kAudioDevicePropertyDeviceIsRunningSomewhere, kAudioDevicePropertyTransportType,
+    kAudioObjectPropertyClass, kAudioObjectPropertyElementName, kAudioObjectPropertyManufacturer,
+    kAudioObjectPropertyOwnedObjects, kAudioSubDeviceClassID,
+    kAudioSubDevicePropertyDriftCompensation,
     AudioBufferList, AudioObjectID,
     AudioObjectGetPropertyData, AudioObjectPropertyAddress,
 };
@@ -64,6 +68,15 @@ pub struct Member {
     /// The aggregate lists this member, and the system will not describe it:
     /// it is configured into the aggregate and not currently there.
     pub absent: bool,
+    /// The aggregate takes its clock from this member. Every other member
+    /// runs on its own clock and has to be reconciled with this one.
+    pub clock: bool,
+    /// The system resamples this member to follow the clock ("drift
+    /// correction" in Audio MIDI Setup). That costs samples on every path
+    /// through it: the AUDIO4c's round trip read 275 opened alone and 592 as
+    /// a resampled member (2026-11-15). `None` when the system will not say,
+    /// which is the case for a member that is absent.
+    pub resampled: Option<bool>,
 }
 
 /// A device, and what it is made of if it is an aggregate.
@@ -374,6 +387,8 @@ pub fn layouts() -> Vec<Layout> {
             let mut members = Vec::new();
             let mut next_in = 1u32;
             let mut next_out = 1u32;
+            let clock = string_prop(*id, MAIN_SUB_DEVICE);
+            let drift = drift_by_uid(*id);
             for sub in sub_device_uids(*id) {
                 let found = by_uid.iter().find(|(u, _, _, _, _)| *u == sub);
                 // A member the system lists but will not describe is one that
@@ -386,13 +401,15 @@ pub fn layouts() -> Vec<Layout> {
                     None => (sub.clone(), 0, 0, true),
                 };
                 members.push(Member {
-                    uid: sub,
                     name: mname,
                     in_ch: m_in,
                     first_in: next_in,
                     out_ch: m_out,
                     first_out: next_out,
                     absent,
+                    clock: clock.as_deref() == Some(sub.as_str()),
+                    resampled: drift.iter().find(|(u, _)| *u == sub).map(|(_, d)| *d),
+                    uid: sub,
                 });
                 next_in += m_in;
                 next_out += m_out;
@@ -404,6 +421,124 @@ pub fn layouts() -> Vec<Layout> {
                 out_ch: *out_ch,
                 members,
             }
+        })
+        .collect()
+}
+
+/// `kAudioAggregateDevicePropertyMainSubDevice` ('amst'): the UID of the
+/// member an aggregate takes its clock from. Spelled out because the
+/// constant's name has changed between SDKs and the four characters have not.
+const MAIN_SUB_DEVICE: u32 = u32::from_be_bytes(*b"amst");
+
+/// What the system says about a device beyond its channels: enough for a
+/// page to show an interface as a person knows it, and to tell hardware from
+/// a loopback, without any of it being written into a program.
+#[derive(Debug, Clone, Default)]
+pub struct Facts {
+    pub maker: String,
+    /// `usb`, `built-in`, `virtual`, `aggregate`, or the system's own four
+    /// characters for anything else.
+    pub transport: String,
+    /// The interface's own name for each channel, in order; empty where it
+    /// has none. An aggregate hands its members' names through.
+    pub in_names: Vec<String>,
+    pub out_names: Vec<String>,
+    /// Latency plus safety offset as the device reports them, in frames, for
+    /// each direction. A claim, not a measurement: `sweep` is the measurement.
+    pub reported_in: u32,
+    pub reported_out: u32,
+    /// Some program has it open.
+    pub running: bool,
+}
+
+/// The facts for the device with this UID.
+pub fn facts(uid: &str) -> Option<Facts> {
+    let id = device_ids()
+        .into_iter()
+        .find(|&id| string_prop(id, kAudioDevicePropertyDeviceUID).as_deref() == Some(uid))?;
+    let transport = match u32_prop(id, kAudioDevicePropertyTransportType, kAudioObjectPropertyScopeGlobal) {
+        Some(t) => match &t.to_be_bytes() {
+            b"usb " => "usb".to_string(),
+            b"bltn" => "built-in".to_string(),
+            b"virt" => "virtual".to_string(),
+            b"grup" => "aggregate".to_string(),
+            other => String::from_utf8_lossy(other).trim().to_string(),
+        },
+        None => String::new(),
+    };
+    let names = |scope: u32, count: u32| -> Vec<String> {
+        (1..=count)
+            .map(|element| string_at(id, kAudioObjectPropertyElementName, scope, element).unwrap_or_default())
+            .collect()
+    };
+    let reported = |scope: u32| {
+        u32_prop(id, kAudioDevicePropertyLatency, scope).unwrap_or(0)
+            + u32_prop(id, kAudioDevicePropertySafetyOffset, scope).unwrap_or(0)
+    };
+    Some(Facts {
+        maker: string_prop(id, kAudioObjectPropertyManufacturer).unwrap_or_default(),
+        transport,
+        in_names: names(kAudioObjectPropertyScopeInput, input_channels(id)),
+        out_names: names(kAudioObjectPropertyScopeOutput, output_channels(id)),
+        reported_in: reported(kAudioObjectPropertyScopeInput),
+        reported_out: reported(kAudioObjectPropertyScopeOutput),
+        running: u32_prop(id, kAudioDevicePropertyDeviceIsRunningSomewhere, kAudioObjectPropertyScopeGlobal)
+            .unwrap_or(0)
+            != 0,
+    })
+}
+
+/// A CFString property at a scope and element: a channel's name is the
+/// element-name property asked of the channel's number.
+fn string_at(id: AudioObjectID, selector: u32, scope: u32, element: u32) -> Option<String> {
+    let a = AudioObjectPropertyAddress { mSelector: selector, mScope: scope, mElement: element };
+    let mut cf: CFStringRef = std::ptr::null();
+    let mut size = std::mem::size_of::<CFStringRef>() as u32;
+    let st = unsafe {
+        AudioObjectGetPropertyData(id, &a, 0, std::ptr::null(), &mut size,
+                                   &mut cf as *mut CFStringRef as *mut c_void)
+    };
+    if st != 0 || cf.is_null() {
+        return None;
+    }
+    let out = cf_string(cf);
+    unsafe { CFRelease(cf as *const c_void) };
+    out
+}
+
+/// Object IDs held in a property that is an array of them.
+fn id_list(id: AudioObjectID, selector: u32) -> Vec<AudioObjectID> {
+    let a = addr(selector, kAudioObjectPropertyScopeGlobal);
+    let mut size: u32 = 0;
+    let st = unsafe {
+        coreaudio_sys::AudioObjectGetPropertyDataSize(id, &a, 0, std::ptr::null(), &mut size)
+    };
+    if st != 0 || size == 0 {
+        return Vec::new();
+    }
+    let mut ids = vec![0 as AudioObjectID; size as usize / std::mem::size_of::<AudioObjectID>()];
+    let st = unsafe {
+        AudioObjectGetPropertyData(id, &a, 0, std::ptr::null(), &mut size,
+                                   ids.as_mut_ptr() as *mut c_void)
+    };
+    if st == 0 { ids } else { Vec::new() }
+}
+
+/// For each member of an aggregate the system will describe, its UID and
+/// whether it is resampled to the clock. An aggregate owns one sub-device
+/// object for each member that is present; the setting is a property of that
+/// object, not of the device the member is.
+fn drift_by_uid(id: AudioObjectID) -> Vec<(String, bool)> {
+    id_list(id, kAudioObjectPropertyOwnedObjects)
+        .into_iter()
+        .filter(|&owned| {
+            u32_prop(owned, kAudioObjectPropertyClass, kAudioObjectPropertyScopeGlobal)
+                == Some(kAudioSubDeviceClassID)
+        })
+        .filter_map(|owned| {
+            let uid = string_prop(owned, kAudioDevicePropertyDeviceUID)?;
+            let drift = u32_prop(owned, kAudioSubDevicePropertyDriftCompensation, kAudioObjectPropertyScopeGlobal)?;
+            Some((uid, drift != 0))
         })
         .collect()
 }
@@ -498,6 +633,8 @@ mod tests {
             out_ch: in_ch,
             first_out: first_in,
             absent: false,
+            clock: false,
+            resampled: None,
         }
     }
 
@@ -579,7 +716,7 @@ mod absence {
 
     fn m(name: &str, i: u32, fi: u32, o: u32, fo: u32, absent: bool) -> Member {
         Member { uid: name.into(), name: name.into(), in_ch: i, first_in: fi,
-                 out_ch: o, first_out: fo, absent }
+                 out_ch: o, first_out: fo, absent, clock: false, resampled: None }
     }
 
     /// **The ES-9 switched off, if CoreAudio drops its channels.** The Audio4c

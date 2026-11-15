@@ -84,6 +84,38 @@ export const clientsNow = () =>
       .join("\n")
   );
 
+// One channel of a device as a person finds it: the interface it is on and
+// its number there. `device` is an entry of `devices()`, `channel` counts
+// from zero across the device. On an aggregate the interface is the member
+// that owns the channel; `own` is the interface's own name for it, if any.
+export const socket = (device, isInput, channel) => {
+  const number = channel + 1;
+  const first = (member) => (isInput ? member.firstIn : member.firstOut);
+  const count = (member) => (isInput ? member.in : member.out);
+  const member = (device.members ?? []).find((m) => !m.absent && number >= first(m) && number < first(m) + count(m));
+  const own = String((isInput ? device.inNames : device.outNames)?.[channel] ?? "");
+  const on = member ? number - first(member) + 1 : number;
+  const interfaceName = String(member ? member.name : device.name).trim();
+  return {
+    channel, interface: interfaceName, number: on, own,
+    label: `${interfaceName} ${isInput ? "in" : "out"} ${on}`,
+    clock: member ? !!member.clock : false,
+    resampled: member ? member.resampled === true : false,
+  };
+};
+
+// The path a record was measured on, in words that survive the aggregate
+// being rebuilt in another order: interfaces and their own channel numbers,
+// and what the system was doing to each (clock, or resampled to the clock).
+// Null if the record has no reading to say which input heard it.
+export const pathOf = (record, device) => {
+  const heard = record.points?.[0]?.channel;
+  if (!device || !Number.isInteger(heard)) return null;
+  const strip = ({ interface: name, number, own, clock, resampled }) => ({ interface: name, number, own, clock, resampled });
+  return { through: device.name, aggregate: (device.members ?? []).length > 0,
+    out: strip(socket(device, false, record.out_ch ?? 0)), in: strip(socket(device, true, heard)) };
+};
+
 // Why a measurement should not be kept, most important first. None: keep it.
 export const problems = (l) => {
   const found = [];
@@ -177,7 +209,10 @@ export const engineNow = (url = process.env.ITAJARA_WS ?? "ws://127.0.0.1:23028"
 
 // Every audio device the system offers, with an aggregate's members and where
 // their channels landed. From the engine's own binary, so the names are the
-// ones `--device` takes.
+// ones `--device` takes. Each device and member also says who made it, what
+// kind of thing it is (`usb`, `built-in`, `virtual`, `aggregate`), what it
+// calls its channels and what latency it claims; a member says whether it is
+// the aggregate's clock or is resampled to follow it.
 export const devices = (itajara = resolve(here, "../target/release/itajara")) =>
   JSON.parse(execFileSync(itajara, ["devices", "--json"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10000 }));
 
@@ -246,9 +281,13 @@ const measure = (itajara, device, outChannel) => {
 // The same measurement for a program that shows it as it goes: `onStep` is
 // called with each buffer size's reading as it lands. Returns a promise of
 // the record, and `stop` to abandon it.
-export const measureLive = (itajara, device, outChannel, onStep) => {
+//
+// `inChannel` (zero-based, optional) is the one input to read. Without it the
+// sweep listens on every input and takes the loudest.
+export const measureLive = (itajara, device, outChannel, onStep, inChannel = null) => {
   const clients = clientsNow();
-  const child = spawn(itajara, ["sweep", "--device", device, "--out-ch", String(outChannel), "--json"], { stdio: ["ignore", "pipe", "pipe"] });
+  const reading = inChannel === null ? [] : ["--in-ch", String(inChannel)];
+  const child = spawn(itajara, ["sweep", "--device", device, "--out-ch", String(outChannel), ...reading, "--json"], { stdio: ["ignore", "pipe", "pipe"] });
   let pending = "", result = null, complaint = "";
   const record = new Promise((done, fail) => {
     child.stdout.on("data", (chunk) => {

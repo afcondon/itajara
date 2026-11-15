@@ -188,6 +188,11 @@ USAGE
 
       Same options as `measure`, minus --buffer, which it varies itself.
 
+      --in-ch <n>       read this input only (zero-based). Without it every
+                        input is listened to and the loudest is taken; with
+                        it, a click that comes back on another input is
+                        reported and not measured.
+
       --json            emit one object on stdout and no prose, so a
                         conductor can store the result. `scripts/latency.mjs`
                         is that conductor; its header says where the
@@ -774,6 +779,7 @@ fn parse_measure(args: &[String]) -> Result<measure::Opts, String> {
         match flag {
             "--device" => opts.device = value()?,
             "--out-ch" => opts.out_ch = value()?.parse().map_err(|_| "--out-ch wants an integer")?,
+            "--in-ch" => opts.in_ch = Some(value()?.parse().map_err(|_| "--in-ch wants an integer")?),
             "--repeats" => {
                 opts.repeats = value()?.parse().map_err(|_| "--repeats wants an integer")?
             }

@@ -58,6 +58,10 @@ const LISTEN_MS: u64 = 400;
 pub struct Opts {
     pub device: String,
     pub out_ch: usize,
+    /// For `sweep`: the one input to read, counted from zero. Without it every
+    /// input is listened to and the loudest is taken, which finds a cable but
+    /// cannot say that the path measured is the path meant.
+    pub in_ch: Option<usize>,
     pub repeats: usize,
     pub amplitude: f32,
     pub sample_rate: u32,
@@ -80,6 +84,7 @@ impl Default for Opts {
         Opts {
             device: String::new(),
             out_ch: 0,
+            in_ch: None,
             repeats: 8,
             amplitude: 0.5,
             sample_rate: 48_000,
@@ -590,16 +595,33 @@ pub fn sweep(opts: Opts) -> Result<(), Box<dyn Error>> {
         };
         sr = p.sr;
 
-        let best = p
+        let loudest = p
             .channels
             .iter()
             .enumerate()
             .filter(|(_, c)| !c.latencies_ms.is_empty())
             .max_by(|(_, a), (_, c)| a.peak.partial_cmp(&c.peak).unwrap());
+        // A named input is the only one read: a click that came back on a
+        // different input is a different path, and is said rather than taken.
+        let best = match opts.in_ch {
+            None => loudest,
+            Some(wanted) => p.channels.get(wanted).filter(|c| !c.latencies_ms.is_empty()).map(|c| (wanted, c)),
+        };
 
         let Some((ch, res)) = best else {
-            say(format!("  {:>6}     —    silence on every input", b));
-            step(format!(r#"{{"step":{{"buffer":{},"heard":false,"why":"silence on every input"}}}}"#, b));
+            let why = match (opts.in_ch, loudest) {
+                (Some(wanted), Some((other, _))) => format!("nothing on input {}; the click came back on input {}", wanted + 1, other + 1),
+                (Some(wanted), None) => format!("nothing on input {}, or on any other", wanted + 1),
+                (None, _) => "silence on every input".to_string(),
+            };
+            say(format!("  {:>6}     —    {}", b, why));
+            // `elsewhere` is the input the click did come back on, for a
+            // conductor that knows what that input is called.
+            let elsewhere = match (opts.in_ch, loudest) {
+                (Some(_), Some((other, _))) => format!(r#","elsewhere":{}"#, other),
+                _ => String::new(),
+            };
+            step(format!(r#"{{"step":{{"buffer":{},"heard":false,"why":"{}"{}}}}}"#, b, escape(&why), elsewhere));
             continue;
         };
 

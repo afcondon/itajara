@@ -85,27 +85,44 @@ pub fn json() -> String {
     let host = cpal::default_host();
     let default_in = host.default_input_device().and_then(|d| d.name().ok());
     let default_out = host.default_output_device().and_then(|d| d.name().ok());
+    let list = |names: &[String]| names.iter().map(|n| quote(n)).collect::<Vec<_>>().join(",");
+    // The facts every device and every member carries: who made it, what
+    // kind of thing it is, what it calls its channels, what it claims its
+    // latency is, and whether anything has it open.
+    let facts = |uid: &str| {
+        let f = crate::aggregate::facts(uid).unwrap_or_default();
+        format!(
+            r#""maker":{},"transport":{},"inNames":[{}],"outNames":[{}],"reportedIn":{},"reportedOut":{},"running":{}"#,
+            quote(&f.maker), quote(&f.transport), list(&f.in_names), list(&f.out_names),
+            f.reported_in, f.reported_out, f.running
+        )
+    };
     let each: Vec<String> = all()
         .iter()
         .map(|c| {
-            let members: Vec<String> = crate::aggregate::layout_of(&c.name)
-                .map(|l| l.members)
+            let layout = crate::aggregate::layout_of(&c.name);
+            let members: Vec<String> = layout
+                .as_ref()
+                .map(|l| l.members.clone())
                 .unwrap_or_default()
                 .iter()
                 .map(|m| {
                     format!(
-                        r#"{{"name":{},"in":{},"firstIn":{},"out":{},"firstOut":{},"absent":{}}}"#,
-                        quote(&m.name), m.in_ch, m.first_in, m.out_ch, m.first_out, m.absent
+                        r#"{{"name":{},"in":{},"firstIn":{},"out":{},"firstOut":{},"absent":{},"clock":{},"resampled":{},{}}}"#,
+                        quote(&m.name), m.in_ch, m.first_in, m.out_ch, m.first_out, m.absent, m.clock,
+                        m.resampled.map(|r| r.to_string()).unwrap_or("null".into()),
+                        facts(&m.uid)
                     )
                 })
                 .collect();
             format!(
-                r#"{{"name":{},"in":{},"out":{},"defaultIn":{},"defaultOut":{},"members":[{}]}}"#,
+                r#"{{"name":{},"in":{},"out":{},"defaultIn":{},"defaultOut":{},{},"members":[{}]}}"#,
                 quote(&c.name),
                 c.max_in,
                 c.max_out,
                 Some(&c.name) == default_in.as_ref(),
                 Some(&c.name) == default_out.as_ref(),
+                facts(layout.as_ref().map(|l| l.uid.as_str()).unwrap_or("")),
                 members.join(",")
             )
         })
