@@ -39,7 +39,7 @@ USAGE
       order, the absolute channel numbers still parse, the meters still move,
       and every take is off the wrong input.
 
-  itajara levels --device <name> [--seconds <n>]
+  itajara levels --device <name> [--seconds <n>] [--json]
       Live peak meter on every input channel, with a peak hold. Play into
       one jack at a time to find out which host channel it arrives on —
       an interface with more USB channels than physical jacks does not
@@ -741,6 +741,11 @@ fn parse_levels(args: &[String]) -> Result<levels::Opts, String> {
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
+        if flag == "--json" {
+            opts.json = true;
+            i += 1;
+            continue;
+        }
         let value = args
             .get(i + 1)
             .cloned()

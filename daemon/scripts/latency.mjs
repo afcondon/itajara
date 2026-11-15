@@ -158,7 +158,7 @@ clients          = ${l.clients.join(",")}
 amphora          = ${hash}
 `;
 
-const ask = async (method, path, body) => {
+export const ask = async (method, path, body) => {
   const answer = await fetch(store() + path, {
     method,
     headers: body === undefined ? {} : { "Content-Type": "application/json" },
@@ -322,7 +322,7 @@ export const give = (l, hash) => {
 // A value with every object's keys in order, at every depth. (An array of key
 // names handed to `JSON.stringify` is not this: it also drops every nested
 // key that is not in the list, which is how a record once lost its points.)
-const sorted = (value) =>
+export const sorted = (value) =>
   Array.isArray(value) ? value.map(sorted)
   : value && typeof value === "object" ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, sorted(value[key])]))
   : value;

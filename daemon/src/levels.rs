@@ -30,11 +30,13 @@ pub struct Opts {
     pub device: String,
     pub seconds: u64,
     pub sample_rate: u32,
+    /// Lines for a program instead of bars for a person. See `run_json`.
+    pub json: bool,
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Opts { device: String::new(), seconds: 30, sample_rate: 48_000 }
+        Opts { device: String::new(), seconds: 30, sample_rate: 48_000, json: false }
     }
 }
 
@@ -64,7 +66,93 @@ fn bar(level_db: f32) -> String {
         .collect()
 }
 
+/// How often `--json` says what it heard.
+const JSON_EVERY: Duration = Duration::from_millis(100);
+
+/// **Every input's mean and peak, ten times a second, as lines of JSON.**
+///
+/// The mean is the point: on a DC-coupled input it is the voltage on the
+/// socket, as a fraction of full scale, and that is how a control-voltage
+/// output is measured (Quadrat's Calibrate page, the Outputs tab). Each line
+/// covers the stretch since the one before, so a reader that changes a
+/// voltage waits a line and then believes the next.
+///
+/// `{"rate":48000,"channels":16}` first, then
+/// `{"mean":[…],"peak":[…]}` until `--seconds` have passed or it is stopped.
+fn run_json(opts: Opts) -> Result<(), Box<dyn Error>> {
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    let candidate = crate::devices::find(&opts.device)?;
+    let device = candidate.device;
+    let cfg = crate::measure::choose_input(&device, 0, opts.sample_rate, crate::measure::Width::Widest)
+        .ok_or_else(|| format!("{} offers no f32 input config", candidate.name))?;
+    let channels = cfg.channels as usize;
+
+    // Sums, peaks and a frame count since the last line. A lock in an audio
+    // callback is wrong in an engine; this is a meter, and the other side
+    // holds it for a few hundred nanoseconds ten times a second.
+    struct Heard {
+        sums: Vec<f64>,
+        peaks: Vec<f32>,
+        frames: u64,
+    }
+    let heard = Arc::new(Mutex::new(Heard { sums: vec![0.0; channels], peaks: vec![0.0; channels], frames: 0 }));
+
+    let stream = {
+        let heard = heard.clone();
+        device.build_input_stream(
+            &cfg,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                let frames = data.len() / channels;
+                if let Ok(mut heard) = heard.lock() {
+                    for frame in data.chunks_exact(channels) {
+                        for (channel, sample) in frame.iter().enumerate() {
+                            heard.sums[channel] += *sample as f64;
+                            heard.peaks[channel] = heard.peaks[channel].max(sample.abs());
+                        }
+                    }
+                    heard.frames += frames as u64;
+                }
+            },
+            |e| eprintln!("stream error: {}", e),
+            None,
+        )?
+    };
+    stream.play()?;
+
+    let out = std::io::stdout();
+    writeln!(out.lock(), r#"{{"rate":{},"channels":{}}}"#, cfg.sample_rate.0, channels)?;
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(opts.seconds) {
+        std::thread::sleep(JSON_EVERY);
+        let (means, peaks) = {
+            let mut heard = heard.lock().map_err(|_| "the meter's lock was poisoned")?;
+            if heard.frames == 0 {
+                continue;
+            }
+            let frames = heard.frames as f64;
+            let means: Vec<String> = heard.sums.iter().map(|sum| format!("{:.6}", sum / frames)).collect();
+            let peaks: Vec<String> = heard.peaks.iter().map(|peak| format!("{:.6}", peak)).collect();
+            heard.sums.iter_mut().for_each(|sum| *sum = 0.0);
+            heard.peaks.iter_mut().for_each(|peak| *peak = 0.0);
+            heard.frames = 0;
+            (means, peaks)
+        };
+        let mut out = out.lock();
+        // A reader that has gone away is the ordinary way for this to end.
+        if writeln!(out, r#"{{"mean":[{}],"peak":[{}]}}"#, means.join(","), peaks.join(",")).is_err() || out.flush().is_err() {
+            break;
+        }
+    }
+    drop(stream);
+    Ok(())
+}
+
 pub fn run(opts: Opts) -> Result<(), Box<dyn Error>> {
+    if opts.json {
+        return run_json(opts);
+    }
     let candidate = crate::devices::find(&opts.device)?;
     let device = candidate.device;
 
