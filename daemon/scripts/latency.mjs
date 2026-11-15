@@ -280,12 +280,20 @@ export const give = (l, hash) => {
   writeFileSync(confPath(), confText(l, hash));
 };
 
+// A value with every object's keys in order, at every depth. (An array of key
+// names handed to `JSON.stringify` is not this: it also drops every nested
+// key that is not in the list, which is how a record once lost its points.)
+const sorted = (value) =>
+  Array.isArray(value) ? value.map(sorted)
+  : value && typeof value === "object" ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, sorted(value[key])]))
+  : value;
+
 // Content, a name for it, and its place in the collection. The payload's keys
 // are sorted so the same measurement always has the same hash.
 const keep = async (l) => {
   const found = problems(l);
   if (found.length) throw new Error(`not kept: ${found[0]}`);
-  const payload = JSON.stringify(l, Object.keys(l).sort());
+  const payload = JSON.stringify(sorted(l));
   const { hash } = await ask("POST", "/content", { kind: KIND, payload });
   await ask("POST", "/labels", { contentHash: hash, name: `latency-${l.device}`, source: "itajara" });
   const kept = await ask("GET", `/favorites?collection=${COLLECTION}`);

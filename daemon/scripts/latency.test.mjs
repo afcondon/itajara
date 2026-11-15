@@ -11,7 +11,8 @@ import { test } from "node:test";
 import { check, clientsIn, compare, confText, keep, problems, recordFor } from "./latency.mjs";
 
 const good = { device: "AUDIO4c", residual_samples: 275, residual_ms: 5.7291, slope_buffers: 2.0,
-  sample_rate: 48000, usable: true, clients: ["continuo", "sclang"], measured_at: "2026-08-19T15:34:30Z" };
+  sample_rate: 48000, usable: true, clients: ["continuo", "sclang"], measured_at: "2026-08-19T15:34:30Z",
+  points: [{ buffer: 64, measured: 147, implied: 275, channel: 0 }, { buffer: 128, measured: 19, implied: 275, channel: 0 }] };
 
 test("the order of the programs does not matter", () => {
   assert.deepEqual(compare(["continuo", "es9-daemon", "sclang"], ["sclang", "es9-daemon", "continuo"]),
@@ -59,6 +60,7 @@ test("a record is kept, read back, and checked", { skip: !process.env.AMPHORA_UR
   assert.equal(await keep({ ...good, device }), hash, "the same measurement is the same content");
   const record = await recordFor(device);
   assert.equal(record.residual_samples, 275);
+  assert.deepEqual(record.points, good.points, "the readings are kept whole, not as empty objects");
   const result = await check(device);
   assert.equal(result.measured, true);
   assert.deepEqual(result.clientsMeasured, ["continuo", "sclang"]);
